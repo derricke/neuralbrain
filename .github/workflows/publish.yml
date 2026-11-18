@@ -1,12 +1,14 @@
-# Publishes the package to npm through npm Trusted Publishing (OIDC).
+# Stages a release on npm through npm Trusted Publishing (OIDC).
 #
 # No npm token is stored anywhere. npm trusts this workflow because the package
 # is configured on npmjs.com (package Settings → Trusted Publisher → GitHub
 # Actions: owner derricke, repository neuralbrain, workflow publish.yml).
-# Provenance is generated automatically for trusted publishes.
 #
-# The very first version is published by hand (`npm publish`), since the
-# trusted publisher is configured on the package's settings page.
+# The trusted publisher may only STAGE versions ("Allow npm publish" is off).
+# A staged version is not public until a maintainer approves it on npmjs.com
+# with 2FA, so a compromised workflow or GitHub account cannot publish alone.
+# After this workflow succeeds: approve the version on npmjs.com (or run
+# `npm stage list neuralbrain` and approve it from there).
 name: Publish to npm
 
 on:
@@ -20,18 +22,18 @@ permissions:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
-      # Trusted publishing needs npm 11.5.1 or newer.
-      - name: Ensure npm supports trusted publishing
-        run: npm install -g npm@^11.5.1
+      # Trusted publishing needs npm 11.5.1+, and `npm stage` a newer 11.x.
+      - name: Ensure npm supports trusted publishing and staging
+        run: npm install -g npm@^11.19.0
 
       - name: Check release tag matches package.json version
         if: github.event_name == 'release'
@@ -60,5 +62,6 @@ jobs:
       - if: steps.published.outputs.skip != 'true'
         run: npm test
 
+      # Stages the version; it goes public only after a maintainer approves it.
       - if: steps.published.outputs.skip != 'true'
-        run: npm publish --access public
+        run: npm stage publish
