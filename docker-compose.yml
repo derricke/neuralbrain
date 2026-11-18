@@ -1,0 +1,107 @@
+services:
+  brain:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: neuralbrain
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${PORT:-3737}:3000"
+    environment:
+      - NODE_ENV=production
+      - HOST=0.0.0.0
+      - PORT=3000
+      - DATABASE_URL=/app/data/brain.db
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - BRAIN_MODEL_CACHE_DIR=/app/data/models
+      - BRAIN_AI=${BRAIN_AI:-agent}
+      - BRAIN_AI_SUMMARIZE=${BRAIN_AI_SUMMARIZE:-}
+      - BRAIN_AI_CONSOLIDATE=${BRAIN_AI_CONSOLIDATE:-}
+      - BRAIN_EMBED=${BRAIN_EMBED:-local}
+      - BRAIN_EMBED_MODEL=${BRAIN_EMBED_MODEL:-nomic}
+      - BRAIN_EMBED_DIM=${BRAIN_EMBED_DIM:-512}
+      - BRAIN_GPU_ENDPOINT=${BRAIN_GPU_ENDPOINT:-http://embedder-gpu:7997}
+      - BRAIN_GPU_PORT=${BRAIN_GPU_PORT:-7997}
+      - BRAIN_ENDPOINT=${BRAIN_ENDPOINT:-}
+      - BRAIN_ENDPOINT_API_KEY=${BRAIN_ENDPOINT_API_KEY:-}
+      - BRAIN_EMBED_ENDPOINT=${BRAIN_EMBED_ENDPOINT:-}
+      - BRAIN_EMBED_API_KEY=${BRAIN_EMBED_API_KEY:-}
+      - BRAIN_VENDOR=${BRAIN_VENDOR:-}
+      - BRAIN_VENDOR_MODEL=${BRAIN_VENDOR_MODEL:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - BRAIN_OBS_ARCHIVE_DAYS=${BRAIN_OBS_ARCHIVE_DAYS:-30}
+      - BRAIN_OBS_DELETE_DAYS=${BRAIN_OBS_DELETE_DAYS:-90}
+      - BRAIN_TRAJECTORY_ARCHIVE_DAYS=${BRAIN_TRAJECTORY_ARCHIVE_DAYS:-180}
+      - BRAIN_TRAJECTORY_DELETE_DAYS=${BRAIN_TRAJECTORY_DELETE_DAYS:-0}
+      - BRAIN_KEEP_SUMMARIZED_SOURCES=${BRAIN_KEEP_SUMMARIZED_SOURCES:-1}
+      - BRAIN_REQUIRE_API_KEY=${BRAIN_REQUIRE_API_KEY:-1}
+      - BRAIN_API_KEY=${BRAIN_API_KEY:-}
+      - BRAIN_RATE_LIMIT_WINDOW_MS=${BRAIN_RATE_LIMIT_WINDOW_MS:-60000}
+      - BRAIN_RATE_LIMIT_MAX=${BRAIN_RATE_LIMIT_MAX:-100}
+      - BRAIN_RATE_LIMIT_EXEMPT=${BRAIN_RATE_LIMIT_EXEMPT:-/health,/capture}
+      - BRAIN_HTTPS=${BRAIN_HTTPS:-0}
+      - BRAIN_CERTS_DIR=/app/certs
+      - BRAIN_TLS_CERT=${BRAIN_TLS_CERT:-}
+      - BRAIN_TLS_KEY=${BRAIN_TLS_KEY:-}
+    volumes:
+      - ${BRAIN_DATA_DIR:-${HOME}/.neuralbrain/data}:/app/data
+      - ${BRAIN_CERTS_DIR:-${HOME}/.neuralbrain/certs}:/app/certs
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "const https=require('https'),fs=require('fs');if(process.env.BRAIN_HTTPS==='1'||process.env.BRAIN_HTTPS==='true'){const cert=process.env.BRAIN_TLS_CERT||'/app/certs/server.crt';const ca=fs.existsSync(cert)?fs.readFileSync(cert):undefined;const req=https.request({hostname:'127.0.0.1',port:3000,path:'/health',ca},r=>process.exit(r.statusCode===200?0:1));req.on('error',()=>process.exit(1));req.end();}else{fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1));}"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.1
+    container_name: neuralbrain-qdrant
+    volumes:
+      - ${BRAIN_QDRANT_DIR:-${HOME}/.neuralbrain/qdrant}:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333 && echo -e \"GET /readyz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3 && grep -q \"200 OK\" <&3'"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  embedder-gpu:
+    image: ${BRAIN_GPU_IMAGE:-michaelf34/infinity:latest}
+    container_name: neuralbrain-embedder-gpu
+    profiles: ["gpu"]
+    command: >
+      v2
+      --model-id ${BRAIN_GPU_MODEL_ID:-nomic-ai/nomic-embed-text-v1.5}
+      --port 7997
+      --engine ${BRAIN_GPU_ENGINE:-optimum}
+    volumes:
+      - ${BRAIN_DATA_DIR:-${HOME}/.neuralbrain/data}/models:/app/.cache
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:7997/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

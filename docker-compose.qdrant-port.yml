@@ -1,0 +1,7 @@
+services:
+  qdrant:
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${QDRANT_PORT:-6333}:6333"
+  embedder-gpu:
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${BRAIN_GPU_PORT:-7997}:7997"

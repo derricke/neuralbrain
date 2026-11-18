@@ -1,0 +1,651 @@
+import { QdrantClient } from '@qdrant/js-client-rest';
+import { getDb } from '../lib/db';
+import { logger } from '../lib/logger';
+import {
+  claimEmbedQueue,
+  enqueueForEmbedding,
+  getPendingEmbedCount,
+  markEmbedDone,
+  markEmbedFailed,
+  releaseEmbedClaim,
+  type EmbedGrain,
+} from '../memory/embedQueueStore';
+import {
+  EmbeddingConfigurationError,
+  buildTrajectoryEmbeddingText,
+  embedDocument,
+  resolveEmbedderRecipe,
+  serializeEmbedding,
+} from './embedding';
+import { commitStoreMeta, getStoreMeta, verifyOrCreateStoreMeta } from './storeMeta';
+import { transaction } from '../lib/sqlite';
+
+export interface DrainOptions {
+  target?: string;
+  batchSize?: number;
+  maxBatches?: number;
+  client?: QdrantClient;
+}
+
+export interface ReembedStatus {
+  status: 'idle' | 'running' | 'completed' | 'failed';
+  collection: string | null;
+  total: number;
+  processed: number;
+  failed: number;
+  started_at: number | null;
+  completed_at: number | null;
+  error: string | null;
+}
+
+let activeReembedStatus: ReembedStatus = {
+  status: 'idle',
+  collection: null,
+  total: 0,
+  processed: 0,
+  failed: 0,
+  started_at: null,
+  completed_at: null,
+  error: null,
+};
+
+export function getReembedStatus(): ReembedStatus {
+  return { ...activeReembedStatus };
+}
+
+/** How long a status probe waits for Qdrant before reporting it offline. */
+export const QDRANT_PROBE_TIMEOUT_MS = 2000;
+
+/**
+ * Status-only check: is Qdrant answering? Used by /health and the dashboard.
+ *
+ * It uses its own client with a short request timeout. The shared client keeps
+ * the library default (300 s), which is right for real work but made /health
+ * hang for ~10 s whenever Qdrant was unreachable without refusing the
+ * connection (e.g. a docker-mode Qdrant whose port is not published). A health
+ * check that hangs is worse than one that says "offline".
+ */
+export async function probeQdrant(timeoutMs: number = QDRANT_PROBE_TIMEOUT_MS): Promise<'ok' | 'offline'> {
+  const url = process.env.QDRANT_URL || 'http://localhost:6333';
+  const apiKey = process.env.QDRANT_API_KEY?.trim() || undefined;
+  try {
+    const client = new QdrantClient({ url, apiKey, checkCompatibility: false, timeout: timeoutMs });
+    const collections = await client.getCollections();
+    return collections ? 'ok' : 'offline';
+  } catch {
+    return 'offline';
+  }
+}
+
+export function getQdrantClient(): QdrantClient | null {
+  const url = process.env.QDRANT_URL || 'http://localhost:6333';
+  const apiKey = process.env.QDRANT_API_KEY?.trim() || undefined;
+  try {
+    return new QdrantClient({ url, apiKey, checkCompatibility: false });
+  } catch (err) {
+    logger.warn({ error: err instanceof Error ? err.message : String(err) }, 'failed to construct QdrantClient');
+    return null;
+  }
+}
+
+/**
+ * Safely delete points from Qdrant by id.
+ * Never throws — logs warnings on error or skips if Qdrant is unreachable / embedder tier is none.
+ */
+export async function deleteQdrantPoints(
+  ids: string[],
+  client?: QdrantClient | null
+): Promise<void> {
+  if (!ids || ids.length === 0) return;
+  try {
+    const recipe = resolveEmbedderRecipe();
+    if (recipe.embed_tier === 'none') return;
+
+    const qdrant = client !== undefined ? client : getQdrantClient();
+    if (!qdrant) return;
+
+    const collection = getStoreMeta()?.qdrant_alias || 'brain';
+    await qdrant.delete(collection, {
+      points: ids,
+    });
+    logger.debug({ count: ids.length, collection }, 'deleted points from qdrant');
+  } catch (err) {
+    logger.warn(
+      {
+        count: ids.length,
+        error: err instanceof Error ? err.message : String(err),
+      },
+      'failed to delete points from qdrant (ignored to preserve sqlite source of truth)'
+    );
+  }
+}
+
+let isDrainRunning = false;
+
+export async function drainEmbedQueue(
+  options?: DrainOptions
+): Promise<{ processed: number; failed: number; remaining: number }> {
+  const target = options?.target || 'live';
+
+  // Yield/skip non-reembed drains (e.g. 'live') while a full re-embed is running
+  // so they don't compete for the embedder or Qdrant with startReembed().
+  if (
+    activeReembedStatus.status === 'running' &&
+    target !== activeReembedStatus.collection
+  ) {
+    return { processed: 0, failed: 0, remaining: 0 };
+  }
+
+  if (isDrainRunning) {
+    return { processed: 0, failed: 0, remaining: 0 };
+  }
+
+  isDrainRunning = true;
+  try {
+    const batchSize = options?.batchSize || 32;
+    const maxBatches = options?.maxBatches || 1;
+    const qdrant = options?.client ?? getQdrantClient();
+
+    const recipe = resolveEmbedderRecipe();
+    const db = getDb();
+
+    let totalProcessed = 0;
+    let totalFailed = 0;
+
+  let embedderUnavailable = false;
+  for (let batchIdx = 0; batchIdx < maxBatches; batchIdx++) {
+    if (embedderUnavailable) break;
+    const items = claimEmbedQueue(target, batchSize);
+    if (items.length === 0) {
+      break;
+    }
+
+    const qdrantPointsToUpsert: Array<{ id: string; vector: number[]; payload: Record<string, any> }> = [];
+
+    for (let itemIdx = 0; itemIdx < items.length; itemIdx++) {
+      const item = items[itemIdx];
+      try {
+        let text = '';
+        let payload: Record<string, any> = {};
+
+        switch (item.grain) {
+          case 'observation': {
+            const obs = db
+              .prepare('SELECT * FROM observations WHERE id = ?')
+              .get(item.record_id) as any;
+            if (!obs) {
+              markEmbedDone(item.record_id, item.grain, target);
+              totalProcessed++;
+              continue;
+            }
+            text = [
+              obs.kind === 'prompt' ? 'prompt: ' : 'tool: ',
+              obs.tool_name || '',
+              obs.file_path ? ` file: ${obs.file_path}` : '',
+              obs.input ? `\ninput: ${obs.input}` : '',
+              obs.output ? `\noutput: ${obs.output}` : '',
+            ].join('');
+            payload = {
+              grain: 'observation',
+              scope: obs.scope,
+              project_id: obs.project_id,
+              kind: obs.kind,
+              type: null,
+              task_type: null,
+              note_ref: obs.note_ref,
+              task_ref: obs.task_ref,
+              file_path: obs.file_path,
+              agent: obs.agent,
+              success: obs.failed === 0,
+              created_at: obs.created_at,
+              text,
+            };
+            break;
+          }
+          case 'trajectory': {
+            const traj = db
+              .prepare('SELECT * FROM trajectories WHERE id = ?')
+              .get(item.record_id) as any;
+            if (!traj) {
+              markEmbedDone(item.record_id, item.grain, target);
+              totalProcessed++;
+              continue;
+            }
+            text = buildTrajectoryEmbeddingText({
+              description: traj.description,
+              result: traj.result,
+              provider: traj.agent,
+              model: traj.agent,
+              // NULL means the outcome is unknown; it is not a failure.
+              success: traj.success === null || traj.success === undefined ? null : traj.success === 1,
+            });
+            payload = {
+              grain: 'trajectory',
+              scope: traj.scope,
+              project_id: traj.project_id,
+              kind: null,
+              type: null,
+              task_type: traj.task_type,
+              note_ref: traj.note_ref,
+              task_ref: traj.task_ref,
+              file_path: null,
+              agent: traj.agent,
+              success: traj.success === null || traj.success === undefined ? null : traj.success === 1,
+              created_at: traj.created_at,
+              text,
+            };
+            break;
+          }
+          case 'note': {
+            const note = db
+              .prepare('SELECT * FROM notes WHERE id = ?')
+              .get(item.record_id) as any;
+            if (!note) {
+              markEmbedDone(item.record_id, item.grain, target);
+              totalProcessed++;
+              continue;
+            }
+            text = `${note.title}\n\n${note.content}`;
+            payload = {
+              grain: 'note',
+              scope: note.scope,
+              project_id: note.project_id,
+              kind: null,
+              type: note.type,
+              task_type: null,
+              note_ref: null,
+              task_ref: null,
+              file_path: null,
+              agent: note.author,
+              success: null,
+              created_at: note.created_at,
+              text,
+            };
+            break;
+          }
+          case 'summary': {
+            const summary = db
+              .prepare('SELECT * FROM summaries WHERE id = ?')
+              .get(item.record_id) as any;
+            if (!summary) {
+              markEmbedDone(item.record_id, item.grain, target);
+              totalProcessed++;
+              continue;
+            }
+            const claims = db
+              .prepare('SELECT text FROM summary_claims WHERE summary_id = ? ORDER BY ordinal ASC')
+              .all(item.record_id) as Array<{ text: string }>;
+            text = claims.map((c) => c.text).join('\n');
+            payload = {
+              grain: 'summary',
+              scope: summary.scope,
+              project_id: summary.project_id,
+              kind: summary.kind,
+              type: null,
+              task_type: null,
+              note_ref: null,
+              task_ref: null,
+              file_path: null,
+              agent: summary.producer_model || summary.producer_tier,
+              success: summary.outcome === 'success',
+              created_at: summary.created_at,
+              text,
+            };
+            break;
+          }
+        }
+
+        if (recipe.embed_tier !== 'none') {
+          const vector = await embedDocument(text);
+
+          // Save embedding blob back to SQLite if table supports embedding column
+          if (item.grain === 'trajectory') {
+            db.prepare('UPDATE trajectories SET embedding = ? WHERE id = ?').run(
+              serializeEmbedding(vector),
+              item.record_id
+            );
+          } else if (item.grain === 'note') {
+            db.prepare('UPDATE notes SET embedding = ? WHERE id = ?').run(
+              serializeEmbedding(vector),
+              item.record_id
+            );
+          } else if (item.grain === 'summary') {
+            db.prepare('UPDATE summaries SET embedding = ? WHERE id = ?').run(
+              serializeEmbedding(vector),
+              item.record_id
+            );
+          }
+
+          if (qdrant && vector.length > 0) {
+            qdrantPointsToUpsert.push({
+              id: item.record_id,
+              vector,
+              payload,
+            });
+          }
+        }
+
+        markEmbedDone(item.record_id, item.grain, target);
+        totalProcessed++;
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        if (err instanceof EmbeddingConfigurationError) {
+          // The embedder itself is unavailable (e.g. the optional local embedder
+          // is not installed). No record is at fault: put this item and the rest
+          // of the batch back to pending and stop until it is fixed.
+          for (const pending of items.slice(itemIdx)) {
+            releaseEmbedClaim(pending.record_id, pending.grain, target, errorMsg);
+          }
+          logger.error({ target, error: errorMsg }, 'embedder unavailable; queue left pending');
+          embedderUnavailable = true;
+          break;
+        }
+        logger.error(
+          {
+            recordId: item.record_id,
+            grain: item.grain,
+            target,
+            error: errorMsg,
+          },
+          'error embedding record'
+        );
+        markEmbedFailed(item.record_id, item.grain, target, errorMsg);
+        totalFailed++;
+      }
+
+      // Yield to the event loop between embeddings so HTTP health/dashboard requests stay responsive
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    // [CR-09] Bulk upsert all computed points for this batch to Qdrant in a single roundtrip
+    if (qdrant && qdrantPointsToUpsert.length > 0) {
+      const targetCollection =
+        target === 'live' ? getStoreMeta()?.qdrant_alias || 'brain' : target;
+      try {
+        await qdrant.upsert(targetCollection, {
+          points: qdrantPointsToUpsert,
+        });
+      } catch (qdrantErr: any) {
+        // If collection was not created yet (e.g. freshly started Qdrant container), create it and retry once
+        const errMsg = qdrantErr instanceof Error ? qdrantErr.message : String(qdrantErr);
+        if (recipe.embed_dim > 0 && (qdrantErr?.status === 404 || errMsg.toLowerCase().includes('not found'))) {
+          try {
+            await createQdrantCollectionWithIndexes(qdrant, targetCollection, recipe.embed_dim);
+            await qdrant.upsert(targetCollection, {
+              points: qdrantPointsToUpsert,
+            });
+          } catch (retryErr) {
+            logger.warn(
+              {
+                collection: targetCollection,
+                error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+              },
+              'qdrant batch upsert retry after collection creation failed'
+            );
+          }
+        } else {
+          // Qdrant being unreachable is an index lag, not a database failure (Rule 2)
+          logger.warn(
+            {
+              collection: targetCollection,
+              count: qdrantPointsToUpsert.length,
+              error: errMsg,
+            },
+            'qdrant batch upsert skipped or failed'
+          );
+        }
+      }
+    }
+  }
+
+    const remaining = getPendingEmbedCount(target);
+    return { processed: totalProcessed, failed: totalFailed, remaining };
+  } finally {
+    isDrainRunning = false;
+  }
+}
+
+export async function ensureInitialEmbeddingsSync(options?: {
+  client?: QdrantClient;
+}): Promise<{ synced: boolean; enqueued: number; reason?: string }> {
+  const recipe = resolveEmbedderRecipe();
+  if (recipe.embed_tier === 'none' || recipe.embed_dim === 0) {
+    return { synced: false, enqueued: 0, reason: 'embed_tier is none' };
+  }
+
+  const qdrant = options?.client ?? getQdrantClient();
+  if (!qdrant) {
+    return { synced: false, enqueued: 0, reason: 'qdrant client unavailable' };
+  }
+
+  try {
+    const targetCollection = getStoreMeta()?.qdrant_alias || 'brain';
+    const collections = await qdrant.getCollections();
+    const collectionExists = collections.collections.some((c) => c.name === targetCollection);
+
+    if (!collectionExists) {
+      await createQdrantCollectionWithIndexes(qdrant, targetCollection, recipe.embed_dim);
+      logger.info({ collection: targetCollection }, 'created initial Qdrant collection');
+    }
+
+    const info = await qdrant.getCollection(targetCollection);
+    const pointCount = info.points_count ?? 0;
+
+    const db = getDb();
+    const noteCount = (
+      db.prepare('SELECT count(*) as count FROM notes WHERE is_latest = 1').get() as { count: number }
+    ).count;
+    const pendingQueueCount = getPendingEmbedCount('live');
+
+    if (pointCount === 0 && noteCount > 0 && pendingQueueCount === 0) {
+      logger.info({ noteCount, pointCount }, 'auto-enqueuing unindexed notes for initial embedding');
+      const noteRows = db.prepare('SELECT id FROM notes WHERE is_latest = 1').all() as Array<{ id: string }>;
+      transaction(db, () => {
+        for (const row of noteRows) {
+          enqueueForEmbedding(row.id, 'note', 'live');
+        }
+      })();
+
+      // Trigger asynchronous background drain
+      drainEmbedQueue({ target: 'live', batchSize: 50, maxBatches: 10 }).catch((err) => {
+        logger.error({ error: err instanceof Error ? err.message : String(err) }, 'initial embedding drain failed');
+      });
+
+      return { synced: true, enqueued: noteRows.length };
+    }
+
+    return {
+      synced: false,
+      enqueued: 0,
+      reason: `pointCount=${pointCount}, noteCount=${noteCount}, pending=${pendingQueueCount}`,
+    };
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    logger.warn({ error: errorMsg }, 'ensureInitialEmbeddingsSync probe failed');
+    return { synced: false, enqueued: 0, reason: errorMsg };
+  }
+}
+
+export async function createQdrantCollectionWithIndexes(
+  client: QdrantClient,
+  collectionName: string,
+  vectorDim: number
+): Promise<void> {
+  await client.createCollection(collectionName, {
+    vectors: {
+      size: vectorDim,
+      distance: 'Cosine',
+    },
+  });
+
+  const keywordFields = [
+    'scope',
+    'project_id',
+    'grain',
+    'kind',
+    'type',
+    'task_type',
+    'note_ref',
+    'task_ref',
+    'file_path',
+    'agent',
+  ];
+
+  for (const field of keywordFields) {
+    try {
+      await client.createPayloadIndex(collectionName, {
+        field_name: field,
+        field_schema: 'keyword',
+      });
+    } catch (err) {
+      logger.warn({ collectionName, field, error: err }, 'failed to create keyword index');
+    }
+  }
+
+  try {
+    await client.createPayloadIndex(collectionName, {
+      field_name: 'success',
+      field_schema: 'bool',
+    });
+  } catch (err) {
+    logger.warn({ collectionName, field: 'success', error: err }, 'failed to create bool index');
+  }
+
+  try {
+    await client.createPayloadIndex(collectionName, {
+      field_name: 'created_at',
+      field_schema: 'integer',
+    });
+  } catch (err) {
+    logger.warn({ collectionName, field: 'created_at', error: err }, 'failed to create integer index');
+  }
+}
+
+export async function startReembed(options?: {
+  newCollectionName?: string;
+  client?: QdrantClient;
+}): Promise<{ collection: string; processed: number; failed: number }> {
+  // [CR-11] Concurrency guard to prevent parallel re-embedding runs
+  if (activeReembedStatus.status === 'running') {
+    logger.warn(
+      { collection: activeReembedStatus.collection, processed: activeReembedStatus.processed },
+      'startReembed called while a reembed process is already running'
+    );
+    return {
+      collection: activeReembedStatus.collection || '',
+      processed: activeReembedStatus.processed,
+      failed: activeReembedStatus.failed,
+    };
+  }
+
+  const newCollectionName =
+    options?.newCollectionName || `brain_v_${Math.floor(Date.now() / 1000)}`;
+  const qdrant = options?.client ?? getQdrantClient();
+  const db = getDb();
+  const recipe = resolveEmbedderRecipe();
+
+  activeReembedStatus = {
+    status: 'running',
+    collection: newCollectionName,
+    total: 0,
+    processed: 0,
+    failed: 0,
+    started_at: Math.floor(Date.now() / 1000),
+    completed_at: null,
+    error: null,
+  };
+
+  try {
+    // Collect active records
+    const noteRows = db.prepare('SELECT id FROM notes WHERE is_latest = 1').all() as Array<{ id: string }>;
+    const trajRows = db.prepare('SELECT id FROM trajectories').all() as Array<{ id: string }>;
+    const obsRows = db.prepare('SELECT id FROM observations').all() as Array<{ id: string }>;
+    const sumRows = db.prepare('SELECT id FROM summaries WHERE is_latest = 1').all() as Array<{ id: string }>;
+
+    activeReembedStatus.total = noteRows.length + trajRows.length + obsRows.length + sumRows.length;
+
+    // Enqueue to embed_queue with target = newCollectionName in a single atomic transaction (CR-11)
+    transaction(db, () => {
+      for (const r of noteRows) enqueueForEmbedding(r.id, 'note', newCollectionName);
+      for (const r of trajRows) enqueueForEmbedding(r.id, 'trajectory', newCollectionName);
+      for (const r of obsRows) enqueueForEmbedding(r.id, 'observation', newCollectionName);
+      for (const r of sumRows) enqueueForEmbedding(r.id, 'summary', newCollectionName);
+    })();
+
+    // Create new collection in Qdrant if reachable
+    if (qdrant && recipe.embed_dim > 0) {
+      try {
+        await createQdrantCollectionWithIndexes(qdrant, newCollectionName, recipe.embed_dim);
+      } catch (qdrantErr) {
+        logger.warn(
+          { error: qdrantErr instanceof Error ? qdrantErr.message : String(qdrantErr) },
+          'could not create qdrant collection for reembed'
+        );
+      }
+    }
+
+    // Wait for any in-flight 'live' drain to finish before draining the new collection
+    while (isDrainRunning) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    // Drain queue for new collection until empty
+    let processedTotal = 0;
+    let failedTotal = 0;
+
+    while (true) {
+      const { processed, failed, remaining } = await drainEmbedQueue({
+        target: newCollectionName,
+        batchSize: 50,
+        maxBatches: 1,
+        client: qdrant ?? undefined,
+      });
+
+      processedTotal += processed;
+      failedTotal += failed;
+      activeReembedStatus.processed = processedTotal;
+      activeReembedStatus.failed = failedTotal;
+
+      if (remaining === 0) break;
+    }
+
+    // Switch alias in Qdrant if reachable
+    const meta = getStoreMeta();
+    const aliasName = meta?.qdrant_alias || 'brain';
+
+    if (qdrant) {
+      try {
+        await qdrant.updateCollectionAliases({
+          actions: [
+            {
+              create_alias: {
+                collection_name: newCollectionName,
+                alias_name: aliasName,
+              },
+            },
+          ],
+        });
+      } catch (aliasErr) {
+        logger.warn({ error: aliasErr }, 'failed to update collection alias in qdrant');
+      }
+    }
+
+    // Update store_meta last as the commit point
+    commitStoreMeta(recipe, aliasName);
+
+    activeReembedStatus.status = 'completed';
+    activeReembedStatus.completed_at = Math.floor(Date.now() / 1000);
+
+    return {
+      collection: newCollectionName,
+      processed: processedTotal,
+      failed: failedTotal,
+    };
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    activeReembedStatus.status = 'failed';
+    activeReembedStatus.error = errorMsg;
+    logger.error({ error: errorMsg }, 'reembed failed');
+    throw error;
+  }
+}
