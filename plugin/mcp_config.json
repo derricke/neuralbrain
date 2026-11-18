@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "neuralbrain": {
+      "command": "neuralbrain",
+      "args": [
+        "mcp"
+      ],
+      "env": {
+        "BRAIN_API_URL": "http://127.0.0.1:3737"
+      }
+    }
+  }
+}
