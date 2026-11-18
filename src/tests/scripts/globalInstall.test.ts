@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { installGlobalPackage, isInstalledCopy, isNpxCacheCopy } from '../../cli';
+import { installGlobalPackage, isInstalledCopy, locateInstalledCopy, isNpxCacheCopy } from '../../cli';
 
 type Call = { command: string; args: string[]; options: any };
 
@@ -17,7 +17,15 @@ function fakeNpm(opts: { globalRoot: string; packStatus?: number; installStatus?
         stdout: opts.packStdout ?? '> neuralbrain@0.1.0 prepack\n> npm run build\n[{"filename":"neuralbrain-0.1.0.tgz"}]',
       };
     }
-    if (args[0] === 'install') return { status: opts.installStatus ?? 0 };
+    if (args[0] === 'install') {
+      const status = opts.installStatus ?? 0;
+      // Like the real npm, a successful global install leaves the package on disk.
+      if (status === 0) {
+        fs.mkdirSync(path.join(opts.globalRoot, 'neuralbrain'), { recursive: true });
+        fs.writeFileSync(path.join(opts.globalRoot, 'neuralbrain', 'package.json'), '{"name":"neuralbrain"}');
+      }
+      return { status };
+    }
     return { status: 1 };
   };
   return { run, calls };
@@ -142,5 +150,42 @@ describe('global install copies the package instead of linking it', () => {
       ok: false,
       error: '`npm install -g` failed',
     });
+  });
+});
+
+describe('locateInstalledCopy: never trusts a masked `npm root -g`', () => {
+  let tmp: string;
+  const savedPrefix = process.env.npm_config_prefix;
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'nb-locate-'));
+  });
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+    if (savedPrefix === undefined) delete process.env.npm_config_prefix;
+    else process.env.npm_config_prefix = savedPrefix;
+  });
+  const install = (root: string) => {
+    fs.mkdirSync(path.join(root, 'neuralbrain'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'neuralbrain', 'package.json'), '{}');
+  };
+
+  test('uses npm\'s answer when the package is really there', () => {
+    const root = path.join(tmp, 'lib', 'node_modules');
+    install(root);
+    expect(locateInstalledCopy(root)).toBe(path.join(root, 'neuralbrain'));
+  });
+
+  test('ignores output npm masked with *** and falls back to the configured prefix', () => {
+    const prefix = path.join(tmp, '3f2a9c1e-5b7d-4e8f-9a0b-1c2d3e4f5a6b', 'prefix');
+    const root = process.platform === 'win32' ? path.join(prefix, 'node_modules') : path.join(prefix, 'lib', 'node_modules');
+    install(root);
+    process.env.npm_config_prefix = prefix;
+    const masked = root.replace('3f2a9c1e-5b7d-4e8f-9a0b-1c2d3e4f5a6b', '***');
+    expect(locateInstalledCopy(masked)).toBe(path.join(root, 'neuralbrain'));
+  });
+
+  test('returns null when no candidate has the package', () => {
+    delete process.env.npm_config_prefix;
+    expect(locateInstalledCopy(path.join(tmp, 'nowhere'), () => false)).toBeNull();
   });
 });

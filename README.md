@@ -72,6 +72,14 @@ npm install -g neuralbrain
 neuralbrain install
 ```
 
+Or in one step with npx:
+
+```bash
+npx neuralbrain install
+```
+
+npx runs from a temporary cache, so `install` puts a permanent copy in npm's global folder and runs the brain from there. Afterwards `neuralbrain` works in any shell.
+
 To update, run `npm install -g neuralbrain@latest`, then `neuralbrain start`.
 
 ### From source
