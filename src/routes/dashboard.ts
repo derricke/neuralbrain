@@ -23,6 +23,50 @@ import { dashboardJs } from '../dashboard/clientScript';
 
 export const dashboardRouter = Router();
 
+// In-memory idempotency key deduplication cache (prevents double-submit on retried mutations)
+const IDEMPOTENCY_TTL_MS = 5 * 60 * 1000;
+const IDEMPOTENCY_MAX_ENTRIES = 500;
+const idempotencyCache = new Map<string, { status: number; body: unknown; expiresAt: number }>();
+
+function checkIdempotencyKey(req: Request, res: Response, next: NextFunction) {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) || req.path === '/api/session') {
+    return next();
+  }
+
+  const rawKey = req.headers['idempotency-key'];
+  const idempotencyKey = typeof rawKey === 'string' ? rawKey.trim() : '';
+  if (!idempotencyKey) {
+    return next();
+  }
+
+  const now = Date.now();
+  const cacheKey = `${req.method}:${req.path}:${idempotencyKey}`;
+  const cached = idempotencyCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    res.setHeader('X-Idempotency-Replayed', 'true');
+    return res.status(cached.status).json(cached.body);
+  }
+  if (cached) {
+    idempotencyCache.delete(cacheKey);
+  }
+
+  const originalJson = res.json.bind(res);
+  res.json = ((body: unknown) => {
+    if (idempotencyCache.size >= IDEMPOTENCY_MAX_ENTRIES) {
+      const oldestKey = idempotencyCache.keys().next().value;
+      if (oldestKey) idempotencyCache.delete(oldestKey);
+    }
+    idempotencyCache.set(cacheKey, {
+      status: res.statusCode || 200,
+      body,
+      expiresAt: Date.now() + IDEMPOTENCY_TTL_MS,
+    });
+    return originalJson(body);
+  }) as Response['json'];
+
+  next();
+}
+
 // Strict Security Headers Middleware for all /dashboard endpoints
 dashboardRouter.use((_req: Request, res: Response, next: NextFunction) => {
   res.setHeader(
@@ -35,6 +79,7 @@ dashboardRouter.use((_req: Request, res: Response, next: NextFunction) => {
   res.setHeader('Cache-Control', 'no-store');
   next();
 });
+dashboardRouter.use(checkIdempotencyKey);
 
 // ---------------------------------------------------------------------------
 // HTML & Static Assets (Served directly from compiled TypeScript modules)
