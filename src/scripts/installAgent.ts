@@ -669,7 +669,7 @@ export function installAgentIntegration(options: InstallAgentOptions = {}): Inst
       {
         name: 'neuralbrain',
         displayName: 'neuralbrain',
-        version: '0.0.1',
+        version: '0.0.2',
         description: 'neuralbrain persistent memory service integration for Antigravity',
       },
       dryRun,

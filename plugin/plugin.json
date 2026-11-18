@@ -1,6 +1,6 @@
 {
   "name": "neuralbrain",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Standalone memory service (brain) for coding agents — hybrid dense + BM25 search, curated notes, failure pattern push injection, and extractive consolidation.",
   "mcpServers": "./mcp_config.json",
   "hooks": "./hooks.json",
