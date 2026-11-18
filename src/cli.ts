@@ -612,6 +612,37 @@ function readPackageVersion(packageRoot: string): string | null {
   }
 }
 
+/**
+ * Finds the globally installed copy on disk.
+ *
+ * `npm root -g` alone is not trusted: npm masks anything that looks like a
+ * UUID in its output (legacy npm tokens were UUIDs), so a global folder whose
+ * path contains one is printed with `***` and points nowhere. Candidates, first
+ * existing one wins: npm's answer (unless masked), the configured global
+ * prefix, then the folder next to the running node binary (nvm and standard
+ * installs).
+ */
+export function locateInstalledCopy(
+  reportedRoot: string,
+  exists: (p: string) => boolean = fs.existsSync
+): string | null {
+  const roots: string[] = [];
+  if (reportedRoot && !reportedRoot.includes('***')) roots.push(reportedRoot);
+  const prefix = process.env.npm_config_prefix || process.env.NPM_CONFIG_PREFIX;
+  if (prefix) {
+    roots.push(process.platform === 'win32' ? path.join(prefix, 'node_modules') : path.join(prefix, 'lib', 'node_modules'));
+  }
+  const binDir = path.dirname(process.execPath);
+  roots.push(
+    process.platform === 'win32' ? path.join(binDir, 'node_modules') : path.join(path.dirname(binDir), 'lib', 'node_modules')
+  );
+  for (const root of roots) {
+    const candidate = path.join(root, 'neuralbrain');
+    if (exists(path.join(candidate, 'package.json'))) return candidate;
+  }
+  return null;
+}
+
 export function installGlobalPackage(
   packageRoot: string,
   run: SpawnFn = spawnSync as unknown as SpawnFn
@@ -621,11 +652,19 @@ export function installGlobalPackage(
   }
 
   const rootRes = run('npm', ['root', '-g'], { encoding: 'utf8', stdio: 'pipe' });
-  const globalRoot = rootRes.status === 0 ? String(rootRes.stdout || '').trim() : '';
-  if (!globalRoot) {
-    return { ok: false, installedRoot: null, alreadyInstalled: false, error: '`npm root -g` failed' };
-  }
-  const installedRoot = path.join(globalRoot, 'neuralbrain');
+  const reportedRoot = rootRes.status === 0 ? String(rootRes.stdout || '').trim() : '';
+  // The real location is confirmed on disk after installing (see locateInstalledCopy).
+  const located = (): GlobalInstallResult => {
+    const root = locateInstalledCopy(reportedRoot);
+    return root
+      ? { ok: true, installedRoot: root, alreadyInstalled: false }
+      : {
+          ok: false,
+          installedRoot: null,
+          alreadyInstalled: false,
+          error: 'installed, but could not find the global copy (check `npm root -g`)',
+        };
+  };
   // onnxruntime-node's script only fetches the CUDA add-on, which the host never
   // uses; with CUDA present it can 404 and fail the whole install. Skip it in
   // case npm runs the script anyway (npm 10 and older run every script).
@@ -643,7 +682,7 @@ export function installGlobalPackage(
     if (installRes.status !== 0) {
       return { ok: false, installedRoot: null, alreadyInstalled: false, error: '`npm install -g` failed' };
     }
-    return { ok: true, installedRoot, alreadyInstalled: false };
+    return located();
   }
 
   const packDir = fs.mkdtempSync(path.join(os.tmpdir(), 'neuralbrain-pack-'));
@@ -677,7 +716,7 @@ export function installGlobalPackage(
     if (installRes.status !== 0) {
       return { ok: false, installedRoot: null, alreadyInstalled: false, error: '`npm install -g` failed' };
     }
-    return { ok: true, installedRoot, alreadyInstalled: false };
+    return located();
   } finally {
     fs.rmSync(packDir, { recursive: true, force: true });
   }
