@@ -1,4 +1,4 @@
-import { resetDb } from '../../lib/db';
+import { getDb, resetDb } from '../../lib/db';
 import { setCustomEmbedder } from '../../learning/embedding';
 import { verifyOrCreateStoreMeta } from '../../learning/storeMeta';
 import {
@@ -6,7 +6,12 @@ import {
   getReembedStatus,
   startReembed,
 } from '../../learning/embedWorker';
-import { getPendingEmbedCount } from '../../memory/embedQueueStore';
+import {
+  enqueueForEmbedding,
+  getPendingEmbedCount,
+  markEmbedFailed,
+  recoverStaleRunningEmbeds,
+} from '../../memory/embedQueueStore';
 import { createNote } from '../../memory/noteStore';
 
 describe('embedWorker single-flight and re-embed yield', () => {
@@ -154,5 +159,110 @@ describe('embedWorker single-flight and re-embed yield', () => {
       client: mockQdrantClient,
     });
     expect(afterRes).toEqual({ processed: 1, failed: 0, remaining: 0 });
+  });
+
+  it('does not markEmbedDone when configured Qdrant upsert fails', async () => {
+    createNote({
+      scope: 'project',
+      projectId: 'test-proj',
+      type: 'fact',
+      title: 'Qdrant Fail Note',
+      content: 'Should stay pending if Qdrant upsert fails',
+    });
+
+    setCustomEmbedder(async () => Array.from({ length: 512 }, () => 0.04));
+
+    const failingQdrant = {
+      upsert: jest.fn().mockRejectedValue(new Error('Qdrant 500')),
+    } as any;
+
+    const res = await drainEmbedQueue({
+      target: 'live',
+      batchSize: 10,
+      client: failingQdrant,
+    });
+
+    expect(res.processed).toBe(0);
+    expect(res.remaining).toBe(1);
+    expect(getPendingEmbedCount('live')).toBe(1);
+  });
+
+  it('deletes regular brain collection on reembed alias switch and cleans up on failure', async () => {
+    const db = getDb();
+    const note = createNote({
+      scope: 'project',
+      projectId: 'test-proj',
+      type: 'fact',
+      title: 'Reembed Alias Note',
+      content: 'Tests regular collection cleanup and deferred SQLite BLOB update',
+    });
+
+    setCustomEmbedder(async () => Array.from({ length: 512 }, () => 0.05));
+
+    const mockQdrant = {
+      getCollections: jest.fn().mockResolvedValue({ collections: [{ name: 'brain' }] }),
+      createCollection: jest.fn().mockResolvedValue(true),
+      deleteCollection: jest.fn().mockResolvedValue(true),
+      createPayloadIndex: jest.fn().mockResolvedValue(true),
+      upsert: jest.fn().mockResolvedValue(true),
+      updateCollectionAliases: jest.fn().mockResolvedValue(true),
+    } as any;
+
+    const okRes = await startReembed({
+      newCollectionName: 'brain_v_alias_test',
+      client: mockQdrant,
+    });
+    expect(okRes.processed).toBe(1);
+    expect(mockQdrant.deleteCollection).toHaveBeenCalledWith('brain');
+    expect(mockQdrant.updateCollectionAliases).toHaveBeenCalledWith({
+      actions: [
+        { create_alias: { collection_name: 'brain_v_alias_test', alias_name: 'brain' } },
+      ],
+    });
+    const noteRow = db.prepare('SELECT embedding FROM notes WHERE id = ?').get(note.id) as { embedding: Buffer | null };
+    expect(noteRow.embedding).not.toBeNull();
+
+    // Failure during alias switch cleans up embed_queue for target
+    const failingAliasQdrant = {
+      getCollections: jest.fn().mockResolvedValue({ collections: [] }),
+      createCollection: jest.fn().mockResolvedValue(true),
+      createPayloadIndex: jest.fn().mockResolvedValue(true),
+      upsert: jest.fn().mockResolvedValue(true),
+      updateCollectionAliases: jest.fn().mockRejectedValue(new Error('alias switch failed')),
+    } as any;
+
+    await expect(
+      startReembed({
+        newCollectionName: 'brain_v_fail_cleanup',
+        client: failingAliasQdrant,
+      })
+    ).rejects.toThrow('alias switch failed');
+
+    const leftover = db
+      .prepare('SELECT COUNT(*) as c FROM embed_queue WHERE target = ?')
+      .get('brain_v_fail_cleanup') as { c: number };
+    expect(leftover.c).toBe(0);
+  });
+
+  it('recovers stale running embeds and retries transient failures up to MAX_EMBED_ATTEMPTS', () => {
+    const db = getDb();
+    enqueueForEmbedding('rec_stale_1', 'note', 'live');
+    db.prepare(
+      `UPDATE embed_queue SET status = 'running', attempts = 1, queued_at = unixepoch() - 600 WHERE record_id = 'rec_stale_1'`
+    ).run();
+
+    const recovered = recoverStaleRunningEmbeds('live', 300);
+    expect(recovered).toBe(1);
+    expect(getPendingEmbedCount('live')).toBe(1);
+
+    // Retry transient failures up to MAX_EMBED_ATTEMPTS (3)
+    markEmbedFailed('rec_stale_1', 'note', 'live', 'err 1');
+    let row = db.prepare(`SELECT status FROM embed_queue WHERE record_id = 'rec_stale_1'`).get() as { status: string };
+    expect(row.status).toBe('pending');
+
+    db.prepare(`UPDATE embed_queue SET attempts = 3 WHERE record_id = 'rec_stale_1'`).run();
+    markEmbedFailed('rec_stale_1', 'note', 'live', 'err 3');
+    row = db.prepare(`SELECT status FROM embed_queue WHERE record_id = 'rec_stale_1'`).get() as { status: string };
+    expect(row.status).toBe('failed');
   });
 });

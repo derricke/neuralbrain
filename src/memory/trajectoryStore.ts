@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
+import { redactOptional, redactSecrets } from '../lib/redactSecrets';
 import { resolveScope } from '../lib/scope';
 import { dequeueRecord, enqueueForEmbedding } from './embedQueueStore';
 import { recordDeadLetter } from './deadLetterStore';
@@ -265,7 +266,8 @@ export function logTrajectory(record: TrajectoryRecord): string {
   // unknown outcome into an assertion of failure.
   const successInt = normalizeSuccess(successValue);
   const retries = Number(record.retries || 0);
-  const result = record.result ?? null;
+  const sanitizedDescription = redactSecrets(description);
+  const sanitizedResult = redactOptional(record.result ?? null);
   const createdAt = record.createdAt ? Math.floor(record.createdAt) : Math.floor(Date.now() / 1000);
 
   const embeddingBuffer = record.embedding
@@ -308,8 +310,8 @@ export function logTrajectory(record: TrajectoryRecord): string {
       sessionId,
       taskType,
       agent,
-      description,
-      result,
+      sanitizedDescription,
+      sanitizedResult,
       successInt,
       rollupSource,
       Number(toolCalls ?? 0),
@@ -348,7 +350,7 @@ export function logTrajectory(record: TrajectoryRecord): string {
   // If failed, auto-upsert failure pattern. An unknown outcome (NULL) is not a
   // failure and must not be injected as one.
   if (successInt === 0) {
-    const errorText = result?.trim() || failureErrorText?.trim() || 'Task failed';
+    const errorText = sanitizedResult?.trim() || failureErrorText?.trim() || 'Task failed';
     try {
       upsertFailurePattern({
         scope,
@@ -461,13 +463,16 @@ export function captureTrajectories(rawItems: unknown[]): CaptureTrajectoriesRes
   };
 }
 
+const TRAJECTORY_COLUMNS =
+  'id, scope, project_id, note_ref, task_ref, session_id, task_type, agent, description, result, success, rollup_source, tool_calls, retries, duration_ms, created_at, archived_at';
+
 export function getTrajectory(id: string) {
-  return getDb().prepare('SELECT * FROM trajectories WHERE id = ?').get(id);
+  return getDb().prepare(`SELECT ${TRAJECTORY_COLUMNS} FROM trajectories WHERE id = ?`).get(id);
 }
 
 export function getProjectTrajectories(projectId: string, limit = 50) {
   return getDb()
-    .prepare('SELECT * FROM trajectories WHERE project_id = ? ORDER BY created_at DESC LIMIT ?')
+    .prepare(`SELECT ${TRAJECTORY_COLUMNS} FROM trajectories WHERE project_id = ? ORDER BY created_at DESC LIMIT ?`)
     .all(projectId, limit);
 }
 
@@ -518,7 +523,7 @@ export function listTrajectories(filters?: {
 
   return db
     .prepare(`
-      SELECT * FROM trajectories
+      SELECT ${TRAJECTORY_COLUMNS} FROM trajectories
       ${whereClause}
       ORDER BY created_at DESC
       LIMIT ? OFFSET ?
@@ -541,6 +546,7 @@ export interface CleanupResult {
 export function runCleanup(): CleanupResult {
   const db = getDb();
   const now = Math.floor(Date.now() / 1000);
+  const BATCH_SIZE = 500;
 
   const obsArchiveDays = parseInt(process.env.BRAIN_OBS_ARCHIVE_DAYS || '30', 10);
   const obsDeleteDays = parseInt(process.env.BRAIN_OBS_DELETE_DAYS || '90', 10);
@@ -553,29 +559,29 @@ export function runCleanup(): CleanupResult {
   const trajArchiveCutoff = now - trajArchiveDays * 86400;
   const trajDeleteCutoff = now - trajDeleteDays * 86400;
 
-  const result = transaction(db, () => {
-    // 1. Archive observations in bounded batches
-    const selectObsBatch = db.prepare(`
-      SELECT id, scope, project_id, note_ref, task_ref, session_id, agent,
-             kind, tool_name, file_path, input, output, duration_ms, failed,
-             created_at, archived_at
-      FROM observations
-      WHERE (created_at < ? AND archived_at IS NULL) OR archived_at IS NOT NULL
-      LIMIT 500
-    `);
+  // 1. Archive observations in bounded batches (each batch in its own transaction)
+  const selectObsBatch = db.prepare(`
+    SELECT id, scope, project_id, note_ref, task_ref, session_id, agent,
+           kind, tool_name, file_path, input, output, duration_ms, failed,
+           created_at, archived_at
+    FROM observations
+    WHERE (created_at < ? AND archived_at IS NULL) OR archived_at IS NOT NULL
+    LIMIT ?
+  `);
 
-    const insertObsArchive = db.prepare(`
-      INSERT OR IGNORE INTO observations_archive (
-        id, original_observation_id, scope, project_id, note_ref, task_ref, session_id, agent,
-        kind, tool_name, file_path, input, output, duration_ms, failed, created_at, archived_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+  const insertObsArchive = db.prepare(`
+    INSERT OR IGNORE INTO observations_archive (
+      id, original_observation_id, scope, project_id, note_ref, task_ref, session_id, agent,
+      kind, tool_name, file_path, input, output, duration_ms, failed, created_at, archived_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
 
-    const deleteObsActive = db.prepare('DELETE FROM observations WHERE id = ?');
+  const deleteObsActive = db.prepare('DELETE FROM observations WHERE id = ?');
 
-    let observationsArchived = 0;
-    while (true) {
-      const obsBatch = selectObsBatch.all(obsArchiveCutoff) as Array<{
+  let observationsArchived = 0;
+  while (true) {
+    const batchCount = transaction(db, () => {
+      const obsBatch = selectObsBatch.all(obsArchiveCutoff, BATCH_SIZE) as Array<{
         id: string;
         scope: string;
         project_id: string | null;
@@ -594,7 +600,7 @@ export function runCleanup(): CleanupResult {
         archived_at: number | null;
       }>;
 
-      if (obsBatch.length === 0) break;
+      if (obsBatch.length === 0) return 0;
 
       for (const obs of obsBatch) {
         insertObsArchive.run(
@@ -617,72 +623,100 @@ export function runCleanup(): CleanupResult {
           obs.archived_at ?? now
         );
         deleteObsActive.run(obs.id);
-        observationsArchived++;
       }
-    }
+      return obsBatch.length;
+    })();
 
-    // 2. Delete old archived observations
-    let observationsDeleted = 0;
-    if (keepSummarized) {
-      // Keep summarized sources: exclude observations referenced in summary_sources
-      const deleteResult = db
-        .prepare(`
-          DELETE FROM observations_archive
-          WHERE archived_at < ?
-            AND original_observation_id NOT IN (
-              SELECT record_id FROM summary_sources WHERE grain = 'observation'
-            )
-        `)
-        .run(obsDeleteCutoff);
-      observationsDeleted = deleteResult.changes;
-    } else {
-      // Find summarized observations that are about to be deleted
-      const summarizedToDelete = db
-        .prepare(`
-          SELECT DISTINCT s.summary_id
-          FROM summary_sources s
-          JOIN observations_archive o ON s.record_id = o.original_observation_id
-          WHERE s.grain = 'observation' AND o.archived_at < ?
-        `)
-        .all(obsDeleteCutoff) as Array<{ summary_id: string }>;
+    if (batchCount === 0) break;
+    observationsArchived += batchCount;
+  }
 
-      const deleteResult = db
-        .prepare('DELETE FROM observations_archive WHERE archived_at < ?')
-        .run(obsDeleteCutoff);
-      observationsDeleted = deleteResult.changes;
+  // 2. Delete old archived observations in bounded batches
+  let observationsDeleted = 0;
+  const selectObsDeleteBatch = keepSummarized
+    ? db.prepare(`
+        SELECT id, original_observation_id
+        FROM observations_archive
+        WHERE archived_at < ?
+          AND original_observation_id NOT IN (
+            SELECT record_id FROM summary_sources WHERE grain = 'observation'
+          )
+        LIMIT ?
+      `)
+    : db.prepare(`
+        SELECT id, original_observation_id
+        FROM observations_archive
+        WHERE archived_at < ?
+        LIMIT ?
+      `);
 
-      // Mark affected summaries with sources_expired = 1
-      if (summarizedToDelete.length > 0) {
-        const updateSummary = db.prepare('UPDATE summaries SET sources_expired = 1 WHERE id = ?');
-        for (const item of summarizedToDelete) {
-          updateSummary.run(item.summary_id);
+  while (true) {
+    const batchObsIds = transaction(db, () => {
+      const rows = selectObsDeleteBatch.all(obsDeleteCutoff, BATCH_SIZE) as Array<{
+        id: string;
+        original_observation_id: string;
+      }>;
+      if (rows.length === 0) return [] as string[];
+
+      const archiveRowIds = rows.map((r) => r.id);
+      const origObsIds = rows.map((r) => r.original_observation_id);
+      const idPlaceholders = archiveRowIds.map(() => '?').join(',');
+      const origPlaceholders = origObsIds.map(() => '?').join(',');
+
+      if (!keepSummarized) {
+        const summarizedToExpire = db
+          .prepare(
+            `SELECT DISTINCT summary_id FROM summary_sources WHERE grain = 'observation' AND record_id IN (${origPlaceholders})`
+          )
+          .all(...origObsIds) as Array<{ summary_id: string }>;
+
+        if (summarizedToExpire.length > 0) {
+          const updateSummary = db.prepare('UPDATE summaries SET sources_expired = 1 WHERE id = ?');
+          for (const item of summarizedToExpire) {
+            updateSummary.run(item.summary_id);
+          }
         }
       }
-    }
 
-    // 3. Archive trajectories in bounded batches
-    const selectTrajBatch = db.prepare(`
-      SELECT id, scope, project_id, note_ref, task_ref, session_id, task_type, agent,
-             description, result, success, rollup_source, tool_calls, retries,
-             duration_ms, embedding, created_at, archived_at
-      FROM trajectories
-      WHERE (created_at < ? AND archived_at IS NULL) OR archived_at IS NOT NULL
-      LIMIT 500
-    `);
+      db.prepare(`DELETE FROM observations_archive WHERE id IN (${idPlaceholders})`).run(
+        ...archiveRowIds
+      );
+      db.prepare(
+        `DELETE FROM embed_queue WHERE grain = 'observation' AND record_id IN (${origPlaceholders})`
+      ).run(...origObsIds);
 
-    const insertTrajArchive = db.prepare(`
-      INSERT OR IGNORE INTO trajectory_archive (
-        id, original_trajectory_id, scope, project_id, note_ref, task_ref, session_id,
-        task_type, agent, description, result, success, rollup_source, tool_calls,
-        retries, duration_ms, embedding, created_at, archived_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+      return origObsIds;
+    })();
 
-    const deleteTrajActive = db.prepare('DELETE FROM trajectories WHERE id = ?');
+    if (batchObsIds.length === 0) break;
+    observationsDeleted += batchObsIds.length;
+    void deleteQdrantPoints(batchObsIds);
+  }
 
-    let trajectoriesArchived = 0;
-    while (true) {
-      const trajBatch = selectTrajBatch.all(trajArchiveCutoff) as Array<{
+  // 3. Archive trajectories in bounded batches (each batch in its own transaction)
+  const selectTrajBatch = db.prepare(`
+    SELECT id, scope, project_id, note_ref, task_ref, session_id, task_type, agent,
+           description, result, success, rollup_source, tool_calls, retries,
+           duration_ms, embedding, created_at, archived_at
+    FROM trajectories
+    WHERE (created_at < ? AND archived_at IS NULL) OR archived_at IS NOT NULL
+    LIMIT ?
+  `);
+
+  const insertTrajArchive = db.prepare(`
+    INSERT OR IGNORE INTO trajectory_archive (
+      id, original_trajectory_id, scope, project_id, note_ref, task_ref, session_id,
+      task_type, agent, description, result, success, rollup_source, tool_calls,
+      retries, duration_ms, embedding, created_at, archived_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const deleteTrajActive = db.prepare('DELETE FROM trajectories WHERE id = ?');
+
+  let trajectoriesArchived = 0;
+  while (true) {
+    const batchCount = transaction(db, () => {
+      const trajBatch = selectTrajBatch.all(trajArchiveCutoff, BATCH_SIZE) as Array<{
         id: string;
         scope: string;
         project_id: string | null;
@@ -703,7 +737,7 @@ export function runCleanup(): CleanupResult {
         archived_at: number | null;
       }>;
 
-      if (trajBatch.length === 0) break;
+      if (trajBatch.length === 0) return 0;
 
       for (const traj of trajBatch) {
         insertTrajArchive.run(
@@ -728,40 +762,61 @@ export function runCleanup(): CleanupResult {
           traj.archived_at ?? now
         );
         deleteTrajActive.run(traj.id);
-        trajectoriesArchived++;
       }
-    }
+      return trajBatch.length;
+    })();
 
-    // 4. Delete archived trajectories (only if trajDeleteDays > 0)
-    let trajectoriesDeleted = 0;
-    const deletedTrajIds: string[] = [];
-    if (trajDeleteDays > 0) {
-      const toDelete = db
-        .prepare('SELECT original_trajectory_id FROM trajectory_archive WHERE archived_at < ?')
-        .all(trajDeleteCutoff) as Array<{ original_trajectory_id: string }>;
-      for (const row of toDelete) {
-        deletedTrajIds.push(row.original_trajectory_id);
-      }
-      const deleteResult = db
-        .prepare('DELETE FROM trajectory_archive WHERE archived_at < ?')
-        .run(trajDeleteCutoff);
-      trajectoriesDeleted = deleteResult.changes;
-    }
-
-    return {
-      archived: trajectoriesArchived,
-      deleted: trajectoriesDeleted,
-      observationsArchived,
-      observationsDeleted,
-      trajectoriesArchived,
-      trajectoriesDeleted,
-      deletedTrajIds,
-    };
-  })();
-
-  if (result.deletedTrajIds && result.deletedTrajIds.length > 0) {
-    void deleteQdrantPoints(result.deletedTrajIds);
+    if (batchCount === 0) break;
+    trajectoriesArchived += batchCount;
   }
+
+  // 4. Delete archived trajectories in bounded batches (only if trajDeleteDays > 0)
+  let trajectoriesDeleted = 0;
+  const deletedTrajIds: string[] = [];
+  if (trajDeleteDays > 0) {
+    const selectTrajDeleteBatch = db.prepare(
+      'SELECT id, original_trajectory_id FROM trajectory_archive WHERE archived_at < ? LIMIT ?'
+    );
+
+    while (true) {
+      const batchTrajIds = transaction(db, () => {
+        const rows = selectTrajDeleteBatch.all(trajDeleteCutoff, BATCH_SIZE) as Array<{
+          id: string;
+          original_trajectory_id: string;
+        }>;
+        if (rows.length === 0) return [] as string[];
+
+        const archiveRowIds = rows.map((r) => r.id);
+        const origTrajIds = rows.map((r) => r.original_trajectory_id);
+        const idPlaceholders = archiveRowIds.map(() => '?').join(',');
+        const origPlaceholders = origTrajIds.map(() => '?').join(',');
+
+        db.prepare(`DELETE FROM trajectory_archive WHERE id IN (${idPlaceholders})`).run(
+          ...archiveRowIds
+        );
+        db.prepare(
+          `DELETE FROM embed_queue WHERE grain = 'trajectory' AND record_id IN (${origPlaceholders})`
+        ).run(...origTrajIds);
+
+        return origTrajIds;
+      })();
+
+      if (batchTrajIds.length === 0) break;
+      trajectoriesDeleted += batchTrajIds.length;
+      deletedTrajIds.push(...batchTrajIds);
+      void deleteQdrantPoints(batchTrajIds);
+    }
+  }
+
+  const result = {
+    archived: trajectoriesArchived,
+    deleted: trajectoriesDeleted,
+    observationsArchived,
+    observationsDeleted,
+    trajectoriesArchived,
+    trajectoriesDeleted,
+    deletedTrajIds,
+  };
 
   logger.info(result, 'retention cleanup complete');
   return {

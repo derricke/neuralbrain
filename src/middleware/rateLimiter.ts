@@ -42,6 +42,26 @@ export function normalizePathForRateLimit(path: string): string {
   if (/^\/summaries\/[^/]+$/.test(path)) {
     return '/summaries/:id';
   }
+  // Normalize /sessions/<id>/end -> /sessions/:id/end
+  if (/^\/sessions\/[^/]+\/end$/.test(path)) {
+    return '/sessions/:id/end';
+  }
+  // Normalize /sessions/<id>/replay -> /sessions/:id/replay
+  if (/^\/sessions\/[^/]+\/replay$/.test(path)) {
+    return '/sessions/:id/replay';
+  }
+  // Normalize /sessions/<id> -> /sessions/:id
+  if (/^\/sessions\/[^/]+$/.test(path)) {
+    return '/sessions/:id';
+  }
+  // Normalize /actions/<id> -> /actions/:id
+  if (/^\/actions\/[^/]+$/.test(path)) {
+    return '/actions/:id';
+  }
+  // Normalize /maintenance/api-keys/<id> -> /maintenance/api-keys/:id
+  if (/^\/maintenance\/api-keys\/[^/]+$/.test(path)) {
+    return '/maintenance/api-keys/:id';
+  }
   return path;
 }
 
@@ -59,7 +79,10 @@ function isPathExempt(path: string): boolean {
     path === '/health' ||
     path === '/favicon.ico' ||
     path === '/dashboard' ||
-    path.startsWith('/dashboard/') ||
+    path === '/dashboard/' ||
+    path === '/dashboard/styles.css' ||
+    path === '/dashboard/app.js' ||
+    path === '/dashboard/api/auth-status' ||
     path.startsWith('/capture')
   ) {
     return true;

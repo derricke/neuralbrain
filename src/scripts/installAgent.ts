@@ -356,7 +356,7 @@ export function installRuntimeHooks(
   }
 
   // Copy helper libraries to hooks/lib/
-  const libFiles = ['projectSlug.js', 'spool.js', 'scope.js', 'brainHome.js', 'logger.js'];
+  const libFiles = ['projectSlug.js', 'spool.js', 'scope.js', 'brainHome.js', 'logger.js', 'redactSecrets.js', 'tls.js'];
   for (const file of libFiles) {
     let srcPath = path.join(brainRepoDir, 'dist', 'lib', file);
     if (!fs.existsSync(srcPath)) {
@@ -373,6 +373,71 @@ export function installRuntimeHooks(
       safeWriteFile(path.join(installedHooksLibDir, file), content, dryRun, report);
     }
   }
+
+  // Write zero-dependency shims for dotenv and pino in hooks/lib/node_modules/
+  // so installed hooks under ~/.neuralbrain/hooks/ are self-contained.
+  const hooksNodeModulesDir = path.join(installedHooksLibDir, 'node_modules');
+  const dotenvShim = [
+    'const fs = require("fs");',
+    'function parse(src) {',
+    '  const out = {};',
+    '  for (const rawLine of String(src).split(/\\r?\\n/)) {',
+    '    const line = rawLine.trim();',
+    '    if (!line || line.startsWith("#")) continue;',
+    '    const cleaned = line.startsWith("export ") ? line.slice(7).trim() : line;',
+    '    const eq = cleaned.indexOf("=");',
+    '    if (eq <= 0) continue;',
+    '    const key = cleaned.slice(0, eq).trim();',
+    '    let val = cleaned.slice(eq + 1).trim();',
+    '    if ((val.startsWith("\\"") && val.endsWith("\\"")) || (val.startsWith("\'") && val.endsWith("\'"))) {',
+    '      val = val.slice(1, -1);',
+    '    }',
+    '    out[key] = val;',
+    '  }',
+    '  return out;',
+    '}',
+    'function config(opts) {',
+    '  try {',
+    '    const p = opts && opts.path ? opts.path : ".env";',
+    '    if (!fs.existsSync(p)) return { parsed: {} };',
+    '    const parsed = parse(fs.readFileSync(p, "utf8"));',
+    '    const override = Boolean(opts && opts.override);',
+    '    for (const [k, v] of Object.entries(parsed)) {',
+    '      if (override || !(k in process.env)) process.env[k] = v;',
+    '    }',
+    '    return { parsed };',
+    '  } catch (err) {',
+    '    return { error: err };',
+    '  }',
+    '}',
+    'module.exports = { parse, config, default: { parse, config } };',
+    '',
+  ].join('\n');
+  safeWriteFile(path.join(hooksNodeModulesDir, 'dotenv', 'index.js'), dotenvShim, dryRun, report);
+
+  const pinoShim = [
+    'function noop() {}',
+    'function writeErr(level, objOrMsg, msg) {',
+    '  const text = typeof objOrMsg === "string" ? objOrMsg : (msg || JSON.stringify(objOrMsg));',
+    '  process.stderr.write(`[neuralbrain:${level}] ${text}\\n`);',
+    '}',
+    'function pino() {',
+    '  const log = {',
+    '    trace: noop,',
+    '    debug: noop,',
+    '    info: noop,',
+    '    warn: (a, b) => writeErr("warn", a, b),',
+    '    error: (a, b) => writeErr("error", a, b),',
+    '    fatal: (a, b) => writeErr("fatal", a, b),',
+    '    child: () => log,',
+    '  };',
+    '  return log;',
+    '}',
+    'module.exports = pino;',
+    'module.exports.default = pino;',
+    '',
+  ].join('\n');
+  safeWriteFile(path.join(hooksNodeModulesDir, 'pino', 'index.js'), pinoShim, dryRun, report);
 
   // Also copy dist/mcp/server.js to ~/.neuralbrain/mcp/
   const installedMcpDir = getBrainMcpDir(homeDir);
@@ -531,7 +596,8 @@ function safeWriteFile(
   filePath: string,
   content: string,
   dryRun: boolean,
-  report: InstallAgentReport
+  report: InstallAgentReport,
+  mode?: number
 ): void {
   const exists = fs.existsSync(filePath);
   if (exists) {
@@ -554,7 +620,14 @@ function safeWriteFile(
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    fs.writeFileSync(filePath, content, 'utf8');
+    fs.writeFileSync(filePath, content, mode !== undefined ? { encoding: 'utf8', mode } : 'utf8');
+    if (mode !== undefined) {
+      try {
+        fs.chmodSync(filePath, mode);
+      } catch {
+        // Ignore chmod errors on platforms that don't support posix permissions
+      }
+    }
   }
 }
 
@@ -562,10 +635,11 @@ function safeWriteJson(
   filePath: string,
   data: any,
   dryRun: boolean,
-  report: InstallAgentReport
+  report: InstallAgentReport,
+  mode?: number
 ): void {
   const content = JSON.stringify(data, null, 2) + '\n';
-  safeWriteFile(filePath, content, dryRun, report);
+  safeWriteFile(filePath, content, dryRun, report, mode);
 }
 
 /**
@@ -691,7 +765,8 @@ export function installAgentIntegration(options: InstallAgentOptions = {}): Inst
         },
       },
       dryRun,
-      report
+      report,
+      0o600
     );
 
     // 3. hooks.json in plugin
@@ -775,7 +850,7 @@ export function installAgentIntegration(options: InstallAgentOptions = {}): Inst
     const claudeJsonPath = path.join(homeDir, '.claude.json');
     const existingClaudeJson = safeReadJson(claudeJsonPath) || { mcpServers: {} };
     const mergedClaudeJson = mergeMcpConfig(existingClaudeJson, globalMcpServerDef, replaceAgentMemory);
-    safeWriteJson(claudeJsonPath, mergedClaudeJson, dryRun, report);
+    safeWriteJson(claudeJsonPath, mergedClaudeJson, dryRun, report, 0o600);
 
     // 2. ~/.claude/settings.json (hooks)
     if (enableHooks) {
@@ -858,7 +933,7 @@ export function installAgentIntegration(options: InstallAgentOptions = {}): Inst
     const cursorMcpPath = path.join(homeDir, '.cursor', 'mcp.json');
     const existingCursorJson = safeReadJson(cursorMcpPath) || { mcpServers: {} };
     const mergedCursorJson = mergeMcpConfig(existingCursorJson, globalMcpServerDef, replaceAgentMemory);
-    safeWriteJson(cursorMcpPath, mergedCursorJson, dryRun, report);
+    safeWriteJson(cursorMcpPath, mergedCursorJson, dryRun, report, 0o600);
 
     report.configuredTargets.push('cursor');
   }
@@ -877,7 +952,6 @@ export function installAgentIntegration(options: InstallAgentOptions = {}): Inst
         env: {
           BRAIN_API_URL: apiUrl,
           BRAIN_DEFAULT_PROJECT_ID: normalizedSlug,
-          ...(apiKey ? { BRAIN_API_KEY: apiKey } : {}),
         },
       };
 
@@ -889,7 +963,7 @@ export function installAgentIntegration(options: InstallAgentOptions = {}): Inst
       const projectClaudeMcpPath = path.join(projectDir, '.mcp.json');
       const existingClaudeMcp = safeReadJson(projectClaudeMcpPath) || { mcpServers: {} };
       const mergedClaudeMcp = mergeMcpConfig(existingClaudeMcp, projectMcpServerDef, replaceAgentMemory);
-      safeWriteJson(projectClaudeMcpPath, mergedClaudeMcp, dryRun, report);
+      safeWriteJson(projectClaudeMcpPath, mergedClaudeMcp, dryRun, report, 0o600);
 
       if (enableHooks) {
         const projectClaudeSettingsPath = path.join(projectDir, '.claude', 'settings.json');
@@ -1028,7 +1102,7 @@ export function installAgentIntegration(options: InstallAgentOptions = {}): Inst
       const projectCursorMcpPath = path.join(projectDir, '.cursor', 'mcp.json');
       const existingCursorMcp = safeReadJson(projectCursorMcpPath) || { mcpServers: {} };
       const mergedCursorMcp = mergeMcpConfig(existingCursorMcp, projectMcpServerDef, replaceAgentMemory);
-      safeWriteJson(projectCursorMcpPath, mergedCursorMcp, dryRun, report);
+      safeWriteJson(projectCursorMcpPath, mergedCursorMcp, dryRun, report, 0o600);
 
       // 5. Project-level Rules (<projectDir>/CLAUDE.md / AGENTS.md)
       const isBrainRepo = projectDir === brainRepoDir;
@@ -1072,6 +1146,14 @@ export function installAgentIntegration(options: InstallAgentOptions = {}): Inst
 // CLI Argument Parsing & Runner
 // -----------------------------------------------------------------------------
 
+function requireFlagValue(argv: string[], index: number, flag: string): string {
+  const next = argv[index + 1];
+  if (next === undefined || next.startsWith('--')) {
+    throw new Error(`Missing value for ${flag}`);
+  }
+  return next;
+}
+
 export function parseCliArgs(argv: string[]): InstallAgentOptions {
   const options: InstallAgentOptions = {};
 
@@ -1084,12 +1166,14 @@ export function parseCliArgs(argv: string[]): InstallAgentOptions {
     }
 
     if (arg === '--project-dir') {
-      options.projectDir = argv[++i];
+      options.projectDir = requireFlagValue(argv, i, arg);
+      i++;
       continue;
     }
 
     if (arg === '--project-id') {
-      options.projectId = argv[++i];
+      options.projectId = requireFlagValue(argv, i, arg);
+      i++;
       continue;
     }
 
@@ -1099,7 +1183,8 @@ export function parseCliArgs(argv: string[]): InstallAgentOptions {
     }
 
     if (arg === '--api-key') {
-      options.apiKey = argv[++i];
+      options.apiKey = requireFlagValue(argv, i, arg);
+      i++;
       console.warn(
         '\n[SECURITY WARNING] Passing --api-key on the command line can expose secrets in shell history (~/.bash_history) and process tables (ps aux).' +
         '\nRecommended: Set BRAIN_API_KEY in your .env file instead and run `npm run install-agent`.\n'
@@ -1108,7 +1193,8 @@ export function parseCliArgs(argv: string[]): InstallAgentOptions {
     }
 
     if (arg === '--api-url') {
-      options.apiUrl = argv[++i];
+      options.apiUrl = requireFlagValue(argv, i, arg);
+      i++;
       continue;
     }
 
@@ -1133,7 +1219,8 @@ export function parseCliArgs(argv: string[]): InstallAgentOptions {
     }
 
     if (arg === '--target' || arg === '--targets') {
-      const rawTargets = (argv[++i] || '').split(',').map((t) => t.trim().toLowerCase());
+      const rawTargets = requireFlagValue(argv, i, arg).split(',').map((t) => t.trim().toLowerCase());
+      i++;
       const validTargets: Array<'antigravity' | 'claude' | 'cursor' | 'project'> = [];
       for (const t of rawTargets) {
         if (t === 'antigravity' || t === 'claude' || t === 'cursor' || t === 'project') {

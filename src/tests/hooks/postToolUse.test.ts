@@ -129,4 +129,78 @@ describe('postToolUse hook output bounding', () => {
     expect(captured[0].body.output).not.toContain('ghp_1234567890abcdefghijklmnopqrstuvwx');
     expect(captured[0].body.output).toContain('[REDACTED_TOKEN]');
   });
+
+  it('logs a warning to stderr when a helper module fails to load', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const { execFileSync } = require('child_process');
+
+    const isolatedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nb-hook-warn-'));
+    try {
+      const hookCopy = path.join(isolatedDir, 'postToolUse.js');
+      fs.copyFileSync(path.resolve(__dirname, '../../../plugin/hooks/postToolUse.js'), hookCopy);
+      const res = require('child_process').spawnSync(
+        process.execPath,
+        ['-e', `const h = require(${JSON.stringify(hookCopy)}); h.redactHookSecrets('hello');`],
+        { encoding: 'utf8' }
+      );
+      expect(res.status).toBe(0);
+      expect(res.stderr).toContain("failed to load helper 'redactSecrets'");
+    } finally {
+      fs.rmSync(isolatedDir, { recursive: true, force: true });
+    }
+  });
+
+  it('sessionStart, postToolUse, and sessionStop trust local self-signed cert over HTTPS', async () => {
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const https = require('https');
+    const { ensureLocalTlsCerts } = require('../../lib/tls');
+    const { runSessionStart } = require('../../../plugin/hooks/sessionStart');
+    const { runSessionStop } = require('../../../plugin/hooks/sessionStop');
+
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'nb-hook-tls-'));
+    const origBrainHome = process.env.BRAIN_HOME;
+    process.env.BRAIN_HOME = tmpHome;
+
+    const certs = ensureLocalTlsCerts(tmpHome);
+    const seenPaths: string[] = [];
+    const server = https.createServer(
+      { key: fs.readFileSync(certs.keyPath), cert: fs.readFileSync(certs.certPath) },
+      (req: any, res: any) => {
+        seenPaths.push(req.url);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, notes: [] }));
+      }
+    );
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address() as { port: number };
+    const apiUrl = `https://127.0.0.1:${addr.port}`;
+
+    try {
+      await runSessionStart({ conversationId: 'tls-sess-1' }, { apiUrl, projectId: 'neuralbrain' });
+      await runPostToolUse(
+        { toolCall: { name: 'Read', args: { file_path: 'a.ts' } }, output: 'ok', conversationId: 'tls-sess-1' },
+        { apiUrl, projectId: 'neuralbrain' }
+      );
+      await runSessionStop({ conversationId: 'tls-sess-1' }, { apiUrl, projectId: 'neuralbrain' });
+
+      expect(seenPaths).toEqual(
+        expect.arrayContaining([
+          '/sessions/start',
+          expect.stringMatching(/^\/inject\?/),
+          '/capture/observations',
+          '/capture/trajectories',
+        ])
+      );
+    } finally {
+      server.close();
+      if (origBrainHome === undefined) delete process.env.BRAIN_HOME;
+      else process.env.BRAIN_HOME = origBrainHome;
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    }
+  });
 });

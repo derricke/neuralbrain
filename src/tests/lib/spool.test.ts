@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { appendSpool, readSpool, flushSpool, getSpoolStats } from '../../lib/spool';
+import { appendSpool, readSpool, flushSpool, getSpoolStats, MAX_SPOOL_ATTEMPTS } from '../../lib/spool';
 
 const TEST_SPOOL_DIR = path.join(process.cwd(), 'data', 'test-spool');
 
@@ -75,5 +75,50 @@ describe('spool', () => {
 
     const tooBig = appendSpool('/endpoint', { msg: 'A'.repeat(500) });
     expect(tooBig).toBe(false);
+  });
+
+  it('drops entries after MAX_SPOOL_ATTEMPTS failures', async () => {
+    appendSpool('/capture/observations', { id: 'obs-perm-fail', val: 'bad' });
+
+    for (let i = 1; i < MAX_SPOOL_ATTEMPTS; i++) {
+      const res = await flushSpool(async () => false);
+      expect(res.flushed).toBe(0);
+      expect(res.remaining).toBe(1);
+      expect(res.droppedMaxAttempts).toBe(0);
+    }
+
+    const finalRes = await flushSpool(async () => false);
+    expect(finalRes.flushed).toBe(0);
+    expect(finalRes.remaining).toBe(0);
+    expect(finalRes.droppedMaxAttempts).toBe(1);
+    expect(readSpool()).toHaveLength(0);
+  });
+
+  it('preserves entries appended concurrently during flushSpool', async () => {
+    appendSpool('/capture/observations', { id: 'obs-initial', val: 1 });
+
+    const res = await flushSpool(async () => {
+      // Simulate concurrent hook append while network I/O is in flight
+      appendSpool('/capture/observations', { id: 'obs-concurrent', val: 2 });
+      return true;
+    });
+
+    expect(res.flushed).toBe(1);
+    expect(res.remaining).toBe(1);
+    const remaining = readSpool();
+    expect(remaining).toHaveLength(1);
+    expect((remaining[0].payload as any).id).toBe('obs-concurrent');
+  });
+
+  it('handles mkdirSync failure cleanly without throwing', () => {
+    // Point BRAIN_SPOOL_PATH inside a regular file so mkdirSync fails with ENOTDIR
+    const blockingFile = path.join(TEST_SPOOL_DIR, 'not-a-dir');
+    fs.mkdirSync(TEST_SPOOL_DIR, { recursive: true });
+    fs.writeFileSync(blockingFile, 'file', 'utf8');
+    process.env.BRAIN_SPOOL_PATH = path.join(blockingFile, 'spool');
+
+    expect(appendSpool('/capture/observations', { id: 'obs-fail-dir' })).toBe(false);
+    expect(readSpool()).toEqual([]);
+    expect(getSpoolStats().count).toBe(0);
   });
 });

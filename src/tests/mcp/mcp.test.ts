@@ -12,6 +12,7 @@ import {
   createBrainMcpHandlers,
   MCP_INSTRUCTIONS,
 } from '../../mcp/server';
+import { createDirectBrainMcpHandlers } from '../../routes/mcp';
 import { upsertFailurePattern } from '../../memory/failurePatternStore';
 import { seedFixtureObservations } from '../../consolidation/fixtures';
 
@@ -133,16 +134,18 @@ describe('MCP Server End-to-End Tests', () => {
     const text = (clientRes as any).content[0].text;
     expect(text).toMatch(/scope/i);
 
-    // 2. Via direct handlers (SCOPE_REQUIRED explicit code)
+    // 2. Via direct handlers (structured isError response with SCOPE_REQUIRED)
     const handlers = createBrainMcpHandlers({ apiBaseUrl, apiKey: testApiKey });
-    await expect(
-      handlers.brainSave({
-        type: 'fact',
-        title: 'Missing Scope Title',
-        content: 'This note has no scope parameter',
-        scope: undefined as any,
-      })
-    ).rejects.toThrow(/SCOPE_REQUIRED/);
+    const directRes = await handlers.brainSave({
+      type: 'fact',
+      title: 'Missing Scope Title',
+      content: 'This note has no scope parameter',
+      scope: undefined as any,
+    });
+    expect(directRes.isError).toBe(true);
+    const directBody = JSON.parse((directRes as any).content[0].text);
+    expect(directBody.error.code).toBe('SCOPE_REQUIRED');
+    expect(directBody.error.message).toMatch(/SCOPE_REQUIRED/);
   });
 
   it('saves a scoped note via brain_save and retrieves it via brain_search', async () => {
@@ -378,5 +381,76 @@ describe('MCP Server End-to-End Tests', () => {
     } finally {
       await httpTransport.close();
     }
+  });
+
+  it('returns structured isError on SCOPE_REQUIRED/SCHEMA_INVALID for brainActionAdd and emits compact JSON', async () => {
+    const handlers = createBrainMcpHandlers({ apiBaseUrl, apiKey: testApiKey, defaultProjectId: '' });
+    const missingScopeRes = await handlers.brainActionAdd({
+      title: 'Action without scope',
+      scope: undefined as any,
+    });
+    expect(missingScopeRes.isError).toBe(true);
+    expect(JSON.parse(missingScopeRes.content[0].text).error.code).toBe('SCOPE_REQUIRED');
+
+    const missingProjectRes = await handlers.brainActionAdd({
+      title: 'Action without project_id',
+      scope: 'project',
+    });
+    expect(missingProjectRes.isError).toBe(true);
+    expect(JSON.parse(missingProjectRes.content[0].text).error.code).toBe('SCHEMA_INVALID');
+
+    const searchRes = await mcpClient.callTool({
+      name: 'brain_search',
+      arguments: { q: 'SQLite', limit: 5 },
+    });
+    expect(searchRes.isError).toBeFalsy();
+    const rawText = (searchRes as any).content[0].text as string;
+    expect(rawText).not.toContain('\n  ');
+  });
+
+  it('enforces Zod limit bounds on MCP tools', async () => {
+    const badSearch = await mcpClient.callTool({
+      name: 'brain_search',
+      arguments: { q: 'test', limit: 101 },
+    });
+    expect(badSearch.isError).toBe(true);
+
+    const badFailures = await mcpClient.callTool({
+      name: 'brain_recent_failures',
+      arguments: { limit: 0 },
+    });
+    expect(badFailures.isError).toBe(true);
+  });
+
+  it('aligns direct MCP handlers for brain_recent_failures, brain_graph global scope, and compact JSON', async () => {
+    for (let i = 0; i < 6; i++) {
+      upsertFailurePattern({
+        scope: 'project',
+        projectId: 'direct-mcp-proj',
+        taskType: 'test_task',
+        errorText: `ERR_DIRECT_${i}`,
+      });
+    }
+
+    const directHandlers = createDirectBrainMcpHandlers('direct-mcp-proj');
+    const failRes = await directHandlers.brainRecentFailures({});
+    expect(failRes.isError).toBeFalsy();
+    expect(failRes.content[0].text).not.toContain('\n  ');
+    const failures = JSON.parse(failRes.content[0].text);
+    expect(failures.length).toBe(5);
+    expect(Object.keys(failures[0]).sort()).toEqual(['count', 'error_text', 'last_seen_at', 'task_type']);
+
+    const saveGlobal = await directHandlers.brainSave({
+      type: 'fact',
+      title: 'Global Graph Fact',
+      content: 'Visible in global graph without project filter',
+      scope: 'global',
+    });
+    expect(saveGlobal.isError).toBeFalsy();
+
+    const graphRes = await directHandlers.brainGraph({ scope: 'global' });
+    expect(graphRes.isError).toBeFalsy();
+    const graph = JSON.parse(graphRes.content[0].text);
+    expect(graph.nodes.some((n: any) => n.label === 'Global Graph Fact')).toBe(true);
   });
 });

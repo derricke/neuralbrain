@@ -601,4 +601,26 @@ describe('trajectory schema alignment on an existing store', () => {
     expect(stored.tool_calls).toBe(1);
     expect(stored.duration_ms).toBe(350);
   });
+
+  it('bounds projected observation blobs and skips if trajectory was concurrently inserted', () => {
+    process.env.DATABASE_URL = ':memory:';
+    const db = getDb();
+    const sessionId = 'sess-bounded-sweep';
+    const twoHoursAgo = nowSec() - 7200;
+
+    db.prepare(`
+      INSERT INTO observations (
+        id, scope, project_id, session_id, agent, kind, tool_name,
+        input, output, duration_ms, failed, created_at
+      ) VALUES (?, 'project', 'proj-sweep', ?, 'claude-code', 'prompt', NULL, ?, ?, 50, 0, ?)
+    `).run('obs_huge_1', sessionId, 'P'.repeat(5000), 'O'.repeat(5000), twoHoursAgo);
+
+    const res = sweepIdleSessions({ idleMinutes: 30 });
+    expect(res.swept).toBe(1);
+
+    const stored = db.prepare('SELECT description FROM trajectories WHERE session_id = ?').get(sessionId) as {
+      description: string;
+    };
+    expect(stored.description.length).toBeLessThanOrEqual(1000);
+  });
 });

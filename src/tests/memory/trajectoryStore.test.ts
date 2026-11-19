@@ -1,4 +1,4 @@
-import { logTrajectory, getTrajectory, getProjectTrajectories, getSwarmTrajectories, runCleanup } from '../../memory/trajectoryStore';
+import { logTrajectory, getTrajectory, getProjectTrajectories, getSwarmTrajectories, listTrajectories, runCleanup } from '../../memory/trajectoryStore';
 import { captureObservations } from '../../memory/observationStore';
 import { getFailurePatterns } from '../../memory/failurePatternStore';
 import { getDb, resetDb } from '../../lib/db';
@@ -333,6 +333,85 @@ describe('trajectoryStore', () => {
     runCleanup();
 
     expect(deleteSpy).toHaveBeenCalledWith([trajToPurge]);
+    deleteSpy.mockRestore();
+  });
+
+  it('omits embedding BLOBs from trajectory read returns and redacts secrets on logTrajectory', () => {
+    const db = getDb();
+    const secret = 'sk-proj-abcdefghijklmnopqrstuvwxyz123456';
+    const id = logTrajectory({
+      scope: 'project',
+      projectId: 'proj-traj-sec',
+      description: `Run with ${secret}`,
+      result: 'Failed with Bearer abcdefghijklmnopqrstuvwxyz123456',
+      success: false,
+      embedding: [0.1, 0.2, 0.3, 0.4],
+    });
+
+    const fetched = getTrajectory(id) as Record<string, unknown>;
+    expect(fetched).toBeDefined();
+    expect('embedding' in fetched).toBe(false);
+    expect(fetched.description).not.toContain(secret);
+    expect(fetched.description).toContain('[REDACTED_API_KEY]');
+    expect(fetched.result).toContain('Bearer [REDACTED_TOKEN]');
+
+    const projList = getProjectTrajectories('proj-traj-sec') as Array<Record<string, unknown>>;
+    expect(projList).toHaveLength(1);
+    expect('embedding' in projList[0]).toBe(false);
+
+    const listed = listTrajectories({ projectId: 'proj-traj-sec' }) as Array<Record<string, unknown>>;
+    expect(listed).toHaveLength(1);
+    expect('embedding' in listed[0]).toBe(false);
+
+    // Also verify recordDeadLetter redacts secrets in payload
+    const { recordDeadLetter, listDeadLetters } = require('../../memory/deadLetterStore');
+    recordDeadLetter({
+      source: 'capture',
+      reason: 'schema_invalid',
+      payload: { apiKey: secret },
+    });
+    const dls = listDeadLetters({ source: 'capture' });
+    expect(dls.some((d: any) => d.payload.includes('[REDACTED_API_KEY]') && !d.payload.includes(secret))).toBe(true);
+    expect(db.prepare('SELECT embedding FROM trajectories WHERE id = ?').get(id)).toBeDefined();
+  });
+
+  it('runCleanup deletes archived observations, calls deleteQdrantPoints, and cleans embed_queue', () => {
+    const db = getDb();
+    const deleteSpy = jest.spyOn(embedWorker, 'deleteQdrantPoints').mockImplementation(async () => {});
+    process.env.BRAIN_KEEP_SUMMARIZED_SOURCES = '1';
+    process.env.BRAIN_TRAJECTORY_DELETE_DAYS = '60';
+
+    const oldTs = Math.floor(Date.now() / 1000) - 95 * 86400;
+    const obsId = 'obs-purge-qdrant';
+    const trajId = 'traj-purge-queue';
+
+    db.prepare(`
+      INSERT INTO observations_archive (
+        id, original_observation_id, scope, project_id, kind, created_at, archived_at
+      ) VALUES (?, ?, 'project', 'p-clean', 'prompt', ?, ?)
+    `).run(randomUUID(), obsId, oldTs, oldTs);
+
+    db.prepare(`
+      INSERT INTO trajectory_archive (
+        id, original_trajectory_id, scope, project_id, description, success, created_at, archived_at
+      ) VALUES (?, ?, 'project', 'p-clean', 'Old', 1, ?, ?)
+    `).run(randomUUID(), trajId, oldTs, oldTs);
+
+    db.prepare(`
+      INSERT INTO embed_queue (record_id, grain, status, target)
+      VALUES (?, 'observation', 'pending', 'live'), (?, 'trajectory', 'pending', 'live')
+    `).run(obsId, trajId);
+
+    const res = runCleanup();
+    expect(res.observationsDeleted).toBe(1);
+    expect(res.trajectoriesDeleted).toBe(1);
+    expect(deleteSpy).toHaveBeenCalledWith([obsId]);
+    expect(deleteSpy).toHaveBeenCalledWith([trajId]);
+
+    const remainingQueue = db
+      .prepare('SELECT record_id FROM embed_queue WHERE record_id IN (?, ?)')
+      .all(obsId, trajId);
+    expect(remainingQueue).toHaveLength(0);
     deleteSpy.mockRestore();
   });
 });

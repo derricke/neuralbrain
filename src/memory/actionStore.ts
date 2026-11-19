@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { getDb } from '../lib/db';
+import { redactOptional, redactSecrets } from '../lib/redactSecrets';
 import { resolveScope, ScopeValue } from '../lib/scope';
 
 export type ActionStatus = 'ready' | 'blocked' | 'in_progress' | 'done' | 'dismissed';
@@ -117,10 +118,11 @@ export function createAction(input: CreateActionInput): ActionRecord {
   const id = customId || `act_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
   const rawSession = input.sessionId !== undefined ? input.sessionId : input.session_id;
   const sessionId = optionalString(rawSession, 'session_id');
-  const description = optionalString(input.description, 'description');
+  const title = redactSecrets(input.title.trim());
+  const description = redactOptional(optionalString(input.description, 'description'));
   const rawBlockedReason =
     input.blockedReason !== undefined ? input.blockedReason : input.blocked_reason;
-  const blockedReason = optionalString(rawBlockedReason, 'blocked_reason');
+  const blockedReason = redactOptional(optionalString(rawBlockedReason, 'blocked_reason'));
   const filesJson = Array.isArray(input.files)
     ? JSON.stringify(input.files)
     : input.files_json ?? null;
@@ -139,7 +141,7 @@ export function createAction(input: CreateActionInput): ActionRecord {
     sessionId,
     scoped.scope,
     scoped.projectId,
-    input.title.trim(),
+    title,
     description,
     status,
     priority,
@@ -278,7 +280,7 @@ export function updateAction(
     if (typeof patch.title !== 'string' || patch.title.trim() === '') {
       throw makeSchemaError('title cannot be empty');
     }
-    nextTitle = patch.title.trim();
+    nextTitle = redactSecrets(patch.title.trim());
   }
 
   let nextStatus = existing.status;
@@ -303,14 +305,14 @@ export function updateAction(
 
   const nextDescription =
     patch.description !== undefined
-      ? optionalString(patch.description, 'description')
+      ? redactOptional(optionalString(patch.description, 'description'))
       : existing.description;
 
   const rawBlockedReason =
     patch.blockedReason !== undefined ? patch.blockedReason : patch.blocked_reason;
   const nextBlockedReason =
     rawBlockedReason !== undefined
-      ? optionalString(rawBlockedReason, 'blocked_reason')
+      ? redactOptional(optionalString(rawBlockedReason, 'blocked_reason'))
       : existing.blocked_reason;
 
   const nextFilesJson = Array.isArray(patch.files)

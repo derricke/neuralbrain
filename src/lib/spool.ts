@@ -5,6 +5,8 @@ import { createHash } from 'crypto';
 import { logger } from './logger';
 import { getDefaultSpoolDir } from './brainHome';
 
+export const MAX_SPOOL_ATTEMPTS = 5;
+
 export interface SpoolEntry {
   id: string;
   endpoint: string;
@@ -32,7 +34,7 @@ function resolveSpoolDir(): string {
   return getDefaultSpoolDir();
 }
 
-function getSpoolFilePath(): string {
+function getSpoolFilePath(): string | null {
   const dir = resolveSpoolDir();
   if (!fs.existsSync(dir)) {
     try {
@@ -44,9 +46,72 @@ function getSpoolFilePath(): string {
       }
     } catch (err) {
       logger.error({ dir, error: err instanceof Error ? err.message : String(err) }, 'failed to create spool directory');
+      return null;
     }
   }
   return path.join(dir, 'spool.jsonl');
+}
+
+function getLockFilePath(filePath: string): string {
+  return path.join(path.dirname(filePath), 'spool.lock');
+}
+
+function tryAcquireLock(lockPath: string, staleMs = 30_000): boolean {
+  try {
+    const fd = fs.openSync(lockPath, 'wx', 0o600);
+    fs.closeSync(fd);
+    return true;
+  } catch (err: any) {
+    if (err?.code !== 'EEXIST') {
+      return false;
+    }
+    try {
+      const stat = fs.statSync(lockPath);
+      if (Date.now() - stat.mtimeMs > staleMs) {
+        fs.rmSync(lockPath, { force: true });
+        const fd = fs.openSync(lockPath, 'wx', 0o600);
+        fs.closeSync(fd);
+        return true;
+      }
+    } catch {
+      // Lock was released or removed concurrently
+    }
+    return false;
+  }
+}
+
+function sleepSync(ms: number): void {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    // Fallback if SharedArrayBuffer is unavailable
+  }
+}
+
+function acquireSpoolLockSync(lockPath: string, timeoutMs = 500): boolean {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (tryAcquireLock(lockPath)) return true;
+    sleepSync(10);
+  }
+  return tryAcquireLock(lockPath);
+}
+
+async function acquireSpoolLockAsync(lockPath: string, timeoutMs = 2000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (tryAcquireLock(lockPath)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+  return tryAcquireLock(lockPath);
+}
+
+function releaseSpoolLock(lockPath: string): void {
+  try {
+    fs.rmSync(lockPath, { force: true });
+  } catch {
+    // ignore
+  }
 }
 
 function getMaxBytes(): number {
@@ -131,6 +196,9 @@ function getActiveIds(filePath: string): Set<string> {
 
 export function readSpool(): SpoolEntry[] {
   const filePath = getSpoolFilePath();
+  if (!filePath) {
+    return [];
+  }
   if (!fs.existsSync(filePath)) {
     activeSpoolCache = { filePath, mtimeMs: 0, size: 0, ids: new Set() };
     return [];
@@ -153,7 +221,7 @@ export function readSpool(): SpoolEntry[] {
   for (const line of lines) {
     try {
       const entry = JSON.parse(line) as SpoolEntry;
-      if (entry.timestamp < cutoff) {
+      if (entry.timestamp < cutoff || (entry.attempts ?? 0) >= MAX_SPOOL_ATTEMPTS) {
         expiredCount++;
       } else {
         validEntries.push(entry);
@@ -163,7 +231,7 @@ export function readSpool(): SpoolEntry[] {
     }
   }
 
-  // If expired or corrupted lines were found, prune the file
+  // If expired, exhausted, or corrupted lines were found, prune the file
   if (expiredCount > 0) {
     writeSpoolEntries(validEntries);
   } else {
@@ -175,6 +243,9 @@ export function readSpool(): SpoolEntry[] {
 
 function writeSpoolEntries(entries: SpoolEntry[]): void {
   const filePath = getSpoolFilePath();
+  if (!filePath) {
+    return;
+  }
   const dir = path.dirname(filePath);
 
   if (entries.length === 0) {
@@ -203,63 +274,72 @@ function writeSpoolEntries(entries: SpoolEntry[]): void {
 export function appendSpool(endpoint: string, payload: unknown): boolean {
   const id = computeEntryId(endpoint, payload);
   const filePath = getSpoolFilePath();
-
-  // Fast in-memory deduplication check (CR-14)
-  const activeIds = getActiveIds(filePath);
-  if (activeIds.has(id)) {
-    logger.debug({ id, endpoint }, 'duplicate entry already in spool, skipping append');
-    return true;
-  }
-
-  const newEntry: SpoolEntry = {
-    id,
-    endpoint,
-    payload,
-    timestamp: Math.floor(Date.now() / 1000),
-    attempts: 0,
-  };
-
-  const line = JSON.stringify(newEntry) + '\n';
-  const lineBytes = Buffer.byteLength(line, 'utf-8');
-
-  let currentBytes = 0;
-  if (fs.existsSync(filePath)) {
-    try {
-      currentBytes = fs.statSync(filePath).size;
-    } catch {
-      currentBytes = 0;
-    }
-  }
-
-  const maxBytes = getMaxBytes();
-  if (currentBytes + lineBytes > maxBytes) {
-    logger.warn({ currentBytes, lineBytes, maxBytes }, 'spool file full, rejecting write');
+  if (!filePath) {
     return false;
   }
 
-  fs.appendFileSync(filePath, line, { encoding: 'utf-8', mode: 0o600 });
-
+  const lockPath = getLockFilePath(filePath);
+  const locked = acquireSpoolLockSync(lockPath);
   try {
-    const stat = fs.statSync(filePath);
-    activeIds.add(id);
-    activeSpoolCache = {
-      filePath,
-      mtimeMs: stat.mtimeMs,
-      size: stat.size,
-      ids: activeIds,
-    };
-  } catch {
-    activeIds.add(id);
-  }
+    // Fast in-memory deduplication check (CR-14)
+    const activeIds = getActiveIds(filePath);
+    if (activeIds.has(id)) {
+      logger.debug({ id, endpoint }, 'duplicate entry already in spool, skipping append');
+      return true;
+    }
 
-  return true;
+    const newEntry: SpoolEntry = {
+      id,
+      endpoint,
+      payload,
+      timestamp: Math.floor(Date.now() / 1000),
+      attempts: 0,
+    };
+
+    const line = JSON.stringify(newEntry) + '\n';
+    const lineBytes = Buffer.byteLength(line, 'utf-8');
+
+    let currentBytes = 0;
+    if (fs.existsSync(filePath)) {
+      try {
+        currentBytes = fs.statSync(filePath).size;
+      } catch {
+        currentBytes = 0;
+      }
+    }
+
+    const maxBytes = getMaxBytes();
+    if (currentBytes + lineBytes > maxBytes) {
+      logger.warn({ currentBytes, lineBytes, maxBytes }, 'spool file full, rejecting write');
+      return false;
+    }
+
+    fs.appendFileSync(filePath, line, { encoding: 'utf-8', mode: 0o600 });
+
+    try {
+      const stat = fs.statSync(filePath);
+      activeIds.add(id);
+      activeSpoolCache = {
+        filePath,
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        ids: activeIds,
+      };
+    } catch {
+      activeIds.add(id);
+    }
+
+    return true;
+  } finally {
+    if (locked) releaseSpoolLock(lockPath);
+  }
 }
 
 let flushMutex: Promise<unknown> = Promise.resolve();
 
 export function flushSpool(
   sendFn: (endpoint: string, payload: unknown) => Promise<boolean>
-): Promise<{ flushed: number; remaining: number; droppedExpired: number }> {
+): Promise<{ flushed: number; remaining: number; droppedExpired: number; droppedMaxAttempts: number }> {
   const next = flushMutex.then(() => doFlushSpool(sendFn));
   flushMutex = next.catch(() => {});
   return next;
@@ -267,10 +347,10 @@ export function flushSpool(
 
 async function doFlushSpool(
   sendFn: (endpoint: string, payload: unknown) => Promise<boolean>
-): Promise<{ flushed: number; remaining: number; droppedExpired: number }> {
+): Promise<{ flushed: number; remaining: number; droppedExpired: number; droppedMaxAttempts: number }> {
   const filePath = getSpoolFilePath();
-  if (!fs.existsSync(filePath)) {
-    return { flushed: 0, remaining: 0, droppedExpired: 0 };
+  if (!filePath || !fs.existsSync(filePath)) {
+    return { flushed: 0, remaining: 0, droppedExpired: 0, droppedMaxAttempts: 0 };
   }
 
   const rawContent = fs.readFileSync(filePath, 'utf-8');
@@ -281,12 +361,15 @@ async function doFlushSpool(
 
   const validEntries: SpoolEntry[] = [];
   let droppedExpired = 0;
+  let droppedMaxAttempts = 0;
 
   for (const line of rawLines) {
     try {
       const entry = JSON.parse(line) as SpoolEntry;
       if (entry.timestamp < cutoff) {
         droppedExpired++;
+      } else if ((entry.attempts ?? 0) >= MAX_SPOOL_ATTEMPTS) {
+        droppedMaxAttempts++;
       } else {
         validEntries.push(entry);
       }
@@ -306,43 +389,70 @@ async function doFlushSpool(
       if (success) {
         flushed++;
       } else {
-        entry.attempts = (entry.attempts ?? 0) + 1;
-        remainingEntries.push(entry);
-      }
-    } catch {
-      entry.attempts = (entry.attempts ?? 0) + 1;
-      remainingEntries.push(entry);
-    }
-  }
-
-  // Re-read file to capture entries appended concurrently during network I/O
-  const newlyAppended: SpoolEntry[] = [];
-  if (fs.existsSync(filePath)) {
-    try {
-      const currentContent = fs.readFileSync(filePath, 'utf-8');
-      const currentLines = currentContent.split('\n').filter((l) => l.trim().length > 0);
-      for (const line of currentLines) {
-        try {
-          const entry = JSON.parse(line) as SpoolEntry;
-          if (!snapshotIds.has(entry.id) && entry.timestamp >= cutoff) {
-            newlyAppended.push(entry);
-          }
-        } catch {
-          // ignore corrupted lines
+        const nextAttempts = (entry.attempts ?? 0) + 1;
+        if (nextAttempts < MAX_SPOOL_ATTEMPTS) {
+          entry.attempts = nextAttempts;
+          remainingEntries.push(entry);
+        } else {
+          droppedMaxAttempts++;
+          logger.warn(
+            { id: entry.id, endpoint: entry.endpoint, attempts: nextAttempts },
+            'spool entry exceeded max attempts, dropping'
+          );
         }
       }
     } catch {
-      // ignore read error
+      const nextAttempts = (entry.attempts ?? 0) + 1;
+      if (nextAttempts < MAX_SPOOL_ATTEMPTS) {
+        entry.attempts = nextAttempts;
+        remainingEntries.push(entry);
+      } else {
+        droppedMaxAttempts++;
+        logger.warn(
+          { id: entry.id, endpoint: entry.endpoint, attempts: nextAttempts },
+          'spool entry exceeded max attempts, dropping'
+        );
+      }
     }
   }
 
-  const finalRemaining = [...remainingEntries, ...newlyAppended];
-  writeSpoolEntries(finalRemaining);
+  // Advisory lock around read-merge-rename window so concurrent hook appends aren't overwritten
+  const lockPath = getLockFilePath(filePath);
+  const locked = await acquireSpoolLockAsync(lockPath);
+  let finalRemaining: SpoolEntry[];
+  try {
+    // Re-read file to capture entries appended concurrently during network I/O
+    const newlyAppended: SpoolEntry[] = [];
+    if (fs.existsSync(filePath)) {
+      try {
+        const currentContent = fs.readFileSync(filePath, 'utf-8');
+        const currentLines = currentContent.split('\n').filter((l) => l.trim().length > 0);
+        for (const line of currentLines) {
+          try {
+            const entry = JSON.parse(line) as SpoolEntry;
+            if (!snapshotIds.has(entry.id) && entry.timestamp >= cutoff) {
+              newlyAppended.push(entry);
+            }
+          } catch {
+            // ignore corrupted lines
+          }
+        }
+      } catch {
+        // ignore read error
+      }
+    }
+
+    finalRemaining = [...remainingEntries, ...newlyAppended];
+    writeSpoolEntries(finalRemaining);
+  } finally {
+    if (locked) releaseSpoolLock(lockPath);
+  }
 
   return {
     flushed,
     remaining: finalRemaining.length,
     droppedExpired,
+    droppedMaxAttempts,
   };
 }
 
@@ -351,7 +461,7 @@ export function getSpoolStats(): SpoolStats {
   const filePath = getSpoolFilePath();
 
   let bytes = 0;
-  if (fs.existsSync(filePath)) {
+  if (filePath && fs.existsSync(filePath)) {
     bytes = fs.statSync(filePath).size;
   }
 

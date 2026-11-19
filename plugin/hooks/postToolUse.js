@@ -1,8 +1,97 @@
 #!/usr/bin/env node
 
 const fs = require('fs');
+const https = require('https');
 const os = require('os');
 const path = require('path');
+const tls = require('tls');
+
+const warnedHelperFailures = new Set();
+function loadHelperModule(relName) {
+  const candidates = [
+    path.join(__dirname, 'lib', relName),
+    path.join(__dirname, '../../dist/lib', relName),
+  ];
+  let lastErr;
+  for (const candidate of candidates) {
+    try {
+      return require(candidate);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  if (lastErr && !warnedHelperFailures.has(relName)) {
+    warnedHelperFailures.add(relName);
+    process.stderr.write(
+      `[neuralbrain-hook] warning: failed to load helper '${relName}': ${lastErr.message || lastErr}\n`
+    );
+  }
+  return null;
+}
+
+function getHookFetch() {
+  const tlsMod = loadHelperModule('tls');
+  if (tlsMod && typeof tlsMod.createLocalTlsFetch === 'function') {
+    return tlsMod.createLocalTlsFetch();
+  }
+  return async (input, init = {}) => {
+    const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    const parsedUrl = new URL(rawUrl);
+    const host = parsedUrl.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    const explicitCert = process.env.BRAIN_TLS_CERT && process.env.BRAIN_TLS_CERT.trim();
+    const certPath = explicitCert || path.join(getBrainHomeDir(), 'certs', 'server.crt');
+    const isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+    if (parsedUrl.protocol !== 'https:' || (!explicitCert && !isLoopback) || !fs.existsSync(certPath)) {
+      return globalThis.fetch(input, init);
+    }
+    const ca = [...tls.rootCertificates, fs.readFileSync(certPath, 'utf8')];
+    const bodyBuffer = typeof init.body === 'string' ? Buffer.from(init.body, 'utf8') : init.body;
+    const headers = { ...(init.headers || {}) };
+    if (bodyBuffer && !Object.keys(headers).some((k) => k.toLowerCase() === 'content-length')) {
+      headers['Content-Length'] = String(Buffer.byteLength(bodyBuffer));
+    }
+    return new Promise((resolve, reject) => {
+      const req = https.request(
+        {
+          hostname: parsedUrl.hostname,
+          port: parsedUrl.port || 443,
+          path: `${parsedUrl.pathname}${parsedUrl.search}`,
+          method: init.method || 'GET',
+          headers,
+          ca,
+        },
+        (res) => {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(typeof c === 'string' ? Buffer.from(c) : c));
+          res.on('end', () => {
+            const status = res.statusCode ?? 200;
+            const resHeaders = new Headers();
+            for (const [k, v] of Object.entries(res.headers)) {
+              if (Array.isArray(v)) v.forEach((item) => resHeaders.append(k, item));
+              else if (v !== undefined) resHeaders.set(k, v);
+            }
+            const empty = status === 101 || status === 204 || status === 205 || status === 304;
+            resolve(new Response(empty ? null : Buffer.concat(chunks), { status, statusText: res.statusMessage || '', headers: resHeaders }));
+          });
+        }
+      );
+      if (init.signal) {
+        if (init.signal.aborted) {
+          req.destroy();
+          reject(init.signal.reason || new Error('Aborted'));
+          return;
+        }
+        init.signal.addEventListener('abort', () => {
+          req.destroy();
+          reject(init.signal.reason || new Error('Aborted'));
+        }, { once: true });
+      }
+      req.on('error', reject);
+      if (bodyBuffer) req.write(bodyBuffer);
+      req.end();
+    });
+  };
+}
 
 function getBrainHomeDir() {
   const envHome = process.env.BRAIN_HOME && process.env.BRAIN_HOME.trim();
@@ -112,16 +201,7 @@ function resolveApiUrl(options) {
 
 function resolveProjectId(cwd) {
   try {
-    let slugModule;
-    try {
-      slugModule = require(path.join(__dirname, 'lib/projectSlug'));
-    } catch {
-      try {
-        slugModule = require(path.join(__dirname, '../../dist/lib/projectSlug'));
-      } catch {
-        // Fall back
-      }
-    }
+    const slugModule = loadHelperModule('projectSlug');
     if (slugModule && typeof slugModule.resolveCanonicalProjectId === 'function') {
       const resolved = slugModule.resolveCanonicalProjectId({ cwd, fallbackToDirname: true });
       if (resolved) return resolved;
@@ -165,16 +245,7 @@ function resolveProjectId(cwd) {
  */
 function resolveSessionProject(sessionId, cwd, options = {}) {
   try {
-    let slugModule;
-    try {
-      slugModule = require(path.join(__dirname, 'lib/projectSlug'));
-    } catch {
-      try {
-        slugModule = require(path.join(__dirname, '../../dist/lib/projectSlug'));
-      } catch {
-        // Fall back
-      }
-    }
+    const slugModule = loadHelperModule('projectSlug');
     if (slugModule && typeof slugModule.resolveSessionProjectId === 'function') {
       return slugModule.resolveSessionProjectId({ sessionId, cwd, pinDir: options.pinDir });
     }
@@ -186,16 +257,7 @@ function resolveSessionProject(sessionId, cwd, options = {}) {
 
 function safeAppendSpool(endpoint, payload) {
   try {
-    let spoolModule;
-    try {
-      spoolModule = require(path.join(__dirname, 'lib/spool'));
-    } catch {
-      try {
-        spoolModule = require(path.join(__dirname, '../../dist/lib/spool'));
-      } catch {
-        // Fall back
-      }
-    }
+    const spoolModule = loadHelperModule('spool');
     if (spoolModule && typeof spoolModule.appendSpool === 'function') {
       spoolModule.appendSpool(endpoint, payload);
       return;
@@ -295,19 +357,9 @@ let cachedRedactFn = null;
 function redactHookSecrets(text) {
   if (!text) return text;
   if (!cachedRedactFn) {
-    for (const candidate of [
-      path.join(__dirname, 'lib/redactSecrets'),
-      path.join(__dirname, '../../dist/lib/redactSecrets'),
-    ]) {
-      try {
-        const mod = require(candidate);
-        if (typeof mod.redactSecrets === 'function') {
-          cachedRedactFn = mod.redactSecrets;
-          break;
-        }
-      } catch {
-        // Fallback below
-      }
+    const mod = loadHelperModule('redactSecrets');
+    if (mod && typeof mod.redactSecrets === 'function') {
+      cachedRedactFn = mod.redactSecrets;
     }
     if (!cachedRedactFn) {
       cachedRedactFn = (value) => {
@@ -455,7 +507,7 @@ async function runPostToolUse(inputObj = {}, options = {}) {
 
     const apiUrl = resolveApiUrl(options);
     const apiKey = resolveApiKey(options);
-    const fetchFn = options.fetchFn || globalThis.fetch;
+    const fetchFn = options.fetchFn || getHookFetch();
 
     const headers = { 'Content-Type': 'application/json' };
     if (apiKey) {

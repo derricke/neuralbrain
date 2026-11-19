@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
+import { redactSecrets } from '../lib/redactSecrets';
 
 export type DeadLetterSource = 'capture' | 'summarize' | 'consolidate';
 export type DeadLetterReason =
@@ -28,10 +29,11 @@ export function recordDeadLetter(params: {
 }): string {
   const db = getDb();
   const id = `dl_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
-  const payloadStr =
+  const rawPayloadStr =
     typeof params.payload === 'string'
       ? params.payload
-      : JSON.stringify(params.payload);
+      : (JSON.stringify(params.payload) ?? 'null');
+  const payloadStr = redactSecrets(rawPayloadStr);
 
   try {
     db.prepare(`

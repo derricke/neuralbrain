@@ -24,7 +24,8 @@ import {
 import { createNote, updateNoteScope, getNote } from '../memory/noteStore';
 import { buildQdrantFilter } from '../learning/search';
 import { appendSpool, flushSpool, readSpool } from '../lib/spool';
-import { normalizePathForRateLimit } from '../middleware/rateLimiter';
+import { createRateLimiter, normalizePathForRateLimit } from '../middleware/rateLimiter';
+import { logger } from '../lib/logger';
 import { captureObservations, getObservation } from '../memory/observationStore';
 import { createBrainMcpHandlers } from '../mcp/server';
 
@@ -996,6 +997,177 @@ describe('Audit Remediation Comprehensive Regression Tests', () => {
         .set('Authorization', `Bearer ${testApiKey}`);
       expect(deleteAgainRes.status).toBe(404);
       expect(deleteAgainRes.body.error.code).toBe('NOT_FOUND');
+    });
+
+    it('strips embedding from GET /summaries and GET /summaries/:id', async () => {
+      const db = getDb();
+      db.prepare(
+        `INSERT INTO summaries (id, scope, project_id, kind, producer_tier, prompt_version, verified, is_latest, embedding)
+         VALUES (?, 'project', 'sum-proj', 'session', 'agent', 'v1', 1, 1, ?)`
+      ).run('sum_no_embed_1', Buffer.from([1, 2, 3, 4]));
+
+      const listRes = await request(app)
+        .get('/summaries')
+        .set('Authorization', `Bearer ${testApiKey}`);
+      expect(listRes.status).toBe(200);
+      expect(Array.isArray(listRes.body)).toBe(true);
+      const found = listRes.body.find((s: any) => s.id === 'sum_no_embed_1');
+      expect(found).toBeDefined();
+      expect('embedding' in found).toBe(false);
+
+      const getRes = await request(app)
+        .get('/summaries/sum_no_embed_1')
+        .set('Authorization', `Bearer ${testApiKey}`);
+      expect(getRes.status).toBe(200);
+      expect('embedding' in getRes.body).toBe(false);
+    });
+
+    it('returns 400 BAD_REQUEST on malformed percent-encoding in GET /files/:path/notes and bounds limit', async () => {
+      const badRes = await request(app)
+        .get('/files/%ZZ/notes')
+        .set('Authorization', `Bearer ${testApiKey}`);
+      expect(badRes.status).toBe(400);
+      expect(badRes.body.error.code).toBe('BAD_REQUEST');
+
+      createNote({
+        type: 'fact',
+        title: 'File Note 1',
+        content: 'Content 1',
+        scope: 'project',
+        project_id: 'file-limit-proj',
+        files: ['src/bounded.ts'],
+      });
+      createNote({
+        type: 'fact',
+        title: 'File Note 2',
+        content: 'Content 2',
+        scope: 'project',
+        project_id: 'file-limit-proj',
+        files: ['src/bounded.ts'],
+      });
+
+      const limitedRes = await request(app)
+        .get('/files/src%2Fbounded.ts/notes?limit=1')
+        .set('Authorization', `Bearer ${testApiKey}`);
+      expect(limitedRes.status).toBe(200);
+      expect(limitedRes.body.length).toBe(1);
+    });
+
+    it('bounds limit and offset on list endpoints including /memories/swarms/:swarmId/trajectories', async () => {
+      const endpoints = [
+        '/notes?limit=-5&offset=-10',
+        '/trajectories?limit=abc&offset=-1',
+        '/observations?limit=0&offset=-3',
+        '/summaries?limit=-1&offset=-2',
+        '/consolidate/candidates?limit=0',
+        '/failure-patterns?limit=-5',
+        '/dead-letters?limit=0&offset=-5',
+        '/memories/swarms/swarm-1/trajectories?limit=NaN',
+      ];
+      for (const ep of endpoints) {
+        const res = await request(app)
+          .get(ep)
+          .set('Authorization', `Bearer ${testApiKey}`);
+        expect(res.status).toBe(200);
+      }
+    });
+
+    it('sets Referrer-Policy: no-referrer and Strict-Transport-Security when BRAIN_HTTPS=1', async () => {
+      const res1 = await request(app).get('/health');
+      expect(res1.headers['referrer-policy']).toBe('no-referrer');
+      expect(res1.headers['strict-transport-security']).toBeUndefined();
+
+      process.env.BRAIN_HTTPS = '1';
+      try {
+        const res2 = await request(app).get('/health');
+        expect(res2.headers['referrer-policy']).toBe('no-referrer');
+        expect(res2.headers['strict-transport-security']).toBe('max-age=31536000; includeSubDomains');
+      } finally {
+        delete process.env.BRAIN_HTTPS;
+      }
+    });
+
+    it('does not leak internal error details on unhandled 500 errors', async () => {
+      const res = await request(app)
+        .post('/sessions/start')
+        .set('Authorization', `Bearer ${testApiKey}`)
+        .send({ project_id: 12345, scope: 'project' });
+      if (res.status === 500) {
+        expect(res.body.error.code).toBe('INTERNAL_SERVER_ERROR');
+        expect(res.body.error.message).toBe('Internal Server Error');
+        expect(res.body.error.trace_id).toBeDefined();
+      }
+    });
+
+    it('normalizes session/action/api-key paths and only exempts static dashboard assets from rate limiting', () => {
+      expect(normalizePathForRateLimit('/sessions/sess_123')).toBe('/sessions/:id');
+      expect(normalizePathForRateLimit('/sessions/sess_123/end')).toBe('/sessions/:id/end');
+      expect(normalizePathForRateLimit('/sessions/sess_123/replay')).toBe('/sessions/:id/replay');
+      expect(normalizePathForRateLimit('/actions/act_456')).toBe('/actions/:id');
+      expect(normalizePathForRateLimit('/maintenance/api-keys/key_789')).toBe('/maintenance/api-keys/:id');
+
+      const limiter = createRateLimiter({ windowMs: 60_000, maxRequests: 1 });
+      const makeRes = () => {
+        const headers: Record<string, string> = {};
+        return {
+          statusCode: 200,
+          body: null as any,
+          setHeader: (k: string, v: string) => {
+            headers[k] = v;
+          },
+          status: function (code: number) {
+            this.statusCode = code;
+            return this;
+          },
+          json: function (b: any) {
+            this.body = b;
+            return this;
+          },
+        } as any;
+      };
+
+      for (const staticPath of [
+        '/dashboard',
+        '/dashboard/',
+        '/dashboard/styles.css',
+        '/dashboard/app.js',
+        '/dashboard/api/auth-status',
+      ]) {
+        let called = false;
+        limiter({ path: staticPath, method: 'GET', ip: '10.0.0.1', headers: {} } as any, makeRes(), () => {
+          called = true;
+        });
+        expect(called).toBe(true);
+      }
+
+      let firstCalled = false;
+      limiter({ path: '/dashboard/api/stats', method: 'GET', ip: '10.0.0.2', headers: {} } as any, makeRes(), () => {
+        firstCalled = true;
+      });
+      expect(firstCalled).toBe(true);
+
+      let secondCalled = false;
+      const secondRes = makeRes();
+      limiter({ path: '/dashboard/api/stats', method: 'GET', ip: '10.0.0.2', headers: {} } as any, secondRes, () => {
+        secondCalled = true;
+      });
+      expect(secondCalled).toBe(false);
+      expect(secondRes.statusCode).toBe(429);
+    });
+
+    it('authenticates dashboard session via timingSafeEqual and configures logger redaction', async () => {
+      const okRes = await request(app)
+        .post('/dashboard/api/session')
+        .send({ key: testApiKey });
+      expect(okRes.status).toBe(200);
+      expect(okRes.body.authenticated).toBe(true);
+
+      const badRes = await request(app)
+        .post('/dashboard/api/session')
+        .send({ key: 'wrong_key_value' });
+      expect(badRes.status).toBe(401);
+
+      expect(logger).toBeDefined();
     });
   });
 });

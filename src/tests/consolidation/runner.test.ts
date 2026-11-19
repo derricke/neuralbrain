@@ -307,4 +307,19 @@ describe('vendor-driven consolidation run', () => {
     expect(report.message).toMatch(/requires BRAIN_VENDOR/);
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it('backs off rejected leases instead of releasing them in a tight re-lease/dead-letter loop', async () => {
+    seedFailingSession('sess-backoff');
+    fetchMock.mockResolvedValue(openAiReply(''));
+
+    const first = await runConsolidation({ projectId: 'proj-run' });
+    expect(first.rejected).toHaveLength(1);
+    expect(listDeadLetters({ source: 'consolidate' })).toHaveLength(1);
+
+    // Immediate second run must not re-lease or dead-letter the same session
+    const second = await runConsolidation({ projectId: 'proj-run' });
+    expect(second.considered).toBe(0);
+    expect(second.rejected).toHaveLength(0);
+    expect(listDeadLetters({ source: 'consolidate' })).toHaveLength(1);
+  });
 });

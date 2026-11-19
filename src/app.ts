@@ -62,11 +62,21 @@ import { learningRouter } from './routes/learning';
 import { dashboardRouter } from './routes/dashboard';
 import { mcpRouter } from './routes/mcp';
 
+const SUMMARY_PUBLIC_COLUMNS =
+  'id, scope, project_id, kind, window_from, window_to, outcome, producer_tier, producer_model, prompt_version, verified, version, supersedes, is_latest, sources_expired, created_at';
+
 function parseBoundedLimit(raw: unknown, defaultLimit = 50, maxLimit = 200): number {
   if (raw === undefined || raw === null || raw === '') return defaultLimit;
   const parsed = parseInt(String(raw), 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return defaultLimit;
   return Math.min(parsed, maxLimit);
+}
+
+function parseBoundedOffset(raw: unknown, defaultOffset = 0): number {
+  if (raw === undefined || raw === null || raw === '') return defaultOffset;
+  const parsed = parseInt(String(raw), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return defaultOffset;
+  return parsed;
 }
 
 export function createApp(): express.Application {
@@ -80,6 +90,10 @@ export function createApp(): express.Application {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    if (process.env.BRAIN_HTTPS === '1') {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
     next();
   });
 
@@ -252,8 +266,8 @@ export function createApp(): express.Application {
     const includeGlobal = req.query.include_global !== 'false';
     const concept = req.query.concept as string | undefined;
     const filePath = (req.query.file_path || req.query.filePath) as string | undefined;
-    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : undefined;
-    const offset = req.query.offset ? parseInt(String(req.query.offset), 10) : undefined;
+    const limit = parseBoundedLimit(req.query.limit, 50, 200);
+    const offset = parseBoundedOffset(req.query.offset, 0);
 
     let type: string[] | undefined;
     if (req.query.type) {
@@ -278,17 +292,22 @@ export function createApp(): express.Application {
   // Files -> Notes associations (support URL-encoded and wildcard paths)
   app.get(/^\/files\/(.+)\/notes$/, (req: Request, res: Response) => {
     const rawPath = Array.isArray(req.params[0]) ? req.params[0][0] : req.params[0];
-    const decodedPath = decodeURIComponent(String(rawPath));
+    let decodedPath: string;
+    try {
+      decodedPath = decodeURIComponent(String(rawPath));
+    } catch {
+      res.status(400).json({
+        error: {
+          code: 'BAD_REQUEST',
+          message: 'Malformed percent-encoding in file path',
+          trace_id: getCorrelationId(req),
+        },
+      });
+      return;
+    }
     const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
-    const notes = getNotesByFile(decodedPath, projectId);
-    res.json(notes);
-  });
-
-  app.get('/files/:path/notes', (req: Request, res: Response) => {
-    const rawPath = Array.isArray(req.params.path) ? req.params.path[0] : req.params.path;
-    const decodedPath = decodeURIComponent(String(rawPath));
-    const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
-    const notes = getNotesByFile(decodedPath, projectId);
+    const limit = parseBoundedLimit(req.query.limit, 50, 200);
+    const notes = getNotesByFile(decodedPath, projectId, limit);
     res.json(notes);
   });
 
@@ -330,8 +349,8 @@ export function createApp(): express.Application {
       rollupSourceParam === 'signalled' || rollupSourceParam === 'swept'
         ? rollupSourceParam
         : undefined;
-    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : undefined;
-    const offset = req.query.offset ? parseInt(String(req.query.offset), 10) : undefined;
+    const limit = parseBoundedLimit(req.query.limit, 50, 200);
+    const offset = parseBoundedOffset(req.query.offset, 0);
 
     const list = listTrajectories({
       projectId,
@@ -371,8 +390,8 @@ export function createApp(): express.Application {
     const sessionId = (req.query.session_id || req.query.sessionId) as string | undefined;
     const failed =
       req.query.failed !== undefined ? parseInt(String(req.query.failed), 10) : undefined;
-    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : undefined;
-    const offset = req.query.offset ? parseInt(String(req.query.offset), 10) : undefined;
+    const limit = parseBoundedLimit(req.query.limit, 50, 200);
+    const offset = parseBoundedOffset(req.query.offset, 0);
 
     const list = listObservations({
       projectId,
@@ -392,7 +411,7 @@ export function createApp(): express.Application {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     const db = getDb();
     const summary = db
-      .prepare('SELECT * FROM summaries WHERE id = ?')
+      .prepare(`SELECT ${SUMMARY_PUBLIC_COLUMNS} FROM summaries WHERE id = ?`)
       .get(id) as any;
 
     if (!summary) {
@@ -442,12 +461,12 @@ export function createApp(): express.Application {
     }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : 50;
-    const offset = req.query.offset ? parseInt(String(req.query.offset), 10) : 0;
+    const limit = parseBoundedLimit(req.query.limit, 50, 200);
+    const offset = parseBoundedOffset(req.query.offset, 0);
     params.push(limit, offset);
 
     const summaries = db
-      .prepare(`SELECT * FROM summaries ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`)
+      .prepare(`SELECT ${SUMMARY_PUBLIC_COLUMNS} FROM summaries ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`)
       .all(...params) as any[];
 
     if (summaries.length === 0) {
@@ -537,7 +556,9 @@ export function createApp(): express.Application {
 
   app.get('/sessions/:id', (req: Request, res: Response) => {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-    const details = getSessionDetails(id);
+    const limit = parseBoundedLimit(req.query.limit, 200, 500);
+    const offset = parseBoundedOffset(req.query.offset);
+    const details = getSessionDetails(id, { limit, offset });
     if (!details) {
       res.status(404).json({
         error: {
@@ -553,7 +574,9 @@ export function createApp(): express.Application {
 
   app.get('/sessions/:id/replay', (req: Request, res: Response) => {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-    const replay = getSessionReplay(id);
+    const limit = parseBoundedLimit(req.query.limit, 200, 500);
+    const offset = parseBoundedOffset(req.query.offset);
+    const replay = getSessionReplay(id, { limit, offset });
     if (!replay) {
       res.status(404).json({
         error: {
@@ -695,10 +718,15 @@ export function createApp(): express.Application {
   // -------------------------------------------------------------------------
   app.get('/consolidate/candidates', (req: Request, res: Response) => {
     const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
-    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : undefined;
-    const leaseDurationSec = req.query.lease_duration_sec
-      ? parseInt(String(req.query.lease_duration_sec), 10)
-      : undefined;
+    const limit = parseBoundedLimit(req.query.limit, 5, 200);
+    const rawLeaseDuration =
+      req.query.lease_duration_sec !== undefined
+        ? parseInt(String(req.query.lease_duration_sec), 10)
+        : undefined;
+    const leaseDurationSec =
+      rawLeaseDuration !== undefined && Number.isFinite(rawLeaseDuration) && rawLeaseDuration > 0
+        ? rawLeaseDuration
+        : undefined;
 
     const result = getConsolidationCandidates({
       projectId,
@@ -1016,7 +1044,7 @@ export function createApp(): express.Application {
   app.get('/failure-patterns', (req: Request, res: Response) => {
     const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
     const taskType = (req.query.task_type || req.query.taskType) as string | undefined;
-    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : undefined;
+    const limit = parseBoundedLimit(req.query.limit, 50, 200);
 
     const patterns = getFailurePatterns({
       projectId,
@@ -1031,8 +1059,8 @@ export function createApp(): express.Application {
     const source = req.query.source as string | undefined;
     const reason = req.query.reason as string | undefined;
     const producer = req.query.producer as string | undefined;
-    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : undefined;
-    const offset = req.query.offset ? parseInt(String(req.query.offset), 10) : undefined;
+    const limit = parseBoundedLimit(req.query.limit, 50, 200);
+    const offset = parseBoundedOffset(req.query.offset, 0);
 
     const deadLetters = listDeadLetters({
       source,
@@ -1138,7 +1166,7 @@ export function createApp(): express.Application {
     res.status(500).json({
       error: {
         code: 'INTERNAL_SERVER_ERROR',
-        message: err instanceof Error ? err.message : 'Internal Server Error',
+        message: 'Internal Server Error',
         trace_id: traceId,
       },
     });

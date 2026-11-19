@@ -1,8 +1,16 @@
 import { getDb, resetDb } from '../../lib/db';
-import { setCustomEmbedder, serializeEmbedding } from '../../learning/embedding';
-import { verifyOrCreateStoreMeta, commitStoreMeta } from '../../learning/storeMeta';
+import {
+  MAX_LOCAL_EMBED_CHARS,
+  boundLocalEmbedText,
+  deserializeEmbedding,
+  setCustomEmbedder,
+  serializeEmbedding,
+} from '../../learning/embedding';
+import { verifyOrCreateStoreMeta } from '../../learning/storeMeta';
 import { hybridSearch } from '../../learning/search';
+import * as embedWorker from '../../learning/embedWorker';
 import { createNote, getNotesByFile } from '../../memory/noteStore';
+import { captureObservations } from '../../memory/observationStore';
 import { logTrajectory } from '../../memory/trajectoryStore';
 
 describe('hybridSearch', () => {
@@ -229,5 +237,142 @@ describe('hybridSearch', () => {
     // Looking up different file returns empty
     const other = getNotesByFile('src/other.ts', 'neuralswarm');
     expect(other.length).toBe(0);
+  });
+
+  it('omits embedding blobs from search records and avoids duplicating summary claims/sources', async () => {
+    verifyOrCreateStoreMeta();
+    setCustomEmbedder(async () => [1, 0, 0, 0]);
+    const db = getDb();
+    const vec = serializeEmbedding([1, 0, 0, 0]);
+
+    const note = createNote({
+      scope: 'project',
+      projectId: 'p-compact',
+      type: 'fact',
+      title: 'Emery 257 note',
+      content: 'Compact search result test for emery 257',
+    });
+    db.prepare('UPDATE notes SET embedding = ? WHERE id = ?').run(vec, note.id);
+
+    const trajId = logTrajectory({
+      scope: 'project',
+      projectId: 'p-compact',
+      taskType: 'feature',
+      description: 'Emery 257 trajectory',
+      result: 'Completed emery 257 task',
+      success: true,
+    });
+    db.prepare('UPDATE trajectories SET embedding = ? WHERE id = ?').run(vec, trajId);
+
+    db.prepare(`
+      INSERT INTO summaries (
+        id, scope, project_id, kind, outcome, producer_tier, prompt_version, verified, is_latest, embedding
+      ) VALUES (?, 'project', 'p-compact', 'session', 'success', 'agent', 'extract-v1', 1, 1, ?)
+    `).run('sum_compact_1', vec);
+    db.prepare(`
+      INSERT INTO summary_claims (id, summary_id, text, ordinal)
+      VALUES ('clm_compact_1', 'sum_compact_1', 'Emery 257 summary claim', 0)
+    `).run();
+    db.prepare(`
+      INSERT INTO summary_sources (summary_id, claim_id, record_id, grain)
+      VALUES ('sum_compact_1', 'clm_compact_1', 'obs_compact_1', 'observation')
+    `).run();
+
+    const res = await hybridSearch({
+      q: 'emery 257',
+      project_id: 'p-compact',
+      record_types: ['note', 'trajectory', 'summary'],
+      limit: 10,
+    });
+
+    expect(res.results.length).toBe(3);
+    for (const item of res.results) {
+      expect(item.record).not.toHaveProperty('embedding');
+    }
+
+    const summaryItem = res.results.find((r) => r.grain === 'summary');
+    expect(summaryItem).toBeDefined();
+    expect(summaryItem!.claims).toHaveLength(1);
+    expect(summaryItem!.sources).toHaveLength(1);
+    expect(summaryItem!.record).not.toHaveProperty('claims');
+    expect(summaryItem!.record).not.toHaveProperty('sources');
+  });
+
+  it('handles unaligned Buffer.byteOffset in deserializeEmbedding and bounds embed text', () => {
+    const raw = serializeEmbedding([0.25, 0.5, 0.75, 1.0]);
+    const padded = Buffer.concat([Buffer.from([0xaa]), raw]);
+    const unaligned = padded.subarray(1);
+    expect(unaligned.byteOffset % 4).not.toBe(0);
+
+    const decoded = deserializeEmbedding(unaligned);
+    expect(decoded).toHaveLength(4);
+    expect(decoded[0]).toBeCloseTo(0.25);
+    expect(decoded[3]).toBeCloseTo(1.0);
+
+    const huge = 'x'.repeat(MAX_LOCAL_EMBED_CHARS + 500);
+    expect(boundLocalEmbedText(huge).length).toBe(MAX_LOCAL_EMBED_CHARS);
+  });
+
+  it('truncates observation input/output to 2000 chars and hydrates Qdrant hits outside newest 500', async () => {
+    verifyOrCreateStoreMeta();
+    setCustomEmbedder(async () => [1, 0, 0, 0]);
+    const db = getDb();
+
+    // 1. Observation truncation
+    captureObservations([
+      {
+        scope: 'project',
+        project_id: 'p-obs-trunc',
+        kind: 'tool_call',
+        tool_name: 'Bash',
+        input: `cmd ${'a'.repeat(3000)}`,
+        output: `out ${'b'.repeat(3000)}`,
+      },
+    ]);
+
+    const obsRes = await hybridSearch({
+      q: 'cmd',
+      project_id: 'p-obs-trunc',
+      record_types: ['observation'],
+    });
+    expect(obsRes.results).toHaveLength(1);
+    expect(obsRes.results[0].record.input.length).toBeLessThanOrEqual(2003);
+    expect(obsRes.results[0].record.output.length).toBeLessThanOrEqual(2003);
+
+    // 2. Hydrate Qdrant hit outside newest 500 SQLite rows
+    const oldNote = createNote({
+      scope: 'project',
+      projectId: 'p-hydrate',
+      type: 'fact',
+      title: 'Ancient Qdrant Hit',
+      content: 'Semantic match beyond newest 500',
+    });
+    db.prepare('UPDATE notes SET created_at = 100 WHERE id = ?').run(oldNote.id);
+
+    // Insert 501 newer notes so oldNote is outside LIMIT 500
+    const insertNote = db.prepare(`
+      INSERT INTO notes (id, scope, project_id, type, title, content, is_latest, created_at)
+      VALUES (?, 'project', 'p-hydrate', 'fact', 'Filler', 'Filler content', 1, ?)
+    `);
+    for (let i = 0; i < 501; i++) {
+      insertNote.run(`note_fill_${i}`, 1000 + i);
+    }
+
+    const qdrantSpy = jest.spyOn(embedWorker, 'getQdrantClient').mockReturnValue({
+      search: jest.fn().mockResolvedValue([
+        { id: oldNote.id, score: 0.99, payload: { grain: 'note' } },
+      ]),
+    } as any);
+
+    try {
+      const hydratedRes = await hybridSearch({
+        q: 'unrelated query',
+        project_id: 'p-hydrate',
+        record_types: ['note'],
+      });
+      expect(hydratedRes.results.some((r) => r.id === oldNote.id)).toBe(true);
+    } finally {
+      qdrantSpy.mockRestore();
+    }
   });
 });

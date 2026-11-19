@@ -3,6 +3,13 @@ import { getTrajectory, getSwarmTrajectories, runCleanup } from '../memory/traje
 
 export const memoriesRouter = Router();
 
+function parseBoundedLimit(raw: unknown, defaultLimit = 50, maxLimit = 200): number {
+  if (raw === undefined || raw === null || raw === '') return defaultLimit;
+  const parsed = parseInt(String(raw), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return defaultLimit;
+  return Math.min(parsed, maxLimit);
+}
+
 // GET /memories/trajectories/:id
 memoriesRouter.get('/trajectories/:id', (req: Request, res: Response) => {
   const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -21,7 +28,7 @@ memoriesRouter.get('/trajectories/:id', (req: Request, res: Response) => {
 
 // GET /memories/swarms/:swarmId/trajectories
 memoriesRouter.get('/swarms/:swarmId/trajectories', (req: Request, res: Response) => {
-  const limit = Math.min(parseInt(String(req.query.limit ?? '50'), 10), 200);
+  const limit = parseBoundedLimit(req.query.limit, 50, 200);
   const records = getSwarmTrajectories(String(req.params.swarmId), limit);
   res.json(records);
 });

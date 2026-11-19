@@ -4,6 +4,7 @@ import { Database, Statement, transaction } from '../lib/sqlite';
 
 export type EmbedGrain = 'observation' | 'trajectory' | 'note' | 'summary';
 export type EmbedStatus = 'pending' | 'running' | 'done' | 'failed';
+export const MAX_EMBED_ATTEMPTS = 3;
 
 export interface EmbedQueueItem {
   record_id: string;
@@ -107,7 +108,7 @@ export function claimEmbedQueue(target = 'live', limit = 32): EmbedQueueItem[] {
 
     const updateStmt = db.prepare(`
       UPDATE embed_queue
-      SET status = 'running', attempts = attempts + 1
+      SET status = 'running', attempts = attempts + 1, queued_at = unixepoch()
       WHERE record_id = ? AND grain = ? AND target = ?
     `);
 
@@ -161,6 +162,33 @@ export function releaseEmbedClaim(recordId: string, grain: EmbedGrain, target = 
   `).run(reason ?? null, recordId, grain, target);
 }
 
+/**
+ * Recovers items stuck in 'running' state (e.g., after a worker crash or lease timeout)
+ * by resetting them back to 'pending' so they can be re-claimed.
+ */
+export function recoverStaleRunningEmbeds(target = 'live', staleAfterSec = 300): number {
+  const db = getDb();
+  const cutoff = Math.floor(Date.now() / 1000) - Math.max(0, staleAfterSec);
+  const result = db
+    .prepare(`
+      UPDATE embed_queue
+      SET status = 'pending',
+          last_error = COALESCE(last_error, 'recovered stale running item')
+      WHERE target = ? AND status = 'running' AND queued_at <= ?
+    `)
+    .run(target, cutoff);
+  return result.changes;
+}
+
+/**
+ * Deletes all queue entries for a specific target (used to clean up failed reembed targets).
+ */
+export function clearEmbedQueueTarget(target: string): number {
+  const db = getDb();
+  const result = db.prepare('DELETE FROM embed_queue WHERE target = ?').run(target);
+  return result.changes;
+}
+
 export function markEmbedFailed(
   recordId: string,
   grain: EmbedGrain,
@@ -170,7 +198,8 @@ export function markEmbedFailed(
   const db = getDb();
   db.prepare(`
     UPDATE embed_queue
-    SET status = 'failed', last_error = ?
+    SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
+        last_error = ?
     WHERE record_id = ? AND grain = ? AND target = ?
-  `).run(error ?? 'Unknown embedding error', recordId, grain, target);
+  `).run(MAX_EMBED_ATTEMPTS, error ?? 'Unknown embedding error', recordId, grain, target);
 }

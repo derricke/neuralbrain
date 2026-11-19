@@ -7,7 +7,8 @@ export type GraphNodeType =
   | 'file'
   | 'session'
   | 'action'
-  | 'summary';
+  | 'summary'
+  | 'observation';
 
 export type GraphEdgeType =
   | 'has_concept'
@@ -120,20 +121,25 @@ export function getKnowledgeGraph(options: KnowledgeGraphOptions = {}): Knowledg
   const nodeMap = new Map<string, GraphNode>();
   const edgeKeys = new Set<string>();
   const edges: GraphEdge[] = [];
+  const maxNodes = limit * 5;
+  const maxEdges = limit * 10;
 
-  const addNode = (node: GraphNode) => {
-    if (!nodeMap.has(node.id)) {
-      nodeMap.set(node.id, node);
-    }
+  const addNode = (node: GraphNode): boolean => {
+    if (nodeMap.has(node.id)) return true;
+    if (nodeMap.size >= maxNodes) return false;
+    nodeMap.set(node.id, node);
+    return true;
   };
 
-  const addEdge = (source: string, target: string, type: GraphEdgeType) => {
-    if (!nodeMap.has(source) || !nodeMap.has(target)) return;
+  const addEdge = (source: string, target: string, type: GraphEdgeType): boolean => {
+    if (edges.length >= maxEdges) return false;
+    if (!nodeMap.has(source) || !nodeMap.has(target)) return false;
     const key = `${source}\0${type}\0${target}`;
     if (!edgeKeys.has(key)) {
       edgeKeys.add(key);
       edges.push({ source, target, type });
     }
+    return true;
   };
 
   const noteRows = db
@@ -291,23 +297,25 @@ export function getKnowledgeGraph(options: KnowledgeGraphOptions = {}): Knowledg
     const placeholders = noteIds.map(() => '?').join(',');
 
     const conceptRows = db
-      .prepare(`SELECT note_id, concept FROM note_concepts WHERE note_id IN (${placeholders})`)
-      .all(...noteIds) as Array<{ note_id: string; concept: string }>;
+      .prepare(`SELECT note_id, concept FROM note_concepts WHERE note_id IN (${placeholders}) LIMIT ?`)
+      .all(...noteIds, maxNodes) as Array<{ note_id: string; concept: string }>;
 
     for (const row of conceptRows) {
       const conceptId = `concept:${row.concept}`;
-      addNode({ id: conceptId, type: 'concept', label: row.concept });
-      addEdge(row.note_id, conceptId, 'has_concept');
+      if (addNode({ id: conceptId, type: 'concept', label: row.concept })) {
+        addEdge(row.note_id, conceptId, 'has_concept');
+      }
     }
 
     const fileRows = db
-      .prepare(`SELECT note_id, file_path FROM note_files WHERE note_id IN (${placeholders})`)
-      .all(...noteIds) as Array<{ note_id: string; file_path: string }>;
+      .prepare(`SELECT note_id, file_path FROM note_files WHERE note_id IN (${placeholders}) LIMIT ?`)
+      .all(...noteIds, maxNodes) as Array<{ note_id: string; file_path: string }>;
 
     for (const row of fileRows) {
       const fileId = `file:${row.file_path}`;
-      addNode({ id: fileId, type: 'file', label: row.file_path });
-      addEdge(row.note_id, fileId, 'touches_file');
+      if (addNode({ id: fileId, type: 'file', label: row.file_path })) {
+        addEdge(row.note_id, fileId, 'touches_file');
+      }
     }
 
     for (const note of noteRows) {
@@ -331,9 +339,54 @@ export function getKnowledgeGraph(options: KnowledgeGraphOptions = {}): Knowledg
     const placeholders = summaryIds.map(() => '?').join(',');
     const sourceRows = db
       .prepare(
-        `SELECT DISTINCT summary_id, record_id FROM summary_sources WHERE summary_id IN (${placeholders})`
+        `SELECT DISTINCT summary_id, record_id, grain FROM summary_sources WHERE summary_id IN (${placeholders}) LIMIT ?`
       )
-      .all(...summaryIds) as Array<{ summary_id: string; record_id: string }>;
+      .all(...summaryIds, maxNodes) as Array<{ summary_id: string; record_id: string; grain: string }>;
+
+    // Load cited observation nodes within the remaining node budget so cites_source edges resolve cleanly
+    const remainingBudget = maxNodes - nodeMap.size;
+    if (remainingBudget > 0) {
+      const citedObsIds = Array.from(
+        new Set(
+          sourceRows
+            .filter((r) => r.grain === 'observation' && !nodeMap.has(r.record_id))
+            .map((r) => r.record_id)
+        )
+      ).slice(0, remainingBudget);
+
+      if (citedObsIds.length > 0) {
+        const obsPlaceholders = citedObsIds.map(() => '?').join(',');
+        const obsRows = db
+          .prepare(
+            `SELECT id, scope, project_id, kind, tool_name, file_path, created_at FROM observations WHERE id IN (${obsPlaceholders}) LIMIT ?`
+          )
+          .all(...citedObsIds, remainingBudget) as Array<{
+          id: string;
+          scope: string;
+          project_id: string | null;
+          kind: string;
+          tool_name: string | null;
+          file_path: string | null;
+          created_at: number;
+        }>;
+
+        for (const obs of obsRows) {
+          addNode({
+            id: obs.id,
+            type: 'observation',
+            label: obs.tool_name ? `${obs.kind}: ${obs.tool_name}` : obs.kind,
+            scope: obs.scope,
+            project_id: obs.project_id,
+            meta: {
+              kind: obs.kind,
+              tool_name: obs.tool_name,
+              file_path: obs.file_path,
+              created_at: obs.created_at,
+            },
+          });
+        }
+      }
+    }
 
     for (const row of sourceRows) {
       addEdge(row.summary_id, row.record_id, 'cites_source');

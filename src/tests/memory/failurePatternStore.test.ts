@@ -2,6 +2,7 @@ import {
   upsertFailurePattern,
   getFailurePatterns,
   formatCriticalWarnings,
+  sanitizeErrorText,
 } from '../../memory/failurePatternStore';
 import { getDb, resetDb } from '../../lib/db';
 
@@ -84,5 +85,23 @@ describe('failurePatternStore', () => {
 
   it('returns empty string if no patterns to format', () => {
     expect(formatCriticalWarnings([])).toBe('');
+  });
+
+  it('redacts secrets in sanitizeErrorText and upsertFailurePattern', () => {
+    const secret = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456';
+    const cleaned = sanitizeErrorText(`Auth failed with ${secret}`);
+    expect(cleaned).not.toContain(secret);
+    expect(cleaned).toContain('[REDACTED_API_KEY]');
+
+    upsertFailurePattern({
+      scope: 'project',
+      projectId: 'proj-sec',
+      taskType: 'deploy',
+      errorText: `Token leaked: ghp_abcdefghijklmnopqrstuvwxyz123456`,
+    });
+    const patterns = getFailurePatterns({ projectId: 'proj-sec', taskType: 'deploy' });
+    expect(patterns).toHaveLength(1);
+    expect(patterns[0].error_text).not.toContain('ghp_');
+    expect(patterns[0].error_text).toContain('[REDACTED_TOKEN]');
   });
 });
