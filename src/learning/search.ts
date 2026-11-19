@@ -5,6 +5,17 @@ import { verifyOrCreateStoreMeta } from './storeMeta';
 import { getQdrantClient } from './embedWorker';
 import type { SearchRequest, SearchResponse, SearchResultItem } from './types';
 
+const MAX_OBS_RECORD_CHARS = 2000;
+
+function docKey(grain: string, id: string): string {
+  return `${grain}:${id}`;
+}
+
+function truncateObsField(value: string | null): string | null {
+  if (!value || value.length <= MAX_OBS_RECORD_CHARS) return value;
+  return `${value.slice(0, MAX_OBS_RECORD_CHARS)}...`;
+}
+
 function tokenize(text: string): string[] {
   if (!text) return [];
   const matches = text.toLowerCase().match(/[a-z0-9_./-]+/g);
@@ -31,6 +42,8 @@ interface CandidateDoc {
   record: Record<string, any>;
   text: string;
   embedding: Buffer | null;
+  claims?: Array<{ id: string; summary_id: string; text: string; ordinal: number }>;
+  sources?: Array<{ summary_id: string; claim_id: string; record_id: string; grain: string }>;
   bm25Score?: number;
   denseScore?: number;
   rrfScore?: number;
@@ -155,8 +168,8 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
 
   const candidates: CandidateDoc[] = [];
 
-  // 1. Fetch candidate records from SQLite
-  if (grains.includes('note')) {
+  // 1. Helpers to fetch & hydrate candidate records from SQLite (shared between initial LIMIT 500 and Qdrant ID hydration)
+  const fetchNotes = (ids?: string[]): CandidateDoc[] => {
     const scopeFilter = buildScopeClause('n');
     const conditions: string[] = ['n.is_latest = 1', scopeFilter.clause];
     const queryParams: unknown[] = [...scopeFilter.params];
@@ -176,58 +189,58 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
       conditions.push(`n.author = ?`);
       queryParams.push(params.filters.agent.trim());
     }
-
-    const rows = db
-      .prepare(`SELECT * FROM notes n WHERE ${conditions.join(' AND ')} ORDER BY n.created_at DESC LIMIT 500`)
-      .all(...queryParams) as any[];
-
-    if (rows.length > 0) {
-      const noteIds = rows.map((r) => r.id);
-      const placeholders = noteIds.map(() => '?').join(',');
-
-      const allConcepts = db
-        .prepare(`SELECT note_id, concept FROM note_concepts WHERE note_id IN (${placeholders})`)
-        .all(...noteIds) as Array<{ note_id: string; concept: string }>;
-      const conceptsByNoteId = new Map<string, string[]>();
-      for (const row of allConcepts) {
-        let list = conceptsByNoteId.get(row.note_id);
-        if (!list) {
-          list = [];
-          conceptsByNoteId.set(row.note_id, list);
-        }
-        list.push(row.concept);
-      }
-
-      const allFiles = db
-        .prepare(`SELECT note_id, file_path FROM note_files WHERE note_id IN (${placeholders})`)
-        .all(...noteIds) as Array<{ note_id: string; file_path: string }>;
-      const filesByNoteId = new Map<string, string[]>();
-      for (const row of allFiles) {
-        let list = filesByNoteId.get(row.note_id);
-        if (!list) {
-          list = [];
-          filesByNoteId.set(row.note_id, list);
-        }
-        list.push(row.file_path);
-      }
-
-      for (const row of rows) {
-        const concepts = conceptsByNoteId.get(row.id) || [];
-        const files = filesByNoteId.get(row.id) || [];
-        const record = { ...row, concepts, files };
-        const text = `${row.title}\n\n${row.content}\n${concepts.join(' ')}\n${files.join(' ')}`;
-        candidates.push({
-          id: row.id,
-          grain: 'note',
-          record,
-          text,
-          embedding: row.embedding,
-        });
-      }
+    if (ids) {
+      if (ids.length === 0) return [];
+      conditions.push(`n.id IN (${ids.map(() => '?').join(',')})`);
+      queryParams.push(...ids);
     }
-  }
 
-  if (grains.includes('trajectory')) {
+    const sql = ids
+      ? `SELECT * FROM notes n WHERE ${conditions.join(' AND ')}`
+      : `SELECT * FROM notes n WHERE ${conditions.join(' AND ')} ORDER BY n.created_at DESC LIMIT 500`;
+    const rows = db.prepare(sql).all(...queryParams) as any[];
+    if (rows.length === 0) return [];
+
+    const noteIds = rows.map((r) => r.id);
+    const placeholders = noteIds.map(() => '?').join(',');
+
+    const allConcepts = db
+      .prepare(`SELECT note_id, concept FROM note_concepts WHERE note_id IN (${placeholders})`)
+      .all(...noteIds) as Array<{ note_id: string; concept: string }>;
+    const conceptsByNoteId = new Map<string, string[]>();
+    for (const row of allConcepts) {
+      let list = conceptsByNoteId.get(row.note_id);
+      if (!list) {
+        list = [];
+        conceptsByNoteId.set(row.note_id, list);
+      }
+      list.push(row.concept);
+    }
+
+    const allFiles = db
+      .prepare(`SELECT note_id, file_path FROM note_files WHERE note_id IN (${placeholders})`)
+      .all(...noteIds) as Array<{ note_id: string; file_path: string }>;
+    const filesByNoteId = new Map<string, string[]>();
+    for (const row of allFiles) {
+      let list = filesByNoteId.get(row.note_id);
+      if (!list) {
+        list = [];
+        filesByNoteId.set(row.note_id, list);
+      }
+      list.push(row.file_path);
+    }
+
+    return rows.map((row) => {
+      const concepts = conceptsByNoteId.get(row.id) || [];
+      const files = filesByNoteId.get(row.id) || [];
+      const { embedding, ...rowWithoutEmbedding } = row;
+      const record = { ...rowWithoutEmbedding, concepts, files };
+      const text = `${row.title}\n\n${row.content}\n${concepts.join(' ')}\n${files.join(' ')}`;
+      return { id: row.id, grain: 'note', record, text, embedding };
+    });
+  };
+
+  const fetchTrajectories = (ids?: string[]): CandidateDoc[] => {
     const scopeFilter = buildScopeClause('t');
     const conditions: string[] = [scopeFilter.clause];
     const queryParams: unknown[] = [...scopeFilter.params];
@@ -252,24 +265,25 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
       conditions.push(`t.task_ref = ?`);
       queryParams.push(params.filters.task_ref.trim());
     }
-
-    const rows = db
-      .prepare(`SELECT * FROM trajectories t WHERE ${conditions.join(' AND ')} ORDER BY t.created_at DESC LIMIT 500`)
-      .all(...queryParams) as any[];
-
-    for (const row of rows) {
-      const text = `${row.description || ''}\n${row.result || ''}\n${row.task_type || ''}`;
-      candidates.push({
-        id: row.id,
-        grain: 'trajectory',
-        record: row,
-        text,
-        embedding: row.embedding,
-      });
+    if (ids) {
+      if (ids.length === 0) return [];
+      conditions.push(`t.id IN (${ids.map(() => '?').join(',')})`);
+      queryParams.push(...ids);
     }
-  }
 
-  if (grains.includes('observation')) {
+    const sql = ids
+      ? `SELECT * FROM trajectories t WHERE ${conditions.join(' AND ')}`
+      : `SELECT * FROM trajectories t WHERE ${conditions.join(' AND ')} ORDER BY t.created_at DESC LIMIT 500`;
+    const rows = db.prepare(sql).all(...queryParams) as any[];
+
+    return rows.map((row) => {
+      const { embedding, ...rowWithoutEmbedding } = row;
+      const text = `${row.description || ''}\n${row.result || ''}\n${row.task_type || ''}`;
+      return { id: row.id, grain: 'trajectory', record: rowWithoutEmbedding, text, embedding };
+    });
+  };
+
+  const fetchObservations = (ids?: string[]): CandidateDoc[] => {
     const scopeFilter = buildScopeClause('o');
     const conditions: string[] = [scopeFilter.clause];
     const queryParams: unknown[] = [...scopeFilter.params];
@@ -298,24 +312,29 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
       conditions.push(`o.task_ref = ?`);
       queryParams.push(params.filters.task_ref.trim());
     }
-
-    const rows = db
-      .prepare(`SELECT * FROM observations o WHERE ${conditions.join(' AND ')} ORDER BY o.created_at DESC LIMIT 500`)
-      .all(...queryParams) as any[];
-
-    for (const row of rows) {
-      const text = `${row.tool_name || ''}\n${row.file_path || ''}\n${row.input || ''}\n${row.output || ''}`;
-      candidates.push({
-        id: row.id,
-        grain: 'observation',
-        record: row,
-        text,
-        embedding: null,
-      });
+    if (ids) {
+      if (ids.length === 0) return [];
+      conditions.push(`o.id IN (${ids.map(() => '?').join(',')})`);
+      queryParams.push(...ids);
     }
-  }
 
-  if (grains.includes('summary')) {
+    const sql = ids
+      ? `SELECT * FROM observations o WHERE ${conditions.join(' AND ')}`
+      : `SELECT * FROM observations o WHERE ${conditions.join(' AND ')} ORDER BY o.created_at DESC LIMIT 500`;
+    const rows = db.prepare(sql).all(...queryParams) as any[];
+
+    return rows.map((row) => {
+      const text = `${row.tool_name || ''}\n${row.file_path || ''}\n${row.input || ''}\n${row.output || ''}`;
+      const record = {
+        ...row,
+        input: truncateObsField(row.input),
+        output: truncateObsField(row.output),
+      };
+      return { id: row.id, grain: 'observation', record, text, embedding: null };
+    });
+  };
+
+  const fetchSummaries = (ids?: string[]): CandidateDoc[] => {
     const scopeFilter = buildScopeClause('s');
     const conditions: string[] = ['s.is_latest = 1', scopeFilter.clause];
     const queryParams: unknown[] = [...scopeFilter.params];
@@ -332,77 +351,178 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
       conditions.push(`s.outcome = ?`);
       queryParams.push(params.filters.success ? 'success' : 'failure');
     }
+    if (ids) {
+      if (ids.length === 0) return [];
+      conditions.push(`s.id IN (${ids.map(() => '?').join(',')})`);
+      queryParams.push(...ids);
+    }
 
-    const rows = db
-      .prepare(`SELECT * FROM summaries s WHERE ${conditions.join(' AND ')} ORDER BY s.created_at DESC LIMIT 500`)
-      .all(...queryParams) as any[];
+    const sql = ids
+      ? `SELECT * FROM summaries s WHERE ${conditions.join(' AND ')}`
+      : `SELECT * FROM summaries s WHERE ${conditions.join(' AND ')} ORDER BY s.created_at DESC LIMIT 500`;
+    const rows = db.prepare(sql).all(...queryParams) as any[];
+    if (rows.length === 0) return [];
 
-    if (rows.length > 0) {
-      const summaryIds = rows.map((r) => r.id);
-      const placeholders = summaryIds.map(() => '?').join(',');
+    const summaryIds = rows.map((r) => r.id);
+    const placeholders = summaryIds.map(() => '?').join(',');
 
-      const allClaims = db
-        .prepare(`SELECT id, summary_id, text, ordinal FROM summary_claims WHERE summary_id IN (${placeholders}) ORDER BY ordinal ASC`)
-        .all(...summaryIds) as Array<{ id: string; summary_id: string; text: string; ordinal: number }>;
-      const claimsBySummaryId = new Map<string, Array<{ id: string; summary_id: string; text: string; ordinal: number }>>();
-      for (const c of allClaims) {
-        let list = claimsBySummaryId.get(c.summary_id);
-        if (!list) {
-          list = [];
-          claimsBySummaryId.set(c.summary_id, list);
+    const allClaims = db
+      .prepare(`SELECT id, summary_id, text, ordinal FROM summary_claims WHERE summary_id IN (${placeholders}) ORDER BY ordinal ASC`)
+      .all(...summaryIds) as Array<{ id: string; summary_id: string; text: string; ordinal: number }>;
+    const claimsBySummaryId = new Map<string, Array<{ id: string; summary_id: string; text: string; ordinal: number }>>();
+    for (const c of allClaims) {
+      let list = claimsBySummaryId.get(c.summary_id);
+      if (!list) {
+        list = [];
+        claimsBySummaryId.set(c.summary_id, list);
+      }
+      list.push(c);
+    }
+
+    const allSources = db
+      .prepare(`SELECT summary_id, claim_id, record_id, grain FROM summary_sources WHERE summary_id IN (${placeholders})`)
+      .all(...summaryIds) as Array<{ summary_id: string; claim_id: string; record_id: string; grain: string }>;
+    const sourcesBySummaryId = new Map<string, Array<{ summary_id: string; claim_id: string; record_id: string; grain: string }>>();
+    for (const s of allSources) {
+      let list = sourcesBySummaryId.get(s.summary_id);
+      if (!list) {
+        list = [];
+        sourcesBySummaryId.set(s.summary_id, list);
+      }
+      list.push(s);
+    }
+
+    return rows.map((row) => {
+      const claims = claimsBySummaryId.get(row.id) || [];
+      const sources = sourcesBySummaryId.get(row.id) || [];
+      const { embedding, ...rowWithoutEmbedding } = row;
+      const text = claims.map((c) => c.text).join('\n');
+      return {
+        id: row.id,
+        grain: 'summary',
+        record: rowWithoutEmbedding,
+        text,
+        embedding,
+        claims,
+        sources,
+      };
+    });
+  };
+
+  if (grains.includes('note')) candidates.push(...fetchNotes());
+  if (grains.includes('trajectory')) candidates.push(...fetchTrajectories());
+  if (grains.includes('observation')) candidates.push(...fetchObservations());
+  if (grains.includes('summary')) candidates.push(...fetchSummaries());
+
+  // 2. Dense retrieval (run Qdrant first so hits outside the newest 500 SQLite rows can be hydrated)
+  const recipe = resolveEmbedderRecipe();
+  const verification = verifyOrCreateStoreMeta();
+  const isMismatch = !verification.match && recipe.embed_tier !== 'none';
+
+  let mode: 'hybrid' | 'bm25' = 'hybrid';
+  let degradedMessage: string | undefined;
+
+  if (recipe.embed_tier === 'none') {
+    mode = 'bm25';
+  } else if (isMismatch) {
+    mode = 'bm25';
+    degradedMessage = verification.mismatchReason;
+  }
+
+  const denseScoresMap = new Map<string, number>();
+  let queryVec: number[] = [];
+
+  if (mode === 'hybrid') {
+    try {
+      queryVec = await embedQuery(q);
+      if (queryVec && queryVec.length > 0) {
+        const qdrant = getQdrantClient();
+        if (qdrant) {
+          const alias = verification.meta?.qdrant_alias || 'brain';
+          try {
+            const filter = buildQdrantFilter(params, grains, includeGlobal);
+            const searchRes = await qdrant.search(alias, {
+              vector: queryVec,
+              limit: Math.max(limit * 2, 50),
+              with_payload: true,
+              ...(filter ? { filter } : {}),
+            });
+
+            const existingKeys = new Set(candidates.map((c) => docKey(c.grain, c.id)));
+            const missingByGrain = new Map<string, string[]>();
+
+            for (const pt of searchRes) {
+              const ptId = String(pt.id);
+              const ptGrain = typeof pt.payload?.grain === 'string' ? pt.payload.grain : undefined;
+              if (ptGrain) {
+                const key = docKey(ptGrain, ptId);
+                denseScoresMap.set(key, pt.score);
+                if (grains.includes(ptGrain as any) && !existingKeys.has(key)) {
+                  let list = missingByGrain.get(ptGrain);
+                  if (!list) {
+                    list = [];
+                    missingByGrain.set(ptGrain, list);
+                  }
+                  list.push(ptId);
+                }
+              } else {
+                for (const g of grains) {
+                  const key = docKey(g, ptId);
+                  denseScoresMap.set(key, pt.score);
+                  if (!existingKeys.has(key)) {
+                    let list = missingByGrain.get(g);
+                    if (!list) {
+                      list = [];
+                      missingByGrain.set(g, list);
+                    }
+                    list.push(ptId);
+                  }
+                }
+              }
+            }
+
+            // Hydrate Qdrant hits that fell outside the newest 500 SQLite rows
+            for (const [grain, ids] of missingByGrain.entries()) {
+              let hydrated: CandidateDoc[] = [];
+              if (grain === 'note') hydrated = fetchNotes(ids);
+              else if (grain === 'trajectory') hydrated = fetchTrajectories(ids);
+              else if (grain === 'observation') hydrated = fetchObservations(ids);
+              else if (grain === 'summary') hydrated = fetchSummaries(ids);
+              for (const doc of hydrated) {
+                const key = docKey(doc.grain, doc.id);
+                if (!existingKeys.has(key)) {
+                  existingKeys.add(key);
+                  candidates.push(doc);
+                }
+              }
+            }
+          } catch {
+            // Fallback to SQLite embedding blobs
+          }
         }
-        list.push(c);
       }
-
-      const allSources = db
-        .prepare(`SELECT summary_id, claim_id, record_id, grain FROM summary_sources WHERE summary_id IN (${placeholders})`)
-        .all(...summaryIds) as Array<{ summary_id: string; claim_id: string; record_id: string; grain: string }>;
-      const sourcesBySummaryId = new Map<string, Array<{ summary_id: string; claim_id: string; record_id: string; grain: string }>>();
-      for (const s of allSources) {
-        let list = sourcesBySummaryId.get(s.summary_id);
-        if (!list) {
-          list = [];
-          sourcesBySummaryId.set(s.summary_id, list);
-        }
-        list.push(s);
-      }
-
-      for (const row of rows) {
-        const claims = claimsBySummaryId.get(row.id) || [];
-        const sources = sourcesBySummaryId.get(row.id) || [];
-        const record = { ...row, claims, sources };
-        const text = claims.map((c) => c.text).join('\n');
-        candidates.push({
-          id: row.id,
-          grain: 'summary',
-          record,
-          text,
-          embedding: row.embedding,
-        });
-      }
+    } catch (err) {
+      logger.warn({ error: err instanceof Error ? err.message : String(err) }, 'dense query embedding failed, falling back to BM25');
+      mode = 'bm25';
     }
   }
 
   if (candidates.length === 0) {
-    const verification = verifyOrCreateStoreMeta();
-    const recipe = resolveEmbedderRecipe();
-    const isDegraded = !verification.match && recipe.embed_tier !== 'none';
-    const mode = recipe.embed_tier === 'none' || isDegraded ? 'bm25' : 'hybrid';
     return {
       results: [],
       mode,
-      degraded: isDegraded ? verification.mismatchReason : undefined,
+      degraded: degradedMessage,
     };
   }
 
-  // 2. BM25 scoring over candidates
+  // 3. BM25 scoring over candidates (keyed by grain:id)
   const queryTokens = tokenize(q);
   const docTokensMap = new Map<string, string[]>();
   const docLengths: number[] = [];
 
   for (const c of candidates) {
     const tokens = tokenize(c.text);
-    docTokensMap.set(c.id, tokens);
+    docTokensMap.set(docKey(c.grain, c.id), tokens);
     docLengths.push(tokens.length);
   }
 
@@ -416,7 +536,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
   for (const token of queryTokens) {
     let df = 0;
     for (const c of candidates) {
-      const tokens = docTokensMap.get(c.id)!;
+      const tokens = docTokensMap.get(docKey(c.grain, c.id))!;
       if (tokens.includes(token)) df++;
     }
     const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5));
@@ -424,7 +544,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
   }
 
   for (const c of candidates) {
-    const tokens = docTokensMap.get(c.id)!;
+    const tokens = docTokensMap.get(docKey(c.grain, c.id))!;
     const tfMap = new Map<string, number>();
     for (const t of tokens) {
       tfMap.set(t, (tfMap.get(t) || 0) + 1);
@@ -442,61 +562,17 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     c.bm25Score = score;
   }
 
-  // 3. Dense scoring
-  const recipe = resolveEmbedderRecipe();
-  const verification = verifyOrCreateStoreMeta();
-  const isMismatch = !verification.match && recipe.embed_tier !== 'none';
-
-  let mode: 'hybrid' | 'bm25' = 'hybrid';
-  let degradedMessage: string | undefined;
-
-  if (recipe.embed_tier === 'none') {
-    mode = 'bm25';
-  } else if (isMismatch) {
-    mode = 'bm25';
-    degradedMessage = verification.mismatchReason;
-  }
-
-  const denseScoresMap = new Map<string, number>();
-
-  if (mode === 'hybrid') {
-    try {
-      const queryVec = await embedQuery(q);
-      if (queryVec && queryVec.length > 0) {
-        // Try Qdrant top points if connected
-        const qdrant = getQdrantClient();
-        if (qdrant) {
-          const alias = verification.meta?.qdrant_alias || 'brain';
-          try {
-            const filter = buildQdrantFilter(params, grains, includeGlobal);
-            const searchRes = await qdrant.search(alias, {
-              vector: queryVec,
-              limit: Math.max(limit * 2, 50),
-              with_payload: true,
-              ...(filter ? { filter } : {}),
-            });
-            for (const pt of searchRes) {
-              denseScoresMap.set(String(pt.id), pt.score);
-            }
-          } catch (qErr) {
-            // Fallback to SQLite embedding blobs
-          }
-        }
-
-        // For any candidate not scored by Qdrant or if Qdrant was unavailable
-        for (const c of candidates) {
-          if (!denseScoresMap.has(c.id) && c.embedding) {
-            const vec = deserializeEmbedding(c.embedding);
-            if (vec.length === queryVec.length) {
-              const sim = cosineSimilarity(queryVec, vec);
-              denseScoresMap.set(c.id, sim);
-            }
-          }
+  // Dense scoring fallback from SQLite embedding blobs for candidates not scored by Qdrant
+  if (mode === 'hybrid' && queryVec.length > 0) {
+    for (const c of candidates) {
+      const key = docKey(c.grain, c.id);
+      if (!denseScoresMap.has(key) && c.embedding) {
+        const vec = deserializeEmbedding(c.embedding);
+        if (vec.length === queryVec.length) {
+          const sim = cosineSimilarity(queryVec, vec);
+          denseScoresMap.set(key, sim);
         }
       }
-    } catch (err) {
-      logger.warn({ error: err instanceof Error ? err.message : String(err) }, 'dense query embedding failed, falling back to BM25');
-      mode = 'bm25';
     }
   }
 
@@ -507,25 +583,33 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     .sort((a, b) => (b.bm25Score ?? 0) - (a.bm25Score ?? 0));
   const bm25RankMap = new Map<string, number>();
   bm25Sorted.forEach((c, idx) => {
-    bm25RankMap.set(c.id, idx + 1);
+    bm25RankMap.set(docKey(c.grain, c.id), idx + 1);
   });
 
   // Rank Dense
   const denseRankMap = new Map<string, number>();
   if (mode === 'hybrid') {
     const denseSorted = candidates
-      .filter((c) => denseScoresMap.has(c.id) && (denseScoresMap.get(c.id) ?? 0) > 0)
-      .sort((a, b) => (denseScoresMap.get(b.id) ?? 0) - (denseScoresMap.get(a.id) ?? 0));
+      .filter((c) => {
+        const key = docKey(c.grain, c.id);
+        return denseScoresMap.has(key) && (denseScoresMap.get(key) ?? 0) > 0;
+      })
+      .sort(
+        (a, b) =>
+          (denseScoresMap.get(docKey(b.grain, b.id)) ?? 0) -
+          (denseScoresMap.get(docKey(a.grain, a.id)) ?? 0)
+      );
     denseSorted.forEach((c, idx) => {
-      denseRankMap.set(c.id, idx + 1);
+      denseRankMap.set(docKey(c.grain, c.id), idx + 1);
     });
   }
 
   const k_rrf = 60;
   for (const c of candidates) {
+    const key = docKey(c.grain, c.id);
     if (mode === 'hybrid') {
-      const rankDense = denseRankMap.get(c.id);
-      const rankBm25 = bm25RankMap.get(c.id);
+      const rankDense = denseRankMap.get(key);
+      const rankBm25 = bm25RankMap.get(key);
       let rrf = 0;
       if (rankDense !== undefined) {
         rrf += 1 / (k_rrf + rankDense);
@@ -554,8 +638,8 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
       record: c.record,
     };
     if (c.grain === 'summary') {
-      item.claims = c.record.claims;
-      item.sources = c.record.sources;
+      item.claims = c.claims;
+      item.sources = c.sources;
     }
     return item;
   });

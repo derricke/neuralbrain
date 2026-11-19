@@ -24,6 +24,7 @@
 import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
 import { resolveScope } from '../lib/scope';
+import { transaction } from '../lib/sqlite';
 import { logTrajectory } from './trajectoryStore';
 import { endSession } from './sessionStore';
 
@@ -157,12 +158,16 @@ export function sweepIdleSessions(options?: SweepOptions): SweepResult {
         SELECT id, scope, project_id, agent, kind, tool_name, input, output,
                duration_ms, failed, created_at
         FROM (
-          SELECT id, scope, project_id, agent, kind, tool_name, input, output,
+          SELECT id, scope, project_id, agent, kind, tool_name,
+                 SUBSTR(input, 1, 1000) AS input,
+                 CASE WHEN failed = 1 THEN SUBSTR(output, 1, 1000) ELSE NULL END AS output,
                  duration_ms, failed, created_at
           FROM observations
           WHERE session_id = ?
           UNION ALL
-          SELECT original_observation_id AS id, scope, project_id, agent, kind, tool_name, input, output,
+          SELECT original_observation_id AS id, scope, project_id, agent, kind, tool_name,
+                 SUBSTR(input, 1, 1000) AS input,
+                 CASE WHEN failed = 1 THEN SUBSTR(output, 1, 1000) ELSE NULL END AS output,
                  duration_ms, failed, created_at
           FROM observations_archive
           WHERE session_id = ?
@@ -200,28 +205,41 @@ export function sweepIdleSessions(options?: SweepOptions): SweepResult {
     const durationMs = rows.reduce((sum, r) => sum + (r.duration_ms || 0), 0);
     const toolCalls = rows.filter((r) => r.kind === 'tool_call').length;
 
-    let trajectoryId: string;
+    let trajectoryId: string | null = null;
     try {
-      trajectoryId = logTrajectory({
-        scope: scoped.scope,
-        projectId: scoped.projectId,
-        sessionId: candidate.session_id,
-        agent: modeOf(rows.map((r) => r.agent)) ?? null,
-        // taskType is not derivable from observations, and guessing one would
-        // pollute the failure-pattern grouping key.
-        taskType: 'unknown',
-        rollupSource: 'swept',
-        observationIds: rows.map((r) => r.id),
-        preFetchedObservations: rows,
-        toolCalls,
-        durationMs,
-        // success is deliberately omitted: trajectoryStore derives it from the
-        // cited rows under the 'swept' contract, which yields NULL (unknown)
-        // unless a source row recorded a failure or a completion.
-        // The attempt happened when its observations happened, not when the
-        // sweeper noticed, so retention sees it in the right place in time.
-        createdAt: rows[rows.length - 1].created_at,
-      });
+      trajectoryId = transaction(db, () => {
+        const alreadyExists = db
+          .prepare(
+            `SELECT 1 FROM trajectories WHERE session_id = ?
+             UNION ALL
+             SELECT 1 FROM trajectory_archive WHERE session_id = ?
+             LIMIT 1`
+          )
+          .get(candidate.session_id, candidate.session_id);
+        if (alreadyExists) {
+          return null;
+        }
+        return logTrajectory({
+          scope: scoped.scope,
+          projectId: scoped.projectId,
+          sessionId: candidate.session_id,
+          agent: modeOf(rows.map((r) => r.agent)) ?? null,
+          // taskType is not derivable from observations, and guessing one would
+          // pollute the failure-pattern grouping key.
+          taskType: 'unknown',
+          rollupSource: 'swept',
+          observationIds: rows.map((r) => r.id),
+          preFetchedObservations: rows,
+          toolCalls,
+          durationMs,
+          // success is deliberately omitted: trajectoryStore derives it from the
+          // cited rows under the 'swept' contract, which yields NULL (unknown)
+          // unless a source row recorded a failure or a completion.
+          // The attempt happened when its observations happened, not when the
+          // sweeper noticed, so retention sees it in the right place in time.
+          createdAt: rows[rows.length - 1].created_at,
+        });
+      })();
     } catch (err) {
       logger.error(
         {
@@ -230,6 +248,11 @@ export function sweepIdleSessions(options?: SweepOptions): SweepResult {
         },
         'rollup sweep: failed to roll up session'
       );
+      skipped++;
+      continue;
+    }
+
+    if (!trajectoryId) {
       skipped++;
       continue;
     }

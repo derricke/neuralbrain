@@ -978,4 +978,89 @@ describe('Multi-Agent Installer (installAgent)', () => {
       `node "${path.join(spacedHome, '.neuralbrain', 'hooks', 'sessionStart.js')}"`
     );
   });
+
+  test('installRuntimeHooks creates self-contained hooks/lib with redactSecrets, tls, and dotenv/pino shims', () => {
+    const isolatedHome = path.join(tmpBase, 'isolated-hooks-home');
+    fs.mkdirSync(isolatedHome, { recursive: true });
+
+    installAgentIntegration({
+      homeDir: isolatedHome,
+      brainRepoDir: path.resolve(__dirname, '../../..'),
+      targets: ['claude'],
+      enableHooks: true,
+    });
+
+    const hooksLibDir = path.join(isolatedHome, '.neuralbrain', 'hooks', 'lib');
+    expect(fs.existsSync(path.join(hooksLibDir, 'redactSecrets.js'))).toBe(true);
+    expect(fs.existsSync(path.join(hooksLibDir, 'tls.js'))).toBe(true);
+    expect(fs.existsSync(path.join(hooksLibDir, 'node_modules', 'dotenv', 'index.js'))).toBe(true);
+    expect(fs.existsSync(path.join(hooksLibDir, 'node_modules', 'pino', 'index.js'))).toBe(true);
+
+    // Verify brainHome.js and logger.js resolve their shims from hooks/lib without repo node_modules
+    const { execFileSync } = require('child_process');
+    const out = execFileSync(
+      process.execPath,
+      [
+        '-e',
+        [
+          `const bh = require(${JSON.stringify(path.join(hooksLibDir, 'brainHome.js'))});`,
+          `const lg = require(${JSON.stringify(path.join(hooksLibDir, 'logger.js'))});`,
+          `const rs = require(${JSON.stringify(path.join(hooksLibDir, 'redactSecrets.js'))});`,
+          `const tl = require(${JSON.stringify(path.join(hooksLibDir, 'tls.js'))});`,
+          `if (typeof bh.getBrainHomeDir !== 'function') process.exit(1);`,
+          `if (typeof lg.logger.warn !== 'function') process.exit(2);`,
+          `if (typeof rs.redactSecrets !== 'function') process.exit(3);`,
+          `if (typeof tl.createLocalTlsFetch !== 'function') process.exit(4);`,
+          `process.stdout.write('ok');`,
+        ].join(' '),
+      ],
+      { encoding: 'utf8', env: { ...process.env, NODE_PATH: '' } }
+    );
+    expect(out).toBe('ok');
+  });
+
+  test('omits BRAIN_API_KEY from project-level .mcp.json and .cursor/mcp.json and writes sensitive configs with 0600', () => {
+    const secHome = path.join(tmpBase, 'sec-home');
+    const secProject = path.join(tmpBase, 'sec-project');
+    fs.mkdirSync(secHome, { recursive: true });
+    fs.mkdirSync(secProject, { recursive: true });
+
+    installAgentIntegration({
+      homeDir: secHome,
+      projectDir: secProject,
+      brainRepoDir: mockBrainDir,
+      targets: ['antigravity', 'claude', 'cursor', 'project'],
+      apiKey: 'super-secret-key',
+      apiUrl: 'http://127.0.0.1:3737',
+    });
+
+    const projectMcp = JSON.parse(fs.readFileSync(path.join(secProject, '.mcp.json'), 'utf8'));
+    expect(projectMcp.mcpServers.neuralbrain.env.BRAIN_API_KEY).toBeUndefined();
+
+    const projectCursorMcp = JSON.parse(
+      fs.readFileSync(path.join(secProject, '.cursor', 'mcp.json'), 'utf8')
+    );
+    expect(projectCursorMcp.mcpServers.neuralbrain.env.BRAIN_API_KEY).toBeUndefined();
+
+    if (process.platform !== 'win32') {
+      const sensitiveFiles = [
+        path.join(secHome, '.gemini', 'config', 'plugins', 'neuralbrain', 'mcp_config.json'),
+        path.join(secHome, '.claude.json'),
+        path.join(secHome, '.cursor', 'mcp.json'),
+        path.join(secProject, '.mcp.json'),
+        path.join(secProject, '.cursor', 'mcp.json'),
+      ];
+      for (const fp of sensitiveFiles) {
+        expect(fs.statSync(fp).mode & 0o777).toBe(0o600);
+      }
+    }
+  });
+
+  test('parseCliArgs throws when value-expecting flags are missing values', () => {
+    expect(() => parseCliArgs(['--project-dir'])).toThrow(/Missing value for --project-dir/);
+    expect(() => parseCliArgs(['--project-id', '--global'])).toThrow(/Missing value for --project-id/);
+    expect(() => parseCliArgs(['--api-key'])).toThrow(/Missing value for --api-key/);
+    expect(() => parseCliArgs(['--api-url'])).toThrow(/Missing value for --api-url/);
+    expect(() => parseCliArgs(['--target'])).toThrow(/Missing value for --target/);
+  });
 });

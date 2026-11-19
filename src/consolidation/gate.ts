@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
+import { redactSecrets } from '../lib/redactSecrets';
 import { recordDeadLetter, type DeadLetterReason } from '../memory/deadLetterStore';
 import { enqueueForEmbedding } from '../memory/embedQueueStore';
 import type { ObservationRecord } from '../memory/observationStore';
@@ -144,6 +145,9 @@ export function verifyAndStoreSummary(
         error: err instanceof Error ? err.message : String(err),
       });
     }
+    if (!parsedPayload || typeof parsedPayload !== 'object' || Array.isArray(parsedPayload)) {
+      return reject('schema_invalid', 'Parsed response must be a JSON object');
+    }
   }
 
   // 4. schema_invalid
@@ -154,7 +158,8 @@ export function verifyAndStoreSummary(
     }
   }
 
-  const claims = parsedPayload.claims ?? submission.claims;
+  // Validate strictly against parsedPayload when raw_response is provided (no fallback to submission.*)
+  const claims = parsedPayload.claims;
   if (!Array.isArray(claims)) {
     return reject('schema_invalid', 'Submission must contain a claims array');
   }
@@ -175,163 +180,194 @@ export function verifyAndStoreSummary(
     }
   }
 
-  const filesTouched = parsedPayload.files_touched ?? submission.files_touched;
+  const filesTouched = parsedPayload.files_touched;
   if (filesTouched !== undefined && !Array.isArray(filesTouched)) {
     return reject('schema_invalid', 'files_touched must be an array of strings if provided');
   }
 
-  const errorVerbatim = parsedPayload.error_verbatim ?? submission.error_verbatim;
-  if (errorVerbatim !== undefined && errorVerbatim !== null && typeof errorVerbatim !== 'string') {
+  const rawErrorVerbatim = parsedPayload.error_verbatim;
+  if (rawErrorVerbatim !== undefined && rawErrorVerbatim !== null && typeof rawErrorVerbatim !== 'string') {
     return reject('schema_invalid', 'error_verbatim must be a string or null');
   }
+  const errorVerbatim =
+    typeof rawErrorVerbatim === 'string' ? redactSecrets(rawErrorVerbatim) : rawErrorVerbatim;
 
-  // 5. Verify lease
+  // 5. Verify lease & store inside a single transaction to prevent TOCTOU races
   const leaseId = submission.lease_id?.trim();
   if (!leaseId) {
     return reject('schema_invalid', 'lease_id is required');
   }
 
-  const now = Math.floor(Date.now() / 1000);
-  const lease = db
-    .prepare('SELECT * FROM consolidation_leases WHERE lease_id = ?')
-    .get(leaseId) as
-    | {
-        lease_id: string;
-        kind: string;
-        scope: string;
-        project_id: string | null;
-        session_id: string;
-        observation_ids: string;
-        expires_at: number;
-        completed_at: number | null;
-      }
-    | undefined;
-
-  if (!lease) {
-    return reject('schema_invalid', `Lease '${leaseId}' not found`);
-  }
-
-  if (lease.completed_at !== null) {
-    return reject('schema_invalid', `Lease '${leaseId}' has already been completed`);
-  }
-
-  if (lease.expires_at < now) {
-    return reject('schema_invalid', `Lease '${leaseId}' has expired`);
-  }
-
-  let leaseObsIds: string[] = [];
   try {
-    leaseObsIds = JSON.parse(lease.observation_ids);
-  } catch {
-    return reject('schema_invalid', `Lease '${leaseId}' has invalid observation_ids`);
-  }
-  const validObsIdSet = new Set(leaseObsIds);
+    return transaction(db, (): GateVerificationResult => {
+      const now = Math.floor(Date.now() / 1000);
+      const lease = db
+        .prepare('SELECT * FROM consolidation_leases WHERE lease_id = ?')
+        .get(leaseId) as
+        | {
+            lease_id: string;
+            kind: string;
+            scope: string;
+            project_id: string | null;
+            session_id: string;
+            observation_ids: string;
+            expires_at: number;
+            completed_at: number | null;
+          }
+        | undefined;
 
-  // Load source observations
-  const placeholders = leaseObsIds.map(() => '?').join(',');
-  const sourceObservations = (
-    placeholders
-      ? db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders})`).all(...leaseObsIds)
-      : []
-  ) as ObservationRecord[];
-
-  // 6. citation_unresolved
-  for (const claim of claims) {
-    if (!claim.source_ids || claim.source_ids.length === 0) {
-      return reject('citation_unresolved', `Claim '${claim.text}' has no source_ids citations`);
-    }
-    for (const srcId of claim.source_ids) {
-      if (!validObsIdSet.has(srcId)) {
-        return reject(
-          'citation_unresolved',
-          `Citation id '${srcId}' in claim '${claim.text}' does not resolve to an observation in lease '${leaseId}'`
-        );
+      if (!lease) {
+        return reject('schema_invalid', `Lease '${leaseId}' not found`);
       }
-    }
-  }
 
-  // 7. not_verbatim on error_verbatim
-  if (errorVerbatim && typeof errorVerbatim === 'string' && errorVerbatim.trim() !== '') {
-    const errorStr = errorVerbatim.trim();
-    const appearsInLog = sourceObservations.some((obs) => {
-      const inInput = obs.input ? obs.input.includes(errorStr) : false;
-      const inOutput = obs.output ? obs.output.includes(errorStr) : false;
-      return inInput || inOutput;
-    });
-
-    if (!appearsInLog) {
-      return reject(
-        'not_verbatim',
-        `error_verbatim string does not appear verbatim in any source observation input/output`
-      );
-    }
-  }
-
-  // 8. not_verbatim on files_touched
-  if (Array.isArray(filesTouched) && filesTouched.length > 0) {
-    // files_touched means a path that appeared as a tool call's TARGET file_path.
-    // A path merely mentioned in command output does NOT count.
-    const targetPaths = new Set<string>();
-    for (const obs of sourceObservations) {
-      if (obs.file_path && obs.file_path.trim() !== '') {
-        targetPaths.add(obs.file_path.trim());
+      if (lease.completed_at !== null) {
+        return reject('schema_invalid', `Lease '${leaseId}' has already been completed`);
       }
-    }
 
-    for (const path of filesTouched) {
-      const cleanPath = String(path).trim();
-      if (!targetPaths.has(cleanPath)) {
-        return reject(
-          'not_verbatim',
-          `Path '${cleanPath}' in files_touched did not appear as a tool call target file_path`
-        );
+      if (lease.expires_at <= now) {
+        return reject('schema_invalid', `Lease '${leaseId}' has expired`);
       }
-    }
-  }
 
-  // 9. Check quotes in claim texts
-  for (const claim of claims) {
-    const quotes = claim.text.match(/"([^"]+)"/g);
-    if (quotes) {
-      for (const q of quotes) {
-        const quoteContent = q.slice(1, -1);
-        if (quoteContent.length > 5) {
-          const found = sourceObservations.some((obs) => {
-            const inInput = obs.input ? obs.input.includes(quoteContent) : false;
-            const inOutput = obs.output ? obs.output.includes(quoteContent) : false;
-            const inFile = obs.file_path ? obs.file_path.includes(quoteContent) : false;
-            return inInput || inOutput || inFile;
-          });
-          if (!found) {
+      let leaseObsIds: string[] = [];
+      try {
+        leaseObsIds = JSON.parse(lease.observation_ids);
+      } catch {
+        return reject('schema_invalid', `Lease '${leaseId}' has invalid observation_ids`);
+      }
+      const validObsIdSet = new Set(leaseObsIds);
+
+      // Load source observations in chunks (checking observations_archive if needed)
+      const sourceObservations: ObservationRecord[] = [];
+      const foundIds = new Set<string>();
+      const CHUNK_SIZE = 500;
+
+      for (let i = 0; i < leaseObsIds.length; i += CHUNK_SIZE) {
+        const chunk = leaseObsIds.slice(i, i + CHUNK_SIZE);
+        const placeholders = chunk.map(() => '?').join(',');
+        const rows = db
+          .prepare(`SELECT * FROM observations WHERE id IN (${placeholders})`)
+          .all(...chunk) as ObservationRecord[];
+        for (const r of rows) {
+          sourceObservations.push(r);
+          foundIds.add(r.id);
+        }
+      }
+
+      const missingIds = leaseObsIds.filter((id) => !foundIds.has(id));
+      if (missingIds.length > 0) {
+        for (let i = 0; i < missingIds.length; i += CHUNK_SIZE) {
+          const chunk = missingIds.slice(i, i + CHUNK_SIZE);
+          const placeholders = chunk.map(() => '?').join(',');
+          const archivedRows = db
+            .prepare(`
+              SELECT original_observation_id AS id, scope, project_id, note_ref, task_ref,
+                     session_id, agent, kind, tool_name, file_path, input, output,
+                     duration_ms, failed, created_at, archived_at
+              FROM observations_archive
+              WHERE original_observation_id IN (${placeholders})
+            `)
+            .all(...chunk) as ObservationRecord[];
+          for (const r of archivedRows) {
+            sourceObservations.push(r);
+          }
+        }
+      }
+
+      // 6. citation_unresolved
+      for (const claim of claims) {
+        if (!claim.source_ids || claim.source_ids.length === 0) {
+          return reject('citation_unresolved', `Claim '${claim.text}' has no source_ids citations`);
+        }
+        for (const srcId of claim.source_ids) {
+          if (!validObsIdSet.has(srcId)) {
             return reject(
-              'not_verbatim',
-              `Quoted string '${quoteContent}' in claim does not appear in source observations`
+              'citation_unresolved',
+              `Citation id '${srcId}' in claim '${claim.text}' does not resolve to an observation in lease '${leaseId}'`
             );
           }
         }
       }
-    }
-  }
 
-  // PASSED: Compute outcome arithmetically
-  const outcome = computeArithmeticOutcome(sourceObservations);
+      // 7. not_verbatim on error_verbatim
+      if (errorVerbatim && typeof errorVerbatim === 'string' && errorVerbatim.trim() !== '') {
+        const errorStr = errorVerbatim.trim();
+        const appearsInLog = sourceObservations.some((obs) => {
+          const inInput = obs.input ? obs.input.includes(errorStr) : false;
+          const inOutput = obs.output ? obs.output.includes(errorStr) : false;
+          return inInput || inOutput;
+        });
 
-  const windowFrom =
-    sourceObservations.length > 0
-      ? Math.min(...sourceObservations.map((o) => o.created_at))
-      : now;
-  const windowTo =
-    sourceObservations.length > 0
-      ? Math.max(...sourceObservations.map((o) => o.created_at))
-      : now;
+        if (!appearsInLog) {
+          return reject(
+            'not_verbatim',
+            `error_verbatim string does not appear verbatim in any source observation input/output`
+          );
+        }
+      }
 
-  const summaryId = `sum_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
-  const producerTier = submission.producer_tier || 'agent';
-  const producerModel = submission.producer_model || null;
-  const promptVersion = submission.prompt_version || 'extract-v1';
+      // 8. not_verbatim on files_touched
+      if (Array.isArray(filesTouched) && filesTouched.length > 0) {
+        // files_touched means a path that appeared as a tool call's TARGET file_path.
+        // A path merely mentioned in command output does NOT count.
+        const targetPaths = new Set<string>();
+        for (const obs of sourceObservations) {
+          if (obs.file_path && obs.file_path.trim() !== '') {
+            targetPaths.add(obs.file_path.trim());
+          }
+        }
 
-  try {
-    transaction(db, () => {
+        for (const path of filesTouched) {
+          const cleanPath = String(path).trim();
+          if (!targetPaths.has(cleanPath)) {
+            return reject(
+              'not_verbatim',
+              `Path '${cleanPath}' in files_touched did not appear as a tool call target file_path`
+            );
+          }
+        }
+      }
+
+      // 9. Check quotes in claim texts
+      for (const claim of claims) {
+        const quotes = claim.text.match(/"([^"]+)"/g);
+        if (quotes) {
+          for (const q of quotes) {
+            const quoteContent = q.slice(1, -1);
+            if (quoteContent.length > 5) {
+              const found = sourceObservations.some((obs) => {
+                const inInput = obs.input ? obs.input.includes(quoteContent) : false;
+                const inOutput = obs.output ? obs.output.includes(quoteContent) : false;
+                const inFile = obs.file_path ? obs.file_path.includes(quoteContent) : false;
+                return inInput || inOutput || inFile;
+              });
+              if (!found) {
+                return reject(
+                  'not_verbatim',
+                  `Quoted string '${quoteContent}' in claim does not appear in source observations`
+                );
+              }
+            }
+          }
+        }
+      }
+
+      // PASSED: Compute outcome arithmetically
+      const outcome = computeArithmeticOutcome(sourceObservations);
+
+      const windowFrom =
+        sourceObservations.length > 0
+          ? Math.min(...sourceObservations.map((o) => o.created_at))
+          : now;
+      const windowTo =
+        sourceObservations.length > 0
+          ? Math.max(...sourceObservations.map((o) => o.created_at))
+          : now;
+
+      const summaryId = `sum_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+      const producerTier = submission.producer_tier || 'agent';
+      const producerModel = submission.producer_model || null;
+      const promptVersion = submission.prompt_version || 'extract-v1';
+
       db.prepare(`
         INSERT INTO summaries (
           id, scope, project_id, kind, window_from, window_to, outcome,
@@ -364,9 +400,10 @@ export function verifyAndStoreSummary(
       for (let i = 0; i < claims.length; i++) {
         const claim = claims[i];
         const claimId = `clm_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
-        claimStmt.run(claimId, summaryId, claim.text.trim(), i);
+        claimStmt.run(claimId, summaryId, redactSecrets(claim.text.trim()), i);
 
-        for (const srcId of claim.source_ids) {
+        const uniqueSourceIds = Array.from(new Set<string>(claim.source_ids));
+        for (const srcId of uniqueSourceIds) {
           sourceStmt.run(summaryId, claimId, srcId);
         }
       }
@@ -384,20 +421,20 @@ export function verifyAndStoreSummary(
 
       // Enqueue summary for embedding inside write transaction (Rule 2)
       enqueueForEmbedding(summaryId, 'summary');
+
+      logger.info(
+        { summaryId, outcome, claimsCount: claims.length, leaseId },
+        'summary successfully verified and stored'
+      );
+
+      return {
+        ok: true,
+        status: 201,
+        summary_id: summaryId,
+        outcome,
+        claims_count: claims.length,
+      };
     })();
-
-    logger.info(
-      { summaryId, outcome, claimsCount: claims.length, leaseId },
-      'summary successfully verified and stored'
-    );
-
-    return {
-      ok: true,
-      status: 201,
-      summary_id: summaryId,
-      outcome,
-      claims_count: claims.length,
-    };
   } catch (err) {
     logger.error(
       { leaseId, error: err instanceof Error ? err.message : String(err) },

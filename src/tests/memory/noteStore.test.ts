@@ -183,4 +183,52 @@ describe('noteStore', () => {
     expect(fetched?.scope).toBe('project');
     expect(fetched?.project_id).toBe('proj-repaired');
   });
+
+  it('omits embedding BLOBs from createNote, getNote, getNotesByFile, and listNotes', () => {
+    const db = getDb();
+    const note = createNote({
+      scope: 'project',
+      projectId: 'proj-embed',
+      type: 'fact',
+      title: 'Embed strip test',
+      content: 'Verify embedding column is never returned',
+      files: ['src/embed-test.ts'],
+    });
+    expect('embedding' in note).toBe(false);
+
+    db.prepare('UPDATE notes SET embedding = ? WHERE id = ?').run(
+      Buffer.from(new Float32Array([0.1, 0.2, 0.3, 0.4]).buffer),
+      note.id
+    );
+
+    const fetched = getNote(note.id);
+    expect(fetched).toBeDefined();
+    expect('embedding' in fetched!).toBe(false);
+
+    const byFile = getNotesByFile('src/embed-test.ts', 'proj-embed');
+    expect(byFile).toHaveLength(1);
+    expect('embedding' in byFile[0]).toBe(false);
+
+    const listed = listNotes({ projectId: 'proj-embed' });
+    expect(listed).toHaveLength(1);
+    expect('embedding' in listed[0]).toBe(false);
+  });
+
+  it('bounds getNotesByFile with limit parameter (default 50, max 200)', () => {
+    const filePath = 'src/bounded.ts';
+    for (let i = 0; i < 6; i++) {
+      createNote({
+        scope: 'project',
+        projectId: 'proj-bound',
+        type: 'fact',
+        title: `Bounded note ${i}`,
+        content: `Content ${i}`,
+        files: [filePath],
+      });
+    }
+
+    expect(getNotesByFile(filePath, 'proj-bound', 3)).toHaveLength(3);
+    expect(getNotesByFile(filePath, 'proj-bound', 0)).toHaveLength(1);
+    expect(getNotesByFile(filePath, 'proj-bound')).toHaveLength(6);
+  });
 });

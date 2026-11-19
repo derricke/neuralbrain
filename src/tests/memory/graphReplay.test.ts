@@ -197,6 +197,43 @@ describe('Phase 3+4: Knowledge Graph, Session Replay, and Dashboard Alignment', 
       expect(getKnowledgeGraph({ projectId: 'proj-limit', limit: 5 }).nodes).toHaveLength(5);
       expect(getKnowledgeGraph({ projectId: 'proj-limit', limit: 500 }).nodes).toHaveLength(200);
     });
+
+    it('resolves cites_source edges to observation nodes within budget', () => {
+      const db = getDb();
+      const cap = captureObservations([
+        {
+          id: 'obs-graph-cited',
+          scope: 'project',
+          project_id: 'proj-obs-graph',
+          kind: 'tool_call',
+          tool_name: 'run_command',
+          input: 'npm test',
+          output: 'ok',
+        },
+      ]);
+      expect(cap.accepted).toBe(1);
+
+      db.prepare(
+        `
+        INSERT INTO summaries (id, scope, project_id, kind, outcome, producer_tier, prompt_version, verified)
+        VALUES ('sum-obs-1', 'project', 'proj-obs-graph', 'session', 'success', 'agent', 'v1', 1)
+        `
+      ).run();
+      db.prepare(
+        `
+        INSERT INTO summary_sources (summary_id, claim_id, record_id, grain)
+        VALUES ('sum-obs-1', NULL, 'obs-graph-cited', 'observation')
+        `
+      ).run();
+
+      const graph = getKnowledgeGraph({ projectId: 'proj-obs-graph' });
+      expect(graph.nodes.some((n) => n.id === 'obs-graph-cited' && n.type === 'observation')).toBe(true);
+      expect(
+        graph.edges.some(
+          (e) => e.source === 'sum-obs-1' && e.target === 'obs-graph-cited' && e.type === 'cites_source'
+        )
+      ).toBe(true);
+    });
   });
 
   describe('sessionStore.getSessionReplay & GET /sessions/:id/replay', () => {

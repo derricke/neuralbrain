@@ -23,10 +23,15 @@ export interface NoteRecord {
   version: number;
   supersedes: string | null;
   is_latest: number;
-  embedding: Buffer | null;
   created_at: number;
   updated_at: number;
 }
+
+const NOTE_COLUMNS =
+  'id, scope, project_id, session_id, type, title, content, author, author_kind, version, supersedes, is_latest, created_at, updated_at';
+const NOTE_COLUMNS_ALIASED = NOTE_COLUMNS.split(', ')
+  .map((c) => `n.${c}`)
+  .join(', ');
 
 export interface NoteWithRelations extends NoteRecord {
   concepts: string[];
@@ -196,7 +201,6 @@ export function createNote(input: CreateNoteInput): NoteWithRelations {
       version,
       supersedes: supersedesId,
       is_latest: 1,
-      embedding: null,
       created_at: createdAt,
       updated_at: updatedAt,
       concepts,
@@ -209,7 +213,7 @@ export function createNote(input: CreateNoteInput): NoteWithRelations {
 
 export function getNote(id: string): NoteWithRelations | undefined {
   const db = getDb();
-  const note = db.prepare('SELECT * FROM notes WHERE id = ?').get(id) as NoteRecord | undefined;
+  const note = db.prepare(`SELECT ${NOTE_COLUMNS} FROM notes WHERE id = ?`).get(id) as NoteRecord | undefined;
   if (!note) return undefined;
 
   const conceptRows = db
@@ -271,12 +275,13 @@ function attachNoteRelations(notes: NoteRecord[], db: ReturnType<typeof getDb>):
   }));
 }
 
-export function getNotesByFile(filePath: string, projectId?: string): NoteWithRelations[] {
+export function getNotesByFile(filePath: string, projectId?: string, limit = 50): NoteWithRelations[] {
   const db = getDb();
   const cleanPath = filePath.trim();
+  const boundedLimit = Math.min(Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : 50), 200);
 
   let query = `
-    SELECT n.*
+    SELECT ${NOTE_COLUMNS_ALIASED}
     FROM notes n
     JOIN note_files nf ON n.id = nf.note_id
     WHERE nf.file_path = ? AND n.is_latest = 1
@@ -288,7 +293,8 @@ export function getNotesByFile(filePath: string, projectId?: string): NoteWithRe
     params.push(projectId.trim());
   }
 
-  query += ` ORDER BY n.updated_at DESC`;
+  query += ` ORDER BY n.updated_at DESC LIMIT ?`;
+  params.push(boundedLimit);
 
   const rows = db.prepare(query).all(...params) as NoteRecord[];
   return attachNoteRelations(rows, db);
@@ -352,7 +358,7 @@ export function listNotes(filters?: {
 
   const rows = db
     .prepare(`
-      SELECT n.*
+      SELECT ${NOTE_COLUMNS_ALIASED}
       FROM notes n
       ${whereClause}
       ORDER BY n.updated_at DESC

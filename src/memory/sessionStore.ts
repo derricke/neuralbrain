@@ -1,9 +1,17 @@
 import { randomUUID } from 'crypto';
 import { getDb } from '../lib/db';
+import { redactSecrets } from '../lib/redactSecrets';
 import { resolveScope, ScopeValue } from '../lib/scope';
 import type { ObservationRecord } from './observationStore';
 import type { NoteRecord } from './noteStore';
 import type { ActionRecord } from './actionStore';
+
+const NOTE_COLUMNS =
+  'id, scope, project_id, session_id, type, title, content, author, author_kind, version, supersedes, is_latest, created_at, updated_at';
+const DEFAULT_DETAIL_LIMIT = 200;
+const MAX_DETAIL_LIMIT = 500;
+const MAX_PREVIEW_CHARS = 2000;
+const TRUNCATED_SUFFIX = '... [truncated]';
 
 export type SessionStatus = 'active' | 'paused' | 'completed' | 'abandoned';
 
@@ -52,6 +60,11 @@ export interface SessionDetails {
   observations: ObservationRecord[];
   notes: NoteRecord[];
   actions: ActionRecord[];
+}
+
+export interface SessionQueryOptions {
+  limit?: number;
+  offset?: number;
 }
 
 export interface SessionReplayItem {
@@ -104,16 +117,33 @@ export function startSession(input: StartSessionInput = {}): SessionRecord {
     | undefined;
 
   if (existing) {
+    let nextScope = existing.scope;
+    let nextProjectId = existing.project_id;
+
+    if (existing.scope === 'unknown' && scoped.scope !== 'unknown') {
+      nextScope = scoped.scope;
+      nextProjectId = scoped.projectId;
+    } else if (
+      existing.scope !== 'unknown' &&
+      (scoped.scope !== existing.scope || scoped.projectId !== existing.project_id)
+    ) {
+      throw makeSchemaError(
+        `Session '${id}' already exists with scope '${existing.scope}'${existing.project_id ? ` (project '${existing.project_id}')` : ''}; cannot reactivate with scope '${scoped.scope}'${scoped.projectId ? ` (project '${scoped.projectId}')` : ''}`
+      );
+    }
+
     db.prepare(
       `
       UPDATE sessions
       SET status = 'active',
           ended_at = NULL,
+          scope = ?,
+          project_id = ?,
           agent_name = COALESCE(?, agent_name),
           cwd = COALESCE(?, cwd)
       WHERE id = ?
       `
-    ).run(agentName, cwd, id);
+    ).run(nextScope, nextProjectId, agentName, cwd, id);
 
     return getSession(id)!;
   }
@@ -210,7 +240,7 @@ export function endSession(
     : existing.files_touched_json;
 
   const providedSummary = optionalString(input.summary, 'summary');
-  const summary = providedSummary ?? buildArithmeticSessionSummary(db, id);
+  const summary = redactSecrets(providedSummary ?? buildArithmeticSessionSummary(db, id));
 
   const rawHandoff =
     input.handoffSummaryId !== undefined
@@ -282,22 +312,53 @@ export function listSessions(filters?: {
     .all(...params) as SessionRecord[];
 }
 
-export function getSessionDetails(id: string): SessionDetails | undefined {
+function clampDetailLimit(raw?: number): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) {
+    return DEFAULT_DETAIL_LIMIT;
+  }
+  return Math.min(Math.floor(raw), MAX_DETAIL_LIMIT);
+}
+
+function clampOffset(raw?: number): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) {
+    return 0;
+  }
+  return Math.floor(raw);
+}
+
+function truncatePreview(value: string | null): string | null {
+  if (value === null || value.length <= MAX_PREVIEW_CHARS) return value;
+  return value.slice(0, MAX_PREVIEW_CHARS) + TRUNCATED_SUFFIX;
+}
+
+export function getSessionDetails(
+  id: string,
+  options: SessionQueryOptions = {}
+): SessionDetails | undefined {
   const session = getSession(id);
   if (!session) return undefined;
 
+  const limit = clampDetailLimit(options.limit);
+  const offset = clampOffset(options.offset);
+
   const db = getDb();
-  const observations = db
-    .prepare('SELECT * FROM observations WHERE session_id = ? ORDER BY created_at ASC')
-    .all(id) as ObservationRecord[];
+  const rawObservations = db
+    .prepare('SELECT * FROM observations WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?')
+    .all(id, limit, offset) as ObservationRecord[];
+
+  const observations = rawObservations.map((obs) => ({
+    ...obs,
+    input: truncatePreview(obs.input),
+    output: truncatePreview(obs.output),
+  }));
 
   const notes = db
-    .prepare('SELECT * FROM notes WHERE session_id = ? ORDER BY created_at ASC')
-    .all(id) as NoteRecord[];
+    .prepare(`SELECT ${NOTE_COLUMNS} FROM notes WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?`)
+    .all(id, limit, offset) as NoteRecord[];
 
   const actions = db
-    .prepare('SELECT * FROM actions WHERE session_id = ? ORDER BY created_at ASC')
-    .all(id) as ActionRecord[];
+    .prepare('SELECT * FROM actions WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?')
+    .all(id, limit, offset) as ActionRecord[];
 
   return { session, observations, notes, actions };
 }
@@ -317,8 +378,11 @@ function toIsoTimestamp(ts: number | string): string {
  * Build a chronological replay timeline of observations, notes, and actions
  * associated with a session.
  */
-export function getSessionReplay(id: string): SessionReplay | undefined {
-  const details = getSessionDetails(id);
+export function getSessionReplay(
+  id: string,
+  options: SessionQueryOptions = {}
+): SessionReplay | undefined {
+  const details = getSessionDetails(id, options);
   if (!details) return undefined;
 
   const timeline: SessionReplayItem[] = [

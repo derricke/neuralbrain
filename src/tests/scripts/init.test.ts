@@ -42,6 +42,7 @@ describe('neuralbrain init', () => {
   test('rejects an invalid explicit id instead of silently using the folder name', () => {
     const dir = mk('Projects', 'whatever');
     expect(() => runInit({ cwd: dir, projectId: '///' })).toThrow(/not a valid project id/);
+    expect(() => runInit({ cwd: dir, projectId: 'foo/bar' })).toThrow(/not a valid project id/);
     expect(fs.existsSync(path.join(dir, '.brainrc'))).toBe(false);
   });
 
@@ -92,5 +93,16 @@ describe('neuralbrain stop only touches Docker in modes that started it', () => 
     [null, false],
   ])('%s -> %s', (mode, expected) => {
     expect(modeUsesCompose(mode)).toBe(expected);
+  });
+});
+
+describe('parseInstallArgs validates value-expecting flags', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { parseInstallArgs } = require('../../cli');
+  test('throws when --mode or --port is missing a value', () => {
+    expect(() => parseInstallArgs(['--mode'])).toThrow(/Missing value for --mode/);
+    expect(() => parseInstallArgs(['--mode', '--yes'])).toThrow(/Missing value for --mode/);
+    expect(() => parseInstallArgs(['--port'])).toThrow(/Missing value for --port/);
+    expect(() => parseInstallArgs(['--port', '--https'])).toThrow(/Missing value for --port/);
   });
 });

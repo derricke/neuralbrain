@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { Router, Request, Response, NextFunction } from 'express';
 import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
@@ -125,12 +126,25 @@ dashboardRouter.post('/api/session', (req: Request, res: Response) => {
 
   const hashedKey = hashApiKey(rawKey);
   const db = getDb();
-  const keyRecord = db
+  const activeKeys = db
     .prepare(
-      `SELECT id, name, key FROM api_keys 
-       WHERE (key = ? OR key = ?) AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > datetime('now'))`
+      `SELECT id, name, key FROM api_keys
+       WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > datetime('now'))`
     )
-    .get(hashedKey, rawKey) as { id: string; name: string; key: string } | undefined;
+    .all() as Array<{ id: string; name: string; key: string }>;
+
+  const hashedBuf = Buffer.from(hashedKey, 'utf8');
+  const rawBuf = Buffer.from(rawKey, 'utf8');
+  const keyRecord = activeKeys.find((rec) => {
+    const candidateBuf = Buffer.from(rec.key, 'utf8');
+    if (candidateBuf.length === hashedBuf.length && crypto.timingSafeEqual(candidateBuf, hashedBuf)) {
+      return true;
+    }
+    if (candidateBuf.length === rawBuf.length && crypto.timingSafeEqual(candidateBuf, rawBuf)) {
+      return true;
+    }
+    return false;
+  });
 
   if (!keyRecord) {
     res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired API key' } });
@@ -348,7 +362,9 @@ dashboardRouter.get('/api/stats', async (_req: Request, res: Response, next: Nex
 
     // 9. Extractive Summaries with claims and sources (batched to eliminate N+1 queries)
     const rawSummaries = db
-      .prepare('SELECT * FROM summaries ORDER BY created_at DESC LIMIT 15')
+      .prepare(
+        'SELECT id, scope, project_id, kind, window_from, window_to, outcome, producer_tier, producer_model, prompt_version, verified, version, supersedes, is_latest, sources_expired, created_at FROM summaries ORDER BY created_at DESC LIMIT 15'
+      )
       .all() as any[];
 
     let summaries: any[] = [];

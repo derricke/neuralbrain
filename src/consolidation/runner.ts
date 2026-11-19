@@ -71,6 +71,29 @@ export function releaseLease(leaseId: string): void {
   ).run(leaseId);
 }
 
+/**
+ * Extends a rejected lease's expiration with exponential backoff based on prior
+ * uncompleted leases for the session, preventing a tight re-lease/dead-letter loop
+ * on deterministic gate rejections.
+ */
+export function backoffLease(leaseId: string, sessionId: string): void {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS attempts
+         FROM consolidation_leases
+        WHERE session_id = ? AND completed_at IS NULL`
+    )
+    .get(sessionId) as { attempts: number } | undefined;
+  const attempts = Math.max(row?.attempts ?? 1, 1);
+  const backoffSec = Math.min(86400, 300 * Math.pow(2, Math.min(attempts - 1, 8)));
+  db.prepare(
+    `UPDATE consolidation_leases
+        SET expires_at = MAX(expires_at, unixepoch() + ?)
+      WHERE lease_id = ? AND completed_at IS NULL`
+  ).run(backoffSec, leaseId);
+}
+
 export interface ConsolidationRunReport {
   status: 'ok' | 'disabled' | 'agent' | 'unavailable' | 'misconfigured';
   tier: GenerativeTier | null;
@@ -202,8 +225,9 @@ export async function runConsolidation(params?: {
         producer_tier: completion.producer_tier,
         producer_model: completion.producer_model,
       });
-      // The lease goes back so a better producer can retry the same session.
-      releaseLease(candidate.lease_id);
+      // Back off the lease instead of releasing it immediately so a deterministic
+      // gate rejection does not cause a tight re-lease/dead-letter loop.
+      backoffLease(candidate.lease_id, candidate.session_id);
     }
   }
 

@@ -537,4 +537,114 @@ describe('Phase 1+2: Sessions, Next Actions, Provenance, and Lesson Notes', () =
       expect(injectRes.body.notes.some((n: any) => n.type === 'lesson')).toBe(false);
     });
   });
+
+  describe('scope upgrade/mismatch, secret redaction, and bounded session details', () => {
+    it('upgrades unknown session scope on reactivation and rejects mismatched non-unknown scope', () => {
+      const unknownSess = startSession({
+        id: 'sess-upgrade',
+        scope: 'unknown',
+      });
+      expect(unknownSess.scope).toBe('unknown');
+
+      const upgraded = startSession({
+        id: 'sess-upgrade',
+        scope: 'project',
+        project_id: 'proj-upgraded',
+      });
+      expect(upgraded.scope).toBe('project');
+      expect(upgraded.project_id).toBe('proj-upgraded');
+
+      expect(() =>
+        startSession({
+          id: 'sess-upgrade',
+          scope: 'project',
+          project_id: 'proj-other',
+        })
+      ).toThrow(/conflicts|already exists/i);
+
+      expect(() =>
+        startSession({
+          id: 'sess-upgrade',
+          scope: 'global',
+        })
+      ).toThrow(/conflicts|already exists/i);
+    });
+
+    it('redacts secrets in endSession summary and actionStore createAction/updateAction', () => {
+      const secret = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456';
+      startSession({ id: 'sess-redact', scope: 'global' });
+      const ended = endSession('sess-redact', {
+        summary: `Completed with key ${secret}`,
+      });
+      expect(ended?.summary).not.toContain(secret);
+      expect(ended?.summary).toContain('[REDACTED_API_KEY]');
+
+      const act = createAction({
+        scope: 'global',
+        title: `Rotate ${secret}`,
+        description: 'Use ghp_abcdefghijklmnopqrstuvwxyz123456',
+        blocked_reason: 'Waiting on Bearer abcdefghijklmnopqrstuvwxyz123456',
+      });
+      expect(act.title).toContain('[REDACTED_API_KEY]');
+      expect(act.description).toContain('[REDACTED_TOKEN]');
+      expect(act.blocked_reason).toContain('Bearer [REDACTED_TOKEN]');
+
+      const updated = updateAction(act.id, {
+        title: `Updated ${secret}`,
+        description: `Desc ${secret}`,
+        blocked_reason: `Blocked ${secret}`,
+      });
+      expect(updated?.title).not.toContain(secret);
+      expect(updated?.description).not.toContain(secret);
+      expect(updated?.blocked_reason).not.toContain(secret);
+    });
+
+    it('bounds getSessionDetails, omits note embeddings, and truncates oversized obs previews', () => {
+      const db = getDb();
+      startSession({ id: 'sess-bound', scope: 'project', project_id: 'proj-bound' });
+
+      const bigText = 'x'.repeat(2500);
+      captureObservations([
+        {
+          scope: 'project',
+          project_id: 'proj-bound',
+          session_id: 'sess-bound',
+          kind: 'tool_call',
+          tool_name: 'read_file',
+          input: bigText,
+          output: bigText,
+        },
+        {
+          scope: 'project',
+          project_id: 'proj-bound',
+          session_id: 'sess-bound',
+          kind: 'tool_call',
+          tool_name: 'run_command',
+          input: 'small',
+          output: 'small',
+        },
+      ]);
+
+      const note = createNote({
+        scope: 'project',
+        projectId: 'proj-bound',
+        sessionId: 'sess-bound',
+        type: 'fact',
+        title: 'Session note',
+        content: 'Body',
+      });
+      db.prepare('UPDATE notes SET embedding = ? WHERE id = ?').run(
+        Buffer.from(new Float32Array([1, 2, 3, 4]).buffer),
+        note.id
+      );
+
+      const limited = getSessionDetails('sess-bound', { limit: 1, offset: 0 });
+      expect(limited?.observations).toHaveLength(1);
+      expect(limited?.observations[0].input).toHaveLength(2000 + '... [truncated]'.length);
+      expect(limited?.observations[0].input?.endsWith('... [truncated]')).toBe(true);
+      expect(limited?.observations[0].output?.endsWith('... [truncated]')).toBe(true);
+      expect(limited?.notes).toHaveLength(1);
+      expect('embedding' in limited!.notes[0]).toBe(false);
+    });
+  });
 });

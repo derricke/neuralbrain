@@ -16,7 +16,7 @@ import {
   getDefaultSpoolDir,
   loadBrainEnv,
 } from './lib/brainHome';
-import { ensureLocalTlsCerts, getDefaultCertsDir } from './lib/tls';
+import { createLocalTlsFetch, ensureLocalTlsCerts, getDefaultCertsDir } from './lib/tls';
 import { resolveCanonicalProjectId, writeBrainRc } from './lib/projectSlug';
 import { normalizeProjectId } from './lib/scope';
 import {
@@ -210,6 +210,9 @@ export function parseInstallArgs(argv: string[]): InstallCliOptions {
       opts.yes = true;
     } else if (arg === '--mode') {
       const val = argv[++i];
+      if (!val || val.startsWith('--')) {
+        throw new Error('Missing value for --mode. Expected: docker | qdrant-docker | local-only');
+      }
       if (val === 'docker' || val === 'qdrant-docker' || val === 'local-only') {
         opts.mode = val;
       } else {
@@ -224,7 +227,11 @@ export function parseInstallArgs(argv: string[]): InstallCliOptions {
     } else if (arg === '--agents') {
       opts.agents = true;
     } else if (arg === '--port') {
-      const p = parseInt(argv[++i], 10);
+      const rawPort = argv[++i];
+      if (!rawPort || rawPort.startsWith('--')) {
+        throw new Error('Missing value for --port');
+      }
+      const p = parseInt(rawPort, 10);
       if (Number.isNaN(p) || p <= 0) {
         throw new Error(`Invalid --port value`);
       }
@@ -286,7 +293,12 @@ function startHostDaemon(packageRoot: string, envPath: string): number {
   }
 
   const logPath = getLogFilePath();
-  const out = fs.openSync(logPath, 'a');
+  const out = fs.openSync(logPath, 'a', 0o600);
+  try {
+    fs.chmodSync(logPath, 0o600);
+  } catch {
+    // ignore chmod errors on unsupported platforms
+  }
   const entryJs = path.join(packageRoot, 'dist', 'index.js');
 
   const parsedEnv = dotenv.parse(fs.readFileSync(envPath, 'utf8'));
@@ -295,15 +307,15 @@ function startHostDaemon(packageRoot: string, envPath: string): number {
     detached: true,
     stdio: ['ignore', out, out],
     env: {
-      ...process.env,
       ...parsedEnv,
-      NODE_ENV: process.env.NODE_ENV || 'production',
+      ...process.env,
+      NODE_ENV: process.env.NODE_ENV || parsedEnv.NODE_ENV || 'production',
     },
   });
 
   child.unref();
   if (child.pid) {
-    fs.writeFileSync(pidFile, `${child.pid}\n`, 'utf8');
+    fs.writeFileSync(pidFile, `${child.pid}\n`, { encoding: 'utf8', mode: 0o600 });
   }
   return child.pid ?? 0;
 }
@@ -313,17 +325,21 @@ function stopHostDaemon(): boolean {
   if (!fs.existsSync(pidFile)) return false;
 
   const pid = parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
-  fs.rmSync(pidFile, { force: true });
-
-  if (!Number.isNaN(pid) && isPidAlive(pid)) {
-    try {
-      process.kill(pid, 'SIGTERM');
-      return true;
-    } catch {
-      return false;
-    }
+  if (Number.isNaN(pid) || pid <= 0) {
+    fs.rmSync(pidFile, { force: true });
+    return false;
   }
-  return false;
+
+  try {
+    process.kill(pid, 'SIGTERM');
+    fs.rmSync(pidFile, { force: true });
+    return true;
+  } catch (err: any) {
+    if (err?.code === 'ESRCH') {
+      fs.rmSync(pidFile, { force: true });
+    }
+    return false;
+  }
 }
 
 function isHttpsEnabled(): boolean {
@@ -928,12 +944,7 @@ export function runInit(options: { cwd: string; projectId?: string; force?: bool
 
   let explicit: string | undefined;
   if (options.projectId !== undefined) {
-    const sanitized = options.projectId
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, '-')
-      .replace(/^-+|-+$/g, '');
-    const norm = normalizeProjectId(sanitized);
+    const norm = normalizeProjectId(options.projectId);
     if (!norm.ok) {
       throw new Error(`'${options.projectId}' is not a valid project id: ${norm.error}`);
     }
@@ -1074,7 +1085,8 @@ async function main(): Promise<void> {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
-    const res = await fetch(`${apiUrl}/maintenance/rename-project`, {
+    const tlsFetch = createLocalTlsFetch();
+    const res = await tlsFetch(`${apiUrl}/maintenance/rename-project`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ from_project_id: fromId, to_project_id: toId }),

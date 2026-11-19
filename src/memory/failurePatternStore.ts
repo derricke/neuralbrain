@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
+import { redactSecrets } from '../lib/redactSecrets';
 import { resolveScope } from '../lib/scope';
 import { transaction } from '../lib/sqlite';
 
@@ -12,7 +13,7 @@ export type FailureScope = 'project' | 'global' | 'unknown';
  */
 export function sanitizeErrorText(raw: unknown): string {
   if (raw === null || raw === undefined) return 'Unknown error';
-  let text = String(raw);
+  let text = redactSecrets(String(raw));
 
   // 1. Normalize line breaks and tabs to single spaces
   text = text.replace(/[\r\n\t]+/g, ' ');

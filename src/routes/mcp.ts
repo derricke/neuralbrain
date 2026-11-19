@@ -16,7 +16,7 @@ export const mcpRouter = Router();
 
 function jsonText(data: unknown, isError = false) {
   return {
-    content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+    content: [{ type: 'text' as const, text: JSON.stringify(data) }],
     ...(isError ? { isError: true } : {}),
   };
 }
@@ -35,27 +35,37 @@ function errorResult(err: unknown) {
   );
 }
 
-function assertScopeAndProject(
+function clampLimit(raw: number | undefined, defaultLimit: number, maxLimit = 200): number {
+  if (raw === undefined || !Number.isFinite(raw)) return defaultLimit;
+  return Math.max(1, Math.min(Math.trunc(raw), maxLimit));
+}
+
+function validateScopeAndProject(
   scope: string | undefined,
   projectId: string | undefined,
   defaultProjectId: string | undefined
-): string | undefined {
+): { effectiveProjectId?: string; error?: { code: string; message: string } } {
   if (!scope || (scope !== 'project' && scope !== 'global' && scope !== 'unknown')) {
-    const err = new Error("SCOPE_REQUIRED: Scope is required and must be 'project', 'global', or 'unknown'");
-    (err as any).code = 'SCOPE_REQUIRED';
-    throw err;
+    return {
+      error: {
+        code: 'SCOPE_REQUIRED',
+        message: "SCOPE_REQUIRED: Scope is required and must be 'project', 'global', or 'unknown'",
+      },
+    };
   }
 
   const effectiveProjectId = projectId || (scope === 'project' ? defaultProjectId : undefined);
   if (scope === 'project' && !effectiveProjectId) {
-    const err = new Error(
-      "SCHEMA_INVALID: project_id is required when scope is 'project' (use the project root folder name, e.g. 'neuralbrain' — from .brainrc or the git repo root, not a subfolder or filesystem path)"
-    );
-    (err as any).code = 'SCHEMA_INVALID';
-    throw err;
+    return {
+      error: {
+        code: 'SCHEMA_INVALID',
+        message:
+          "SCHEMA_INVALID: project_id is required when scope is 'project' (use the project root folder name, e.g. 'neuralbrain' — from .brainrc or the git repo root, not a subfolder or filesystem path)",
+      },
+    };
   }
 
-  return effectiveProjectId;
+  return { effectiveProjectId };
 }
 
 /**
@@ -81,7 +91,7 @@ export function createDirectBrainMcpHandlers(
             ? requestedTypes
             : ['note', 'trajectory']) as any,
           include_global: args.include_global !== false,
-          limit: args.limit ?? 10,
+          limit: clampLimit(args.limit, 10, 100),
           ...(targetProjectId ? { project_id: targetProjectId, scope: 'project' as const } : {}),
           ...(Object.keys(filters).length > 0 ? { filters } : {}),
         });
@@ -92,7 +102,11 @@ export function createDirectBrainMcpHandlers(
     },
 
     brainSave: async (args) => {
-      const effectiveProjectId = assertScopeAndProject(args.scope, args.project_id, defaultProjectId);
+      const check = validateScopeAndProject(args.scope, args.project_id, defaultProjectId);
+      if (check.error) {
+        return jsonText({ error: check.error }, true);
+      }
+      const effectiveProjectId = check.effectiveProjectId;
       try {
         const created = createNote({
           type: args.type,
@@ -119,9 +133,15 @@ export function createDirectBrainMcpHandlers(
           projectId: targetProjectId,
           taskType: args?.task_type,
           includeGlobal: true,
-          limit: args?.limit,
+          limit: clampLimit(args?.limit, 5, 200),
         });
-        return jsonText(patterns);
+        const result = patterns.map((p) => ({
+          task_type: p.task_type,
+          error_text: p.error_text,
+          count: p.count,
+          last_seen_at: p.last_seen_at,
+        }));
+        return jsonText(result);
       } catch (err) {
         return errorResult(err);
       }
@@ -132,7 +152,7 @@ export function createDirectBrainMcpHandlers(
         const targetProjectId = args?.project_id || defaultProjectId;
         const result = getConsolidationCandidates({
           projectId: targetProjectId,
-          limit: args?.limit,
+          limit: args?.limit !== undefined ? clampLimit(args.limit, 5, 200) : undefined,
         });
         return jsonText(result);
       } catch (err) {
@@ -167,7 +187,11 @@ export function createDirectBrainMcpHandlers(
     },
 
     brainActionAdd: async (args) => {
-      const effectiveProjectId = assertScopeAndProject(args.scope, args.project_id, defaultProjectId);
+      const check = validateScopeAndProject(args.scope, args.project_id, defaultProjectId);
+      if (check.error) {
+        return jsonText({ error: check.error }, true);
+      }
+      const effectiveProjectId = check.effectiveProjectId;
       try {
         const action = createAction({
           title: args.title,
@@ -193,7 +217,7 @@ export function createDirectBrainMcpHandlers(
           projectId: targetProjectId,
           includeGlobal: args.include_global !== false,
           status: args.status,
-          limit: args.limit,
+          limit: args.limit !== undefined ? clampLimit(args.limit, 50, 200) : undefined,
         });
         return jsonText({ actions });
       } catch (err) {
@@ -265,7 +289,7 @@ export function createDirectBrainMcpHandlers(
           projectId: targetProjectId,
           status: args.status,
           agentName: args.agent_name,
-          limit: args.limit,
+          limit: args.limit !== undefined ? clampLimit(args.limit, 50, 200) : undefined,
         });
         return jsonText({ sessions });
       } catch (err) {
@@ -300,12 +324,13 @@ export function createDirectBrainMcpHandlers(
 
     brainGraph: async (args = {}) => {
       try {
-        const targetProjectId = args.project_id || defaultProjectId;
+        const targetProjectId =
+          args.project_id || (args.scope === 'global' || args.scope === 'unknown' ? undefined : defaultProjectId);
         const graph = getKnowledgeGraph(
           parseGraphQuery({
             ...(targetProjectId ? { project_id: targetProjectId } : {}),
             ...(args.scope ? { scope: args.scope } : {}),
-            ...(args.limit !== undefined ? { limit: args.limit } : {}),
+            ...(args.limit !== undefined ? { limit: clampLimit(args.limit, 50, 200) } : {}),
           })
         );
         return jsonText(graph);
@@ -316,9 +341,13 @@ export function createDirectBrainMcpHandlers(
   };
 }
 
+const cachedDefaultProjectId = resolveCanonicalProjectId({ fallbackToDirname: false }) ?? undefined;
+const cachedDirectHandlers = createDirectBrainMcpHandlers(cachedDefaultProjectId);
+
 mcpRouter.all('/', async (req: Request, res: Response) => {
   const server = createBrainMcpServer({
-    handlers: createDirectBrainMcpHandlers(),
+    defaultProjectId: cachedDefaultProjectId,
+    handlers: cachedDirectHandlers,
   });
 
   const transport = new StreamableHTTPServerTransport({

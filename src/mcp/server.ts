@@ -31,6 +31,34 @@ export const MCP_INSTRUCTIONS = [
   'for project scope, project_id is the project root folder name (the folder holding .brainrc, else the git repo root — the main repo for a worktree — else the folder the session started in), lowercase, e.g. "neuralbrain"; never a subfolder you are working in and never a filesystem path, so all agents come up with the same id',
 ].join('\n');
 
+function validateScopeAndProject(
+  scope: string | undefined,
+  projectId: string | undefined,
+  defaultProjectId: string | undefined
+): { effectiveProjectId?: string; error?: { code: string; message: string } } {
+  if (!scope || (scope !== 'project' && scope !== 'global' && scope !== 'unknown')) {
+    return {
+      error: {
+        code: 'SCOPE_REQUIRED',
+        message: "SCOPE_REQUIRED: Scope is required and must be 'project', 'global', or 'unknown'",
+      },
+    };
+  }
+
+  const effectiveProjectId = projectId || (scope === 'project' ? defaultProjectId : undefined);
+  if (scope === 'project' && !effectiveProjectId) {
+    return {
+      error: {
+        code: 'SCHEMA_INVALID',
+        message:
+          "SCHEMA_INVALID: project_id is required when scope is 'project' (use the project root folder name, e.g. 'neuralbrain' — from .brainrc or the git repo root, not a subfolder or filesystem path)",
+      },
+    };
+  }
+
+  return { effectiveProjectId };
+}
+
 export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
   const apiBaseUrl = (
     options.apiBaseUrl ||
@@ -98,13 +126,13 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+          content: [{ type: 'text' as const, text: JSON.stringify(data) }],
           isError: true,
         };
       }
 
       return {
-        content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+        content: [{ type: 'text' as const, text: JSON.stringify(data) }],
       };
     } catch (err) {
       return {
@@ -125,22 +153,14 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
     files?: string[];
     supersedes?: string;
   }) => {
-    if (!args.scope || (args.scope !== 'project' && args.scope !== 'global' && args.scope !== 'unknown')) {
-      const err = new Error("SCOPE_REQUIRED: Scope is required and must be 'project', 'global', or 'unknown'");
-      (err as any).code = 'SCOPE_REQUIRED';
-      throw err;
+    const check = validateScopeAndProject(args.scope, args.project_id, defaultProjectId);
+    if (check.error) {
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ error: check.error }) }],
+        isError: true,
+      };
     }
-
-    const effectiveProjectId =
-      args.project_id || (args.scope === 'project' ? defaultProjectId : undefined);
-
-    if (args.scope === 'project' && !effectiveProjectId) {
-      const err = new Error(
-        "SCHEMA_INVALID: project_id is required when scope is 'project' (use the project root folder name, e.g. 'neuralbrain' — from .brainrc or the git repo root, not a subfolder or filesystem path)"
-      );
-      (err as any).code = 'SCHEMA_INVALID';
-      throw err;
-    }
+    const effectiveProjectId = check.effectiveProjectId;
 
     const payload: Record<string, any> = {
       type: args.type,
@@ -168,18 +188,15 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+          content: [{ type: 'text' as const, text: JSON.stringify(data) }],
           isError: true,
         };
       }
 
       return {
-        content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+        content: [{ type: 'text' as const, text: JSON.stringify(data) }],
       };
     } catch (err) {
-      if ((err as any)?.code === 'SCOPE_REQUIRED' || (err as any)?.code === 'SCHEMA_INVALID') {
-        throw err;
-      }
       return {
         content: [{ type: 'text' as const, text: `MCP Transport Error: ${err instanceof Error ? err.message : String(err)}` }],
         isError: true,
@@ -209,7 +226,7 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
       const data = await res.json().catch(() => []);
       if (!res.ok) {
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+          content: [{ type: 'text' as const, text: JSON.stringify(data) }],
           isError: true,
         };
       }
@@ -223,7 +240,7 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
       }));
 
       return {
-        content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
+        content: [{ type: 'text' as const, text: JSON.stringify(result) }],
       };
     } catch (err) {
       return {
@@ -253,13 +270,13 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
       const data = await res.json().catch(() => ({ candidates: [] }));
       if (!res.ok) {
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+          content: [{ type: 'text' as const, text: JSON.stringify(data) }],
           isError: true,
         };
       }
 
       return {
-        content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+        content: [{ type: 'text' as const, text: JSON.stringify(data) }],
       };
     } catch (err) {
       return {
@@ -296,13 +313,13 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+          content: [{ type: 'text' as const, text: JSON.stringify(data) }],
           isError: true,
         };
       }
 
       return {
-        content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+        content: [{ type: 'text' as const, text: JSON.stringify(data) }],
       };
     } catch (err) {
       return {
@@ -322,13 +339,13 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+          content: [{ type: 'text' as const, text: JSON.stringify(data) }],
           isError: true,
         };
       }
 
       return {
-        content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+        content: [{ type: 'text' as const, text: JSON.stringify(data) }],
       };
     } catch (err) {
       return {
@@ -349,22 +366,14 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
     blocked_reason?: string;
     files?: string[];
   }) => {
-    if (!args.scope || (args.scope !== 'project' && args.scope !== 'global' && args.scope !== 'unknown')) {
-      const err = new Error("SCOPE_REQUIRED: Scope is required and must be 'project', 'global', or 'unknown'");
-      (err as any).code = 'SCOPE_REQUIRED';
-      throw err;
+    const check = validateScopeAndProject(args.scope, args.project_id, defaultProjectId);
+    if (check.error) {
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ error: check.error }) }],
+        isError: true,
+      };
     }
-
-    const effectiveProjectId =
-      args.project_id || (args.scope === 'project' ? defaultProjectId : undefined);
-
-    if (args.scope === 'project' && !effectiveProjectId) {
-      const err = new Error(
-        "SCHEMA_INVALID: project_id is required when scope is 'project' (use the project root folder name, e.g. 'neuralbrain' — from .brainrc or the git repo root, not a subfolder or filesystem path)"
-      );
-      (err as any).code = 'SCHEMA_INVALID';
-      throw err;
-    }
+    const effectiveProjectId = check.effectiveProjectId;
 
     const payload: Record<string, any> = {
       title: args.title,
@@ -444,16 +453,12 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
           content: [
             {
               type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  error: {
-                    code: 'SCHEMA_INVALID',
-                    message: `session_id is required when mode is '${mode}'`,
-                  },
+              text: JSON.stringify({
+                error: {
+                  code: 'SCHEMA_INVALID',
+                  message: `session_id is required when mode is '${mode}'`,
                 },
-                null,
-                2
-              ),
+              }),
             },
           ],
           isError: true,
@@ -568,7 +573,7 @@ export function createBrainMcpServer(options: BrainMcpServerOptions = {}): McpSe
       include_global: z.boolean().default(true).describe('Whether to include global records when project_id is specified'),
       type: z.array(z.string()).optional().describe('Note type filter (fact, architecture, pattern, workflow, bug, preference, lesson)'),
       file_path: z.string().optional().describe('File path filter ("what do we know about this file?")'),
-      limit: z.number().int().default(10).describe('Maximum number of results to return'),
+      limit: z.number().int().min(1).max(100).default(10).describe('Maximum number of results to return'),
     },
     async (args) => {
       return handlers.brainSearch(args);
@@ -610,7 +615,7 @@ export function createBrainMcpServer(options: BrainMcpServerOptions = {}): McpSe
         .optional()
         .describe('Project ID to filter by (use the project root folder name, e.g. "neuralbrain"; never a subfolder or filesystem path); omit for global'),
       task_type: z.string().optional().describe('Task type filter'),
-      limit: z.number().int().default(5).describe('Maximum number of failures to return'),
+      limit: z.number().int().min(1).max(200).default(5).describe('Maximum number of failures to return'),
     },
     async (args) => {
       return handlers.brainRecentFailures(args);
@@ -626,7 +631,7 @@ export function createBrainMcpServer(options: BrainMcpServerOptions = {}): McpSe
         .string()
         .optional()
         .describe('Filter candidates by project (use the project root folder name, e.g. "neuralbrain"; never a subfolder or filesystem path)'),
-      limit: z.number().int().optional().describe('Maximum number of candidate leases to retrieve'),
+      limit: z.number().int().min(1).max(200).optional().describe('Maximum number of candidate leases to retrieve'),
     },
     async (args) => {
       return handlers.brainConsolidateCandidates(args);
@@ -689,7 +694,7 @@ export function createBrainMcpServer(options: BrainMcpServerOptions = {}): McpSe
         .describe('Project ID to filter by (use the project root folder name, e.g. "neuralbrain"; never a subfolder or filesystem path)'),
       include_global: z.boolean().optional().describe('Whether to include global actions when project_id is specified'),
       status: z.string().optional().describe("Filter by status (e.g. 'ready', 'in_progress', 'blocked', 'done')"),
-      limit: z.number().int().optional().describe('Maximum number of actions to return'),
+      limit: z.number().int().min(1).max(200).optional().describe('Maximum number of actions to return'),
     },
     async (args) => {
       return handlers.brainActionList(args);
@@ -733,7 +738,7 @@ export function createBrainMcpServer(options: BrainMcpServerOptions = {}): McpSe
         .describe('Project ID to filter by when listing sessions (use the project root folder name, e.g. "neuralbrain"; never a subfolder or filesystem path)'),
       status: z.string().optional().describe("Filter sessions by status when listing (e.g. 'active', 'completed', 'paused', 'abandoned')"),
       agent_name: z.string().optional().describe('Filter sessions by agent name when listing'),
-      limit: z.number().int().optional().describe('Maximum number of sessions to return when listing'),
+      limit: z.number().int().min(1).max(200).optional().describe('Maximum number of sessions to return when listing'),
     },
     async (args) => {
       return handlers.brainSessions(args);
@@ -772,7 +777,7 @@ export function createBrainMcpServer(options: BrainMcpServerOptions = {}): McpSe
         .enum(['project', 'global', 'unknown'])
         .optional()
         .describe("Optional scope filter ('project', 'global', or 'unknown')"),
-      limit: z.number().int().optional().describe('Maximum number of graph nodes to return'),
+      limit: z.number().int().min(1).max(200).optional().describe('Maximum number of graph nodes to return'),
     },
     async (args) => {
       return handlers.brainGraph(args);

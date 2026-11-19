@@ -323,7 +323,7 @@ async function runLocalGpuEmbedding(text: string, recipe: ResolvedEmbedderRecipe
 
   const response = await client.embeddings.create({
     model: recipe.embed_model_id,
-    input: text,
+    input: boundLocalEmbedText(text),
   });
 
   const rawVec = response.data[0]?.embedding ?? [];
@@ -348,7 +348,7 @@ async function runRemoteEmbedding(text: string, recipe: ResolvedEmbedderRecipe):
 
   const response = await client.embeddings.create({
     model: recipe.embed_model,
-    input: text,
+    input: boundLocalEmbedText(text),
   });
 
   const rawVec = response.data[0]?.embedding ?? [];
@@ -365,6 +365,8 @@ async function runVendorEmbedding(text: string, recipe: ResolvedEmbedderRecipe):
     throw new EmbeddingConfigurationError(vendorRejection);
   }
 
+  const boundedText = boundLocalEmbedText(text);
+
   if (vendor === 'google') {
     const apiKey = process.env.GOOGLE_API_KEY?.trim();
     if (!apiKey) {
@@ -379,7 +381,7 @@ async function runVendorEmbedding(text: string, recipe: ResolvedEmbedderRecipe):
         'x-goog-api-key': apiKey,
       },
       body: JSON.stringify({
-        content: { parts: [{ text }] },
+        content: { parts: [{ text: boundedText }] },
       }),
     });
     if (!response.ok) {
@@ -400,7 +402,7 @@ async function runVendorEmbedding(text: string, recipe: ResolvedEmbedderRecipe):
     const client = new OpenAI({ apiKey });
     const response = await client.embeddings.create({
       model: recipe.embed_model,
-      input: text,
+      input: boundedText,
     });
     return response.data[0]?.embedding ?? [];
   }
@@ -510,7 +512,14 @@ export function serializeEmbedding(vector: number[]): Buffer {
 }
 
 export function deserializeEmbedding(blob: Buffer): number[] {
-  const vector = new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength / Float32Array.BYTES_PER_ELEMENT);
+  const byteLength = blob.byteLength - (blob.byteLength % Float32Array.BYTES_PER_ELEMENT);
+  if (byteLength === 0) return [];
+  if (blob.byteOffset % Float32Array.BYTES_PER_ELEMENT !== 0) {
+    const aligned = new Uint8Array(byteLength);
+    aligned.set(blob.subarray(0, byteLength));
+    return Array.from(new Float32Array(aligned.buffer, 0, byteLength / Float32Array.BYTES_PER_ELEMENT));
+  }
+  const vector = new Float32Array(blob.buffer, blob.byteOffset, byteLength / Float32Array.BYTES_PER_ELEMENT);
   return Array.from(vector);
 }
 

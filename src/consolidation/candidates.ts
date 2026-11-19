@@ -15,6 +15,8 @@ export interface ConsolidationCandidate {
   expires_at: number;
 }
 
+const MAX_OBSERVATIONS_PER_LEASE = 200;
+
 export function getConsolidationCandidates(params?: {
   projectId?: string;
   limit?: number;
@@ -67,13 +69,29 @@ export function getConsolidationCandidates(params?: {
     const candidates: ConsolidationCandidate[] = [];
 
     for (const sess of candidateSessions) {
+      const projectClause =
+        sess.project_id === null ? 'o.project_id IS NULL' : 'o.project_id = ?';
+      const obsParams: unknown[] = [sess.session_id, sess.scope];
+      if (sess.project_id !== null) {
+        obsParams.push(sess.project_id);
+      }
+      obsParams.push(MAX_OBSERVATIONS_PER_LEASE);
+
       const obsRows = db
         .prepare(`
-          SELECT * FROM observations
-          WHERE session_id = ?
-          ORDER BY created_at ASC
+          SELECT o.* FROM observations o
+          WHERE o.session_id = ?
+            AND o.scope = ?
+            AND ${projectClause}
+            AND NOT EXISTS (
+              SELECT 1 FROM summary_sources ss
+              JOIN summaries s ON ss.summary_id = s.id
+              WHERE ss.record_id = o.id AND s.verified = 1
+            )
+          ORDER BY o.created_at ASC, o.id ASC
+          LIMIT ?
         `)
-        .all(sess.session_id) as ObservationRecord[];
+        .all(...obsParams) as ObservationRecord[];
 
       if (obsRows.length === 0) continue;
 

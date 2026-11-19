@@ -3,10 +3,12 @@ import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
 import {
   claimEmbedQueue,
+  clearEmbedQueueTarget,
   enqueueForEmbedding,
   getPendingEmbedCount,
   markEmbedDone,
   markEmbedFailed,
+  recoverStaleRunningEmbeds,
   releaseEmbedClaim,
   type EmbedGrain,
 } from '../memory/embedQueueStore';
@@ -25,6 +27,8 @@ export interface DrainOptions {
   batchSize?: number;
   maxBatches?: number;
   client?: QdrantClient;
+  skipSqliteBlobUpdate?: boolean;
+  onVectorsComputed?: (vectors: Array<{ id: string; grain: EmbedGrain; blob: Buffer }>) => void;
 }
 
 export interface ReembedStatus {
@@ -145,6 +149,10 @@ export async function drainEmbedQueue(
     const batchSize = options?.batchSize || 32;
     const maxBatches = options?.maxBatches || 1;
     const qdrant = options?.client ?? getQdrantClient();
+    const qdrantConfigured = Boolean(options?.client || process.env.QDRANT_URL?.trim());
+    const skipSqliteBlobUpdate = options?.skipSqliteBlobUpdate ?? target !== 'live';
+
+    recoverStaleRunningEmbeds(target);
 
     const recipe = resolveEmbedderRecipe();
     const db = getDb();
@@ -161,6 +169,8 @@ export async function drainEmbedQueue(
     }
 
     const qdrantPointsToUpsert: Array<{ id: string; vector: number[]; payload: Record<string, any> }> = [];
+    const pendingQdrantDone: Array<{ record_id: string; grain: EmbedGrain }> = [];
+    const computedBlobs: Array<{ id: string; grain: EmbedGrain; blob: Buffer }> = [];
 
     for (let itemIdx = 0; itemIdx < items.length; itemIdx++) {
       const item = items[itemIdx];
@@ -295,25 +305,26 @@ export async function drainEmbedQueue(
           }
         }
 
+        let queuedForQdrant = false;
         if (recipe.embed_tier !== 'none') {
           const vector = await embedDocument(text);
+          const blob = serializeEmbedding(vector);
 
-          // Save embedding blob back to SQLite if table supports embedding column
-          if (item.grain === 'trajectory') {
-            db.prepare('UPDATE trajectories SET embedding = ? WHERE id = ?').run(
-              serializeEmbedding(vector),
-              item.record_id
-            );
-          } else if (item.grain === 'note') {
-            db.prepare('UPDATE notes SET embedding = ? WHERE id = ?').run(
-              serializeEmbedding(vector),
-              item.record_id
-            );
-          } else if (item.grain === 'summary') {
-            db.prepare('UPDATE summaries SET embedding = ? WHERE id = ?').run(
-              serializeEmbedding(vector),
-              item.record_id
-            );
+          if (item.grain === 'trajectory' || item.grain === 'note' || item.grain === 'summary') {
+            if (!skipSqliteBlobUpdate) {
+              const table =
+                item.grain === 'trajectory'
+                  ? 'trajectories'
+                  : item.grain === 'note'
+                    ? 'notes'
+                    : 'summaries';
+              db.prepare(`UPDATE ${table} SET embedding = ? WHERE id = ?`).run(
+                blob,
+                item.record_id
+              );
+            } else if (options?.onVectorsComputed) {
+              computedBlobs.push({ id: item.record_id, grain: item.grain, blob });
+            }
           }
 
           if (qdrant && vector.length > 0) {
@@ -322,11 +333,15 @@ export async function drainEmbedQueue(
               vector,
               payload,
             });
+            pendingQdrantDone.push({ record_id: item.record_id, grain: item.grain });
+            queuedForQdrant = true;
           }
         }
 
-        markEmbedDone(item.record_id, item.grain, target);
-        totalProcessed++;
+        if (!queuedForQdrant) {
+          markEmbedDone(item.record_id, item.grain, target);
+          totalProcessed++;
+        }
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         if (err instanceof EmbeddingConfigurationError) {
@@ -361,24 +376,29 @@ export async function drainEmbedQueue(
     if (qdrant && qdrantPointsToUpsert.length > 0) {
       const targetCollection =
         target === 'live' ? getStoreMeta()?.qdrant_alias || 'brain' : target;
+      let upsertSucceeded = false;
+      let upsertErrMsg = '';
       try {
         await qdrant.upsert(targetCollection, {
           points: qdrantPointsToUpsert,
         });
+        upsertSucceeded = true;
       } catch (qdrantErr: any) {
         // If collection was not created yet (e.g. freshly started Qdrant container), create it and retry once
-        const errMsg = qdrantErr instanceof Error ? qdrantErr.message : String(qdrantErr);
-        if (recipe.embed_dim > 0 && (qdrantErr?.status === 404 || errMsg.toLowerCase().includes('not found'))) {
+        upsertErrMsg = qdrantErr instanceof Error ? qdrantErr.message : String(qdrantErr);
+        if (recipe.embed_dim > 0 && (qdrantErr?.status === 404 || upsertErrMsg.toLowerCase().includes('not found'))) {
           try {
             await createQdrantCollectionWithIndexes(qdrant, targetCollection, recipe.embed_dim);
             await qdrant.upsert(targetCollection, {
               points: qdrantPointsToUpsert,
             });
+            upsertSucceeded = true;
           } catch (retryErr) {
+            upsertErrMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
             logger.warn(
               {
                 collection: targetCollection,
-                error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+                error: upsertErrMsg,
               },
               'qdrant batch upsert retry after collection creation failed'
             );
@@ -389,12 +409,28 @@ export async function drainEmbedQueue(
             {
               collection: targetCollection,
               count: qdrantPointsToUpsert.length,
-              error: errMsg,
+              error: upsertErrMsg,
             },
             'qdrant batch upsert skipped or failed'
           );
         }
       }
+
+      if (upsertSucceeded || !qdrantConfigured) {
+        for (const p of pendingQdrantDone) {
+          markEmbedDone(p.record_id, p.grain, target);
+          totalProcessed++;
+        }
+        if (options?.onVectorsComputed && computedBlobs.length > 0) {
+          options.onVectorsComputed(computedBlobs);
+        }
+      } else {
+        for (const p of pendingQdrantDone) {
+          releaseEmbedClaim(p.record_id, p.grain, target, upsertErrMsg || 'Qdrant upsert failed');
+        }
+      }
+    } else if (options?.onVectorsComputed && computedBlobs.length > 0) {
+      options.onVectorsComputed(computedBlobs);
     }
   }
 
@@ -573,9 +609,11 @@ export async function startReembed(options?: {
     })();
 
     // Create new collection in Qdrant if reachable
+    let qdrantCollectionReady = false;
     if (qdrant && recipe.embed_dim > 0) {
       try {
         await createQdrantCollectionWithIndexes(qdrant, newCollectionName, recipe.embed_dim);
+        qdrantCollectionReady = true;
       } catch (qdrantErr) {
         logger.warn(
           { error: qdrantErr instanceof Error ? qdrantErr.message : String(qdrantErr) },
@@ -592,6 +630,7 @@ export async function startReembed(options?: {
     // Drain queue for new collection until empty
     let processedTotal = 0;
     let failedTotal = 0;
+    const deferredBlobs: Array<{ id: string; grain: EmbedGrain; blob: Buffer }> = [];
 
     while (true) {
       const { processed, failed, remaining } = await drainEmbedQueue({
@@ -599,6 +638,10 @@ export async function startReembed(options?: {
         batchSize: 50,
         maxBatches: 1,
         client: qdrant ?? undefined,
+        skipSqliteBlobUpdate: true,
+        onVectorsComputed: (blobs) => {
+          deferredBlobs.push(...blobs);
+        },
       });
 
       processedTotal += processed;
@@ -607,14 +650,22 @@ export async function startReembed(options?: {
       activeReembedStatus.failed = failedTotal;
 
       if (remaining === 0) break;
+      if (processed === 0 && failed === 0) {
+        throw new Error(`Reembed stalled for target '${newCollectionName}' with ${remaining} remaining items`);
+      }
     }
 
     // Switch alias in Qdrant if reachable
     const meta = getStoreMeta();
     const aliasName = meta?.qdrant_alias || 'brain';
 
-    if (qdrant) {
-      try {
+    if (qdrant && recipe.embed_dim > 0 && qdrantCollectionReady) {
+      const collections = await qdrant.getCollections();
+      const isRegularCollection = collections.collections.some((c) => c.name === aliasName);
+      if (isRegularCollection) {
+        // Cannot create an alias with the same name as an existing regular collection;
+        // delete the old regular collection before creating the alias.
+        await qdrant.deleteCollection(aliasName);
         await qdrant.updateCollectionAliases({
           actions: [
             {
@@ -625,13 +676,38 @@ export async function startReembed(options?: {
             },
           ],
         });
-      } catch (aliasErr) {
-        logger.warn({ error: aliasErr }, 'failed to update collection alias in qdrant');
+      } else {
+        const aliasesRes = typeof (qdrant as any).getAliases === 'function'
+          ? await (qdrant as any).getAliases().catch(() => null)
+          : null;
+        const hasAlias = aliasesRes?.aliases?.some((a: any) => a.alias_name === aliasName);
+        const actions: any[] = [];
+        if (hasAlias) {
+          actions.push({ delete_alias: { alias_name: aliasName } });
+        }
+        actions.push({
+          create_alias: {
+            collection_name: newCollectionName,
+            alias_name: aliasName,
+          },
+        });
+        await qdrant.updateCollectionAliases({ actions });
       }
     }
 
-    // Update store_meta last as the commit point
-    commitStoreMeta(recipe, aliasName);
+    // Apply deferred SQLite embedding BLOB updates and store_meta atomically on success
+    transaction(db, () => {
+      for (const item of deferredBlobs) {
+        const table =
+          item.grain === 'trajectory'
+            ? 'trajectories'
+            : item.grain === 'note'
+              ? 'notes'
+              : 'summaries';
+        db.prepare(`UPDATE ${table} SET embedding = ? WHERE id = ?`).run(item.blob, item.id);
+      }
+      commitStoreMeta(recipe, aliasName);
+    })();
 
     activeReembedStatus.status = 'completed';
     activeReembedStatus.completed_at = Math.floor(Date.now() / 1000);
@@ -643,6 +719,7 @@ export async function startReembed(options?: {
     };
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
+    clearEmbedQueueTarget(newCollectionName);
     activeReembedStatus.status = 'failed';
     activeReembedStatus.error = errorMsg;
     logger.error({ error: errorMsg }, 'reembed failed');
