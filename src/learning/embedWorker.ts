@@ -1,4 +1,5 @@
 import { QdrantClient } from '@qdrant/js-client-rest';
+import crypto from 'crypto';
 import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
 import {
@@ -92,6 +93,19 @@ export function getQdrantClient(): QdrantClient | null {
   }
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Qdrant only accepts unsigned integers or UUIDs as point IDs.
+ * Map non-UUID record IDs (e.g. note_*, obs_*, sum_*) deterministically to a UUID
+ * while storing the original record_id in the point payload.
+ */
+export function toQdrantPointId(recordId: string): string {
+  if (UUID_RE.test(recordId)) return recordId;
+  const hex = crypto.createHash('sha256').update(recordId).digest('hex').slice(0, 32);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
 /**
  * Safely delete points from Qdrant by id.
  * Never throws — logs warnings on error or skips if Qdrant is unreachable / embedder tier is none.
@@ -110,7 +124,7 @@ export async function deleteQdrantPoints(
 
     const collection = getStoreMeta()?.qdrant_alias || 'brain';
     await qdrant.delete(collection, {
-      points: ids,
+      points: ids.map(toQdrantPointId),
     });
     logger.debug({ count: ids.length, collection }, 'deleted points from qdrant');
   } catch (err) {
@@ -329,9 +343,9 @@ export async function drainEmbedQueue(
 
           if (qdrant && vector.length > 0) {
             qdrantPointsToUpsert.push({
-              id: item.record_id,
+              id: toQdrantPointId(item.record_id),
               vector,
-              payload,
+              payload: { ...payload, record_id: item.record_id },
             });
             pendingQdrantDone.push({ record_id: item.record_id, grain: item.grain });
             queuedForQdrant = true;
@@ -426,7 +440,8 @@ export async function drainEmbedQueue(
         }
       } else {
         for (const p of pendingQdrantDone) {
-          releaseEmbedClaim(p.record_id, p.grain, target, upsertErrMsg || 'Qdrant upsert failed');
+          markEmbedFailed(p.record_id, p.grain, target, upsertErrMsg || 'Qdrant upsert failed');
+          totalFailed++;
         }
       }
     } else if (options?.onVectorsComputed && computedBlobs.length > 0) {

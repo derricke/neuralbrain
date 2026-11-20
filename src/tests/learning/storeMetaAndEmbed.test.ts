@@ -217,9 +217,11 @@ describe('storeMetaAndEmbed', () => {
       process.env.BRAIN_EMBED = 'local';
       verifyOrCreateStoreMeta();
       const mockClient = { delete: jest.fn().mockResolvedValue({}) };
-      await deleteQdrantPoints(['p-1', 'p-2'], mockClient as any);
+      const id1 = '11111111-1111-4111-8111-111111111111';
+      const id2 = '22222222-2222-4222-8222-222222222222';
+      await deleteQdrantPoints([id1, id2], mockClient as any);
       expect(mockClient.delete).toHaveBeenCalledWith('brain', {
-        points: ['p-1', 'p-2'],
+        points: [id1, id2],
       });
     });
 

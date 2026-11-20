@@ -265,4 +265,49 @@ describe('embedWorker single-flight and re-embed yield', () => {
     row = db.prepare(`SELECT status FROM embed_queue WHERE record_id = 'rec_stale_1'`).get() as { status: string };
     expect(row.status).toBe('failed');
   });
+
+  it('maps non-UUID record IDs to valid UUIDs for Qdrant and stops retrying upsert failures after MAX_EMBED_ATTEMPTS', async () => {
+    const note = createNote({
+      scope: 'project',
+      projectId: 'test-proj',
+      type: 'fact',
+      title: 'UUID point mapping',
+      content: 'Ensures Qdrant receives UUID point IDs with payload.record_id',
+    });
+
+    setCustomEmbedder(async () => Array.from({ length: 512 }, () => 0.02));
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+    const upsertedPoints: any[] = [];
+    const okQdrant = {
+      upsert: jest.fn(async (_col: string, body: { points: any[] }) => {
+        upsertedPoints.push(...body.points);
+        return true;
+      }),
+    } as any;
+
+    const okRes = await drainEmbedQueue({ target: 'live', batchSize: 10, client: okQdrant });
+    expect(okRes.processed).toBe(1);
+    expect(upsertedPoints).toHaveLength(1);
+    expect(upsertedPoints[0].id).toMatch(uuidRe);
+    expect(upsertedPoints[0].payload.record_id).toBe(note.id);
+
+    // Repeated Qdrant upsert failures should stop at failed after MAX_EMBED_ATTEMPTS
+    createNote({
+      scope: 'project',
+      projectId: 'test-proj',
+      type: 'fact',
+      title: 'Failing upsert note',
+      content: 'Should not loop forever on 400 Bad Request',
+    });
+    const badQdrant = {
+      upsert: jest.fn().mockRejectedValue(new Error('Bad Request')),
+    } as any;
+
+    for (let i = 0; i < 4; i++) {
+      await drainEmbedQueue({ target: 'live', batchSize: 10, client: badQdrant });
+    }
+    expect(getPendingEmbedCount('live')).toBe(0);
+    expect(badQdrant.upsert).toHaveBeenCalledTimes(3);
+  });
 });

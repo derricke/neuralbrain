@@ -452,7 +452,8 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
             const missingByGrain = new Map<string, string[]>();
 
             for (const pt of searchRes) {
-              const ptId = String(pt.id);
+              const ptId =
+                typeof pt.payload?.record_id === 'string' ? pt.payload.record_id : String(pt.id);
               const ptGrain = typeof pt.payload?.grain === 'string' ? pt.payload.grain : undefined;
               if (ptGrain) {
                 const key = docKey(ptGrain, ptId);
