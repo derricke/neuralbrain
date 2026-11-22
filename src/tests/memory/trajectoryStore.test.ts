@@ -29,6 +29,8 @@ describe('trajectoryStore', () => {
     const id = logTrajectory({
       scope: 'project',
       projectId,
+      userId: 'user-1',
+      agentId: 'agent-1',
       noteRef,
       taskType,
       agent: 'agent-smith',
@@ -44,6 +46,8 @@ describe('trajectoryStore', () => {
     expect(record.id).toBe(id);
     expect(record.scope).toBe('project');
     expect(record.project_id).toBe(projectId);
+    expect(record.user_id).toBe('user-1');
+    expect(record.agent_id).toBe('agent-1');
     expect(record.note_ref).toBe(noteRef);
     expect(record.task_type).toBe(taskType);
     expect(record.agent).toBe('agent-smith');
@@ -71,6 +75,7 @@ describe('trajectoryStore', () => {
     expect(record.project_id).toBe(swarmId);
     expect(record.task_ref).toBe(taskId);
     expect(record.agent).toBe('legacy-agent');
+    expect(record.agent_id).toBe('legacy-agent');
     expect(record.scope).toBe('project');
 
     const byProject = getProjectTrajectories(swarmId);
@@ -78,6 +83,80 @@ describe('trajectoryStore', () => {
 
     const bySwarm = getSwarmTrajectories(swarmId);
     expect(bySwarm).toHaveLength(1);
+  });
+
+  it('supports hierarchical project scoping and userId filtering in listTrajectories', () => {
+    logTrajectory({
+      scope: 'project',
+      projectId: 'acme',
+      userId: 'alice',
+      agentId: 'a1',
+      description: 'Root task',
+      success: true,
+    });
+    logTrajectory({
+      scope: 'project',
+      projectId: 'acme/cogs',
+      userId: 'bob',
+      agentId: 'a2',
+      description: 'Subproject task',
+      success: true,
+    });
+    logTrajectory({
+      scope: 'project',
+      projectId: 'acme/cogs/ledger',
+      userId: 'alice',
+      agentId: 'a3',
+      description: 'Leaf task',
+      success: true,
+    });
+    logTrajectory({
+      scope: 'global',
+      userId: 'alice',
+      agentId: 'a4',
+      description: 'Global task',
+      success: true,
+    });
+
+    // Default includeAncestors=true, includeGlobal=false
+    expect(
+      (listTrajectories({ projectId: 'acme/cogs/ledger' }) as Array<{ project_id: string | null }>)
+        .map((r) => r.project_id)
+        .sort()
+    ).toEqual(['acme', 'acme/cogs', 'acme/cogs/ledger']);
+
+    // includeAncestors=false
+    expect(
+      (
+        listTrajectories({
+          projectId: 'acme/cogs/ledger',
+          includeAncestors: false,
+        }) as Array<{ project_id: string | null }>
+      ).map((r) => r.project_id)
+    ).toEqual(['acme/cogs/ledger']);
+
+    // includeChildren=true
+    expect(
+      (
+        listTrajectories({
+          projectId: 'acme/cogs',
+          includeAncestors: false,
+          includeChildren: true,
+        }) as Array<{ project_id: string | null }>
+      )
+        .map((r) => r.project_id)
+        .sort()
+    ).toEqual(['acme/cogs', 'acme/cogs/ledger']);
+
+    // includeGlobal=true + userId filter (never filters on agent_id)
+    const aliceRows = listTrajectories({
+      projectId: 'acme/cogs/ledger',
+      includeGlobal: true,
+      userId: 'alice',
+    }) as Array<{ user_id: string | null; agent_id: string | null }>;
+    expect(aliceRows).toHaveLength(3);
+    expect(aliceRows.every((r) => r.user_id === 'alice')).toBe(true);
+    expect(new Set(aliceRows.map((r) => r.agent_id))).toEqual(new Set(['a1', 'a3', 'a4']));
   });
 
   it('enforces scope constraints on write', () => {
@@ -204,15 +283,21 @@ describe('trajectoryStore', () => {
     expect(patternsAfter[0].count).toBe(2);
   });
 
-  it('cleanup archives old trajectories including null-scope without error', () => {
+  it('cleanup archives old trajectories and observations including user_id, agent_id, and null-scope without error', () => {
     const db = getDb();
     const oldTimestamp = Math.floor(Date.now() / 1000) - 35 * 86400; // 35 days ago
+
+    const obsId = 'obs-old-1';
+    db.prepare(`
+      INSERT INTO observations (id, scope, project_id, user_id, agent_id, kind, input, created_at)
+      VALUES (?, 'project', 'proj-archive', 'u-obs', 'a-obs', 'response', 'old resp', ?)
+    `).run(obsId, oldTimestamp);
 
     // 1. Project-scoped old trajectory
     const idProject = randomUUID();
     db.prepare(`
-      INSERT INTO trajectories (id, scope, project_id, description, success, duration_ms, created_at)
-      VALUES (?, 'project', 'proj-archive', 'Old project task', 1, 100, ?)
+      INSERT INTO trajectories (id, scope, project_id, user_id, agent_id, description, success, duration_ms, created_at)
+      VALUES (?, 'project', 'proj-archive', 'u-traj', 'a-traj', 'Old project task', 1, 100, ?)
     `).run(idProject, oldTimestamp);
 
     // 2. Null-scope (unknown) old trajectory
@@ -223,17 +308,30 @@ describe('trajectoryStore', () => {
     `).run(idUnknown, oldTimestamp);
 
     const result = runCleanup();
+    expect(result.observationsArchived).toBe(1);
     expect(result.trajectoriesArchived).toBe(2);
 
     expect(getTrajectory(idProject)).toBeUndefined();
     expect(getTrajectory(idUnknown)).toBeUndefined();
 
+    const arcObs = db
+      .prepare('SELECT original_observation_id, user_id, agent_id, kind FROM observations_archive WHERE original_observation_id = ?')
+      .get(obsId) as { original_observation_id: string; user_id: string | null; agent_id: string | null; kind: string } | undefined;
+    expect(arcObs).toEqual({
+      original_observation_id: obsId,
+      user_id: 'u-obs',
+      agent_id: 'a-obs',
+      kind: 'response',
+    });
+
     const arcProject = db
-      .prepare('SELECT original_trajectory_id, scope, project_id FROM trajectory_archive WHERE original_trajectory_id = ?')
-      .get(idProject) as { original_trajectory_id: string; scope: string; project_id: string | null } | undefined;
+      .prepare('SELECT original_trajectory_id, scope, project_id, user_id, agent_id FROM trajectory_archive WHERE original_trajectory_id = ?')
+      .get(idProject) as { original_trajectory_id: string; scope: string; project_id: string | null; user_id: string | null; agent_id: string | null } | undefined;
     expect(arcProject?.original_trajectory_id).toBe(idProject);
     expect(arcProject?.scope).toBe('project');
     expect(arcProject?.project_id).toBe('proj-archive');
+    expect(arcProject?.user_id).toBe('u-traj');
+    expect(arcProject?.agent_id).toBe('a-traj');
 
     const arcUnknown = db
       .prepare('SELECT original_trajectory_id, scope, project_id FROM trajectory_archive WHERE original_trajectory_id = ?')
@@ -309,7 +407,7 @@ describe('trajectoryStore', () => {
     });
 
     // Now log a signalled trajectory for the same session
-    const signalledId = logTrajectory({
+    logTrajectory({
       scope: 'project',
       projectId: 'proj-q25',
       sessionId,

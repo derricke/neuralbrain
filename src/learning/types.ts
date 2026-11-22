@@ -1,3 +1,5 @@
+import type { MatchTier } from '../lib/scope';
+
 export type EmbedTier = 'none' | 'local' | 'local-gpu' | 'remote' | 'vendor';
 export type GenerativeTier = 'none' | 'agent' | 'remote' | 'vendor';
 export type VendorName = 'openai' | 'anthropic' | 'google';
@@ -28,7 +30,13 @@ export interface StoreMetaRecord {
   set_at: number;
 }
 
-export type MemoryRecordType = 'note' | 'trajectory' | 'observation' | 'summary';
+export type MemoryRecordType =
+  | 'note'
+  | 'trajectory'
+  | 'observation'
+  | 'summary'
+  | 'entity'
+  | 'action';
 
 export interface SearchRequest {
   q: string;
@@ -39,6 +47,14 @@ export interface SearchRequest {
   scope?: 'project' | 'global' | 'unknown';
   project_id?: string;
   include_global?: boolean;
+  include_ancestors?: boolean;
+  include_children?: boolean;
+  include_history?: boolean;
+  user_id?: string;
+  after?: string;
+  before?: string;
+  as_of?: string;
+  temporal_bias?: 'none' | 'recent' | 'upcoming';
   filters?: {
     type?: string[];
     file_path?: string;
@@ -48,6 +64,9 @@ export interface SearchRequest {
     success?: boolean;
     note_ref?: string;
     task_ref?: string;
+    entity_type?: string;
+    memory_layer?: 'semantic' | 'procedural';
+    user_id?: string;
   };
   /** Include summary_sources provenance entries on summary results (default false). */
   include_sources?: boolean;
@@ -73,8 +92,11 @@ export interface SearchSummarySource {
 
 export interface SearchResultItem {
   id: string;
-  record_type: 'note' | 'trajectory' | 'observation' | 'summary';
+  record_type: MemoryRecordType;
   score: number;
+  project_id?: string | null;
+  match_tier?: MatchTier;
+  matched_entities?: string[];
   record: Record<string, any>;
   sources?: SearchSummarySource[];
   sources_total?: number;

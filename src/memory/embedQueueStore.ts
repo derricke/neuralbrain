@@ -2,7 +2,13 @@ import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
 import { Database, Statement, transaction } from '../lib/sqlite';
 
-export type EmbedRecordType = 'observation' | 'trajectory' | 'note' | 'summary';
+export type EmbedRecordType =
+  | 'observation'
+  | 'trajectory'
+  | 'note'
+  | 'summary'
+  | 'entity'
+  | 'action';
 export type EmbedGrain = EmbedRecordType;
 export type EmbedStatus = 'pending' | 'running' | 'done' | 'failed';
 export const MAX_EMBED_ATTEMPTS = 3;

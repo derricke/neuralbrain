@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { normalizeProjectId } from './scope';
 import { getBrainHomeDir } from './brainHome';
@@ -9,13 +10,27 @@ export interface ResolveProjectIdOptions {
   fallbackToDirname?: boolean;
 }
 
+export interface WriteBrainRcOptions {
+  autoSubproject?: boolean;
+  maxDepth?: number;
+}
+
+function sanitizeSegment(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
 /**
  * Resolves the canonical project ID slug for a workspace or directory.
  *
  * The id names the project's ROOT folder, never whichever subfolder the agent
- * happens to be in. Precedence:
- * 1. Explicit project ID (validated and normalized).
- * 2. .brainrc or .brain.json, found by walking up every parent of cwd (or process.cwd()).
+ * happens to be in (unless `.brainrc` opts into `auto_subproject: true`).
+ * Precedence:
+ * 1. Explicit project ID (validated and normalized, including hierarchical a/b/c).
+ * 2. .brainrc or .brain.json, found by walking up from cwd (stopping after
+ *    os.homedir() if cwd is inside home, or filesystem root otherwise).
  * 3. If fallbackToDirname: the git repository root's folder name. In a git
  *    worktree that is the MAIN repository, not the worktree folder.
  * 4. BRAIN_DEFAULT_PROJECT_ID environment variable.
@@ -34,8 +49,12 @@ export function resolveCanonicalProjectId(options?: ResolveProjectIdOptions): st
     }
   }
 
-  // 2. Walk up from options.cwd || process.cwd(), through every parent
+  // 2. Walk up from options.cwd || process.cwd()
   const startDir = path.resolve(options?.cwd || process.cwd());
+  const homeDir = path.resolve(os.homedir());
+  const homePrefix = homeDir.endsWith(path.sep) ? homeDir : homeDir + path.sep;
+  const stopAtHome = startDir === homeDir || startDir.startsWith(homePrefix);
+
   let currentDir = startDir;
 
   for (;;) {
@@ -46,10 +65,18 @@ export function resolveCanonicalProjectId(options?: ResolveProjectIdOptions): st
         try {
           const content = fs.readFileSync(candidatePath, 'utf-8');
           let slug: string | null = null;
+          let autoSubproject = false;
+          let maxDepth: number | undefined;
+
           try {
             const parsed = JSON.parse(content);
             if (parsed && typeof parsed === 'object') {
               slug = parsed.project_id || parsed.projectId || parsed.project || null;
+              autoSubproject = Boolean(parsed.auto_subproject ?? parsed.autoSubproject);
+              const rawMaxDepth = parsed.max_depth ?? parsed.maxDepth;
+              if (typeof rawMaxDepth === 'number' && Number.isInteger(rawMaxDepth) && rawMaxDepth > 0) {
+                maxDepth = rawMaxDepth;
+              }
             } else if (typeof parsed === 'string') {
               slug = parsed;
             }
@@ -59,15 +86,38 @@ export function resolveCanonicalProjectId(options?: ResolveProjectIdOptions): st
           }
 
           if (slug && typeof slug === 'string') {
-            const norm = normalizeProjectId(slug.trim());
-            if (norm.ok) {
-              return norm.projectId;
+            const baseNorm = normalizeProjectId(slug.trim());
+            if (baseNorm.ok) {
+              if (autoSubproject && startDir !== currentDir) {
+                const rel = path.relative(currentDir, startDir);
+                let segments = rel
+                  .split(path.sep)
+                  .map(sanitizeSegment)
+                  .filter((seg) => seg.length > 0 && seg !== '.' && seg !== '..');
+
+                if (maxDepth !== undefined) {
+                  segments = segments.slice(0, maxDepth);
+                }
+
+                if (segments.length > 0) {
+                  const combined = `${baseNorm.projectId}/${segments.join('/')}`;
+                  const combinedNorm = normalizeProjectId(combined);
+                  if (combinedNorm.ok) {
+                    return combinedNorm.projectId;
+                  }
+                }
+              }
+              return baseNorm.projectId;
             }
           }
         } catch {
           // Ignore read error and continue walking
         }
       }
+    }
+
+    if (stopAtHome && currentDir === homeDir) {
+      break;
     }
 
     const parentDir = path.dirname(currentDir);
@@ -107,10 +157,7 @@ export function resolveCanonicalProjectId(options?: ResolveProjectIdOptions): st
 }
 
 function slugFromFolderName(name: string): string | null {
-  const sanitized = name
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, '-')
-    .replace(/^-+|-+$/g, '');
+  const sanitized = sanitizeSegment(name);
   if (!sanitized) return null;
   const norm = normalizeProjectId(sanitized);
   return norm.ok ? norm.projectId : null;
@@ -239,11 +286,13 @@ function prunePins(dir: string): void {
 }
 
 /**
- * Writes a canonical .brainrc file in projectDir with { "project_id": "<slug>" }.
+ * Writes a canonical .brainrc file in projectDir with { "project_id": "<slug>" }
+ * (plus optional auto_subproject / max_depth when opted in).
  */
 export function writeBrainRc(
   projectDir: string,
-  projectId?: string
+  projectId?: string,
+  options?: WriteBrainRcOptions
 ): { filePath: string; projectId: string } {
   const resolvedDir = path.resolve(projectDir);
   let slug: string | null = null;
@@ -253,11 +302,7 @@ export function writeBrainRc(
     if (initialNorm.ok) {
       slug = initialNorm.projectId;
     } else {
-      const sanitized = projectId
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9._-]+/g, '-')
-        .replace(/^-+|-+$/g, '');
+      const sanitized = sanitizeSegment(projectId.trim());
       const sanitizedNorm = normalizeProjectId(sanitized);
       if (sanitizedNorm.ok) {
         slug = sanitizedNorm.projectId;
@@ -267,10 +312,7 @@ export function writeBrainRc(
 
   if (!slug) {
     const basename = path.basename(resolvedDir);
-    const sanitized = basename
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, '-')
-      .replace(/^-+|-+$/g, '');
+    const sanitized = sanitizeSegment(basename);
     const norm = normalizeProjectId(sanitized);
     if (!norm.ok) {
       throw new Error(`Failed to derive valid project_id for '${projectDir}': ${norm.error}`);
@@ -278,8 +320,20 @@ export function writeBrainRc(
     slug = norm.projectId;
   }
 
+  const payload: Record<string, unknown> = { project_id: slug };
+  if (options?.autoSubproject) {
+    payload.auto_subproject = true;
+    if (
+      typeof options.maxDepth === 'number' &&
+      Number.isInteger(options.maxDepth) &&
+      options.maxDepth > 0
+    ) {
+      payload.max_depth = options.maxDepth;
+    }
+  }
+
   const filePath = path.join(resolvedDir, '.brainrc');
-  const content = JSON.stringify({ project_id: slug }, null, 2) + '\n';
+  const content = JSON.stringify(payload, null, 2) + '\n';
   fs.writeFileSync(filePath, content, 'utf-8');
 
   return { filePath, projectId: slug };

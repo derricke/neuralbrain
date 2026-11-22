@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
 import { redactOptional, redactSecrets } from '../lib/redactSecrets';
-import { resolveScope } from '../lib/scope';
+import { buildHierarchicalScopeSql, resolveScope } from '../lib/scope';
 import { dequeueRecord, enqueueForEmbedding } from './embedQueueStore';
 import { recordDeadLetter } from './deadLetterStore';
 import { upsertFailurePattern } from './failurePatternStore';
@@ -28,11 +28,14 @@ export interface TrajectoryRecord {
   id?: string;
   scope?: TrajectoryScope;
   projectId?: string | null;
+  userId?: string | null;
+  user_id?: string | null;
   noteRef?: string | null;
   taskRef?: string | null;
   sessionId?: string | null;
   taskType?: string | null;
   agent?: string | null;
+  agent_id?: string | null;
   description?: string;
   result?: string | null;
   /** NULL/undefined after rollup means *unknown*, never "failed". */
@@ -135,22 +138,25 @@ function normalizeSuccess(value: boolean | number | null | undefined): 0 | 1 | n
   return num ? 1 : 0;
 }
 
+function toCleanString(val: unknown): string | null {
+  return typeof val === 'string' && val.trim() !== '' ? val.trim() : null;
+}
+
 export function logTrajectory(record: TrajectoryRecord): string {
   const db = getDb();
   const id = record.id && record.id.trim() !== '' ? record.id.trim() : randomUUID();
 
   // Backward-compatibility field mappings
   const rawProjectId = record.projectId ?? record.swarmId;
-  let projectId = typeof rawProjectId === 'string' && rawProjectId.trim() !== '' ? rawProjectId.trim() : null;
+  let projectId = toCleanString(rawProjectId);
+  const userId = toCleanString(record.userId ?? record.user_id);
+  const agentId = toCleanString(record.agentId ?? record.agent_id);
   const taskRef = record.taskRef ?? record.taskId ?? null;
-  const agent = record.agent ?? record.agentId ?? null;
+  const agent = toCleanString(record.agent) ?? agentId ?? null;
   const noteRef = record.noteRef ?? null;
   const taskType = record.taskType ?? 'unknown';
   const rollupSource: RollupSource = record.rollupSource ?? 'signalled';
-  let sessionId =
-    typeof record.sessionId === 'string' && record.sessionId.trim() !== ''
-      ? record.sessionId.trim()
-      : null;
+  let sessionId = toCleanString(record.sessionId);
 
   // Scope: explicit, or 'project' when an id was supplied. Supplying an id
   // states project scope unambiguously, so this is not a rule-4 guess — the
@@ -276,10 +282,10 @@ export function logTrajectory(record: TrajectoryRecord): string {
 
   const insert = db.prepare(`
     INSERT INTO trajectories (
-      id, scope, project_id, note_ref, task_ref, session_id, task_type, agent,
+      id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, task_type, agent,
       description, result, success, rollup_source, tool_calls, retries,
       duration_ms, embedding, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   // A late explicit signal REPLACES the sweeper's safety-net row for the same
@@ -305,6 +311,8 @@ export function logTrajectory(record: TrajectoryRecord): string {
       id,
       scope,
       projectId,
+      userId,
+      agentId,
       noteRef,
       taskRef,
       sessionId,
@@ -464,7 +472,7 @@ export function captureTrajectories(rawItems: unknown[]): CaptureTrajectoriesRes
 }
 
 const TRAJECTORY_COLUMNS =
-  'id, scope, project_id, note_ref, task_ref, session_id, task_type, agent, description, result, success, rollup_source, tool_calls, retries, duration_ms, created_at, archived_at';
+  'id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, task_type, agent, description, result, success, rollup_source, tool_calls, retries, duration_ms, created_at, archived_at';
 
 export function getTrajectory(id: string) {
   return getDb().prepare(`SELECT ${TRAJECTORY_COLUMNS} FROM trajectories WHERE id = ?`).get(id);
@@ -484,6 +492,10 @@ export function listTrajectories(filters?: {
   /** 'unknown' selects rows whose outcome is NULL. */
   successUnknown?: boolean;
   rollupSource?: RollupSource;
+  includeAncestors?: boolean;
+  includeChildren?: boolean;
+  includeGlobal?: boolean;
+  userId?: string;
   limit?: number;
   offset?: number;
 }) {
@@ -491,14 +503,25 @@ export function listTrajectories(filters?: {
   const conditions: string[] = [];
   const params: unknown[] = [];
 
-  if (filters?.projectId) {
-    conditions.push('project_id = ?');
-    params.push(filters.projectId);
+  const hasProjectId = typeof filters?.projectId === 'string' && filters.projectId.trim() !== '';
+  const hasScope = typeof filters?.scope === 'string' && filters.scope.trim() !== '';
+
+  if (hasProjectId || hasScope) {
+    const scopeSql = buildHierarchicalScopeSql({
+      scope: hasScope ? filters!.scope : undefined,
+      projectId: hasProjectId ? filters!.projectId : undefined,
+      includeAncestors: filters?.includeAncestors ?? true,
+      includeChildren: filters?.includeChildren ?? false,
+      includeGlobal: filters?.includeGlobal ?? false,
+      userId: filters?.userId,
+    });
+    conditions.push(scopeSql.clause);
+    params.push(...scopeSql.params);
+  } else if (typeof filters?.userId === 'string' && filters.userId.trim() !== '') {
+    conditions.push('user_id = ?');
+    params.push(filters.userId.trim());
   }
-  if (filters?.scope) {
-    conditions.push('scope = ?');
-    params.push(filters.scope);
-  }
+
   if (filters?.taskType) {
     conditions.push('task_type = ?');
     params.push(filters.taskType);
@@ -561,7 +584,7 @@ export function runCleanup(): CleanupResult {
 
   // 1. Archive observations in bounded batches (each batch in its own transaction)
   const selectObsBatch = db.prepare(`
-    SELECT id, scope, project_id, note_ref, task_ref, session_id, agent,
+    SELECT id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, agent,
            kind, tool_name, file_path, input, output, duration_ms, failed,
            created_at, archived_at
     FROM observations
@@ -571,9 +594,9 @@ export function runCleanup(): CleanupResult {
 
   const insertObsArchive = db.prepare(`
     INSERT OR IGNORE INTO observations_archive (
-      id, original_observation_id, scope, project_id, note_ref, task_ref, session_id, agent,
+      id, original_observation_id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, agent,
       kind, tool_name, file_path, input, output, duration_ms, failed, created_at, archived_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const deleteObsActive = db.prepare('DELETE FROM observations WHERE id = ?');
@@ -585,6 +608,8 @@ export function runCleanup(): CleanupResult {
         id: string;
         scope: string;
         project_id: string | null;
+        user_id: string | null;
+        agent_id: string | null;
         note_ref: string | null;
         task_ref: string | null;
         session_id: string | null;
@@ -608,6 +633,8 @@ export function runCleanup(): CleanupResult {
           obs.id,
           obs.scope,
           obs.project_id,
+          obs.user_id,
+          obs.agent_id,
           obs.note_ref,
           obs.task_ref,
           obs.session_id,
@@ -695,7 +722,7 @@ export function runCleanup(): CleanupResult {
 
   // 3. Archive trajectories in bounded batches (each batch in its own transaction)
   const selectTrajBatch = db.prepare(`
-    SELECT id, scope, project_id, note_ref, task_ref, session_id, task_type, agent,
+    SELECT id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, task_type, agent,
            description, result, success, rollup_source, tool_calls, retries,
            duration_ms, embedding, created_at, archived_at
     FROM trajectories
@@ -705,10 +732,10 @@ export function runCleanup(): CleanupResult {
 
   const insertTrajArchive = db.prepare(`
     INSERT OR IGNORE INTO trajectory_archive (
-      id, original_trajectory_id, scope, project_id, note_ref, task_ref, session_id,
+      id, original_trajectory_id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id,
       task_type, agent, description, result, success, rollup_source, tool_calls,
       retries, duration_ms, embedding, created_at, archived_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const deleteTrajActive = db.prepare('DELETE FROM trajectories WHERE id = ?');
@@ -720,6 +747,8 @@ export function runCleanup(): CleanupResult {
         id: string;
         scope: string;
         project_id: string | null;
+        user_id: string | null;
+        agent_id: string | null;
         note_ref: string | null;
         task_ref: string | null;
         session_id: string | null;
@@ -745,6 +774,8 @@ export function runCleanup(): CleanupResult {
           traj.id,
           traj.scope,
           traj.project_id,
+          traj.user_id,
+          traj.agent_id,
           traj.note_ref,
           traj.task_ref,
           traj.session_id,

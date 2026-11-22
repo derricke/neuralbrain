@@ -88,7 +88,7 @@ services:
       v2
       --model-id ${BRAIN_GPU_MODEL_ID:-nomic-ai/nomic-embed-text-v1.5}
       --port 7997
-      --engine ${BRAIN_GPU_ENGINE:-optimum}
+      --engine ${BRAIN_GPU_ENGINE:-torch}
     volumes:
       - ${BRAIN_DATA_DIR:-${HOME}/.neuralbrain/data}/models:/app/.cache
     healthcheck:

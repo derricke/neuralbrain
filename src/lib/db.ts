@@ -113,6 +113,158 @@ export function initDb(): void {
   logger.info('database initialized');
 }
 
+interface ColumnInfo {
+  name: string;
+  notnull: number;
+}
+
+function tableColumns(db: Database, table: string): ColumnInfo[] {
+  return db.prepare(`PRAGMA table_info(${table})`).all() as ColumnInfo[];
+}
+
+function ensureColumns(
+  db: Database,
+  table: string,
+  columns: Array<{ name: string; ddl: string; backfill?: string }>
+): void {
+  const existing = new Set(tableColumns(db, table).map((c) => c.name));
+  for (const col of columns) {
+    if (existing.has(col.name)) continue;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${col.name} ${col.ddl}`);
+    if (col.backfill) db.exec(col.backfill);
+    logger.info({ table, column: col.name }, `${table} schema: column added`);
+  }
+}
+
+function rebuildTable(
+  db: Database,
+  table: string,
+  legacyName: string,
+  createDdl: string,
+  indexDdl?: string
+): void {
+  db.exec(`DROP TABLE IF EXISTS ${legacyName}`);
+  pragma(db, 'foreign_keys = OFF');
+  try {
+    transaction(db, () => {
+      db.exec(`ALTER TABLE ${table} RENAME TO ${legacyName}`);
+      db.exec(createDdl);
+      const oldCols = new Set(tableColumns(db, legacyName).map((c) => c.name));
+      const shared = tableColumns(db, table)
+        .map((c) => c.name)
+        .filter((name) => oldCols.has(name));
+      const list = shared.join(', ');
+      db.exec(`INSERT INTO ${table} (${list}) SELECT ${list} FROM ${legacyName}`);
+      db.exec(`DROP TABLE ${legacyName}`);
+      if (indexDdl) db.exec(indexDdl);
+    })();
+  } finally {
+    pragma(db, 'foreign_keys = ON');
+  }
+}
+
+const OBSERVATIONS_DDL = `
+  CREATE TABLE IF NOT EXISTS observations (
+    id           TEXT PRIMARY KEY,
+    scope        TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
+    project_id   TEXT,
+    user_id      TEXT,
+    agent_id     TEXT,
+    note_ref     TEXT,                          -- -> notes.id, optional
+    task_ref     TEXT,                          -- provenance only, not a scope filter
+    session_id   TEXT,
+    agent        TEXT,
+    kind         TEXT NOT NULL CHECK (kind IN ('tool_call','prompt','response')),
+    tool_name    TEXT,
+    file_path    TEXT,                           -- the tool's TARGET path, nothing else
+    input        TEXT,
+    output       TEXT,
+    duration_ms  INTEGER NOT NULL DEFAULT 0,
+    failed       INTEGER NOT NULL DEFAULT 0,     -- set by the failure hook, never inferred
+    created_at   INTEGER NOT NULL DEFAULT (unixepoch()),
+    archived_at  INTEGER,
+    CHECK ((scope = 'project') = (project_id IS NOT NULL))
+  );
+`;
+
+const OBSERVATIONS_INDEX_DDL = `
+  CREATE INDEX IF NOT EXISTS idx_obs_project   ON observations(project_id);
+  CREATE INDEX IF NOT EXISTS idx_obs_scope     ON observations(scope);
+  CREATE INDEX IF NOT EXISTS idx_obs_scope_proj ON observations(scope, project_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_obs_session   ON observations(session_id);
+  CREATE INDEX IF NOT EXISTS idx_obs_created   ON observations(created_at);
+  CREATE INDEX IF NOT EXISTS idx_obs_note      ON observations(note_ref);
+  CREATE INDEX IF NOT EXISTS idx_obs_task      ON observations(task_ref);
+  CREATE INDEX IF NOT EXISTS idx_obs_file      ON observations(file_path);
+  CREATE INDEX IF NOT EXISTS idx_obs_failed    ON observations(failed, created_at);
+  CREATE INDEX IF NOT EXISTS idx_observations_archived ON observations(archived_at);
+`;
+
+const OBSERVATIONS_ARCHIVE_DDL = `
+  CREATE TABLE IF NOT EXISTS observations_archive (
+    id                      TEXT PRIMARY KEY,
+    original_observation_id TEXT NOT NULL UNIQUE,
+    scope                   TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
+    project_id              TEXT,
+    user_id                 TEXT,
+    agent_id                TEXT,
+    note_ref                TEXT,
+    task_ref                TEXT,
+    session_id              TEXT,
+    agent                   TEXT,
+    kind                    TEXT NOT NULL CHECK (kind IN ('tool_call','prompt','response')),
+    tool_name               TEXT,
+    file_path               TEXT,
+    input                   TEXT,
+    output                  TEXT,
+    duration_ms             INTEGER NOT NULL DEFAULT 0,
+    failed                  INTEGER NOT NULL DEFAULT 0,
+    created_at              INTEGER NOT NULL,
+    archived_at             INTEGER NOT NULL,
+    CHECK ((scope = 'project') = (project_id IS NOT NULL))
+  );
+`;
+
+const OBSERVATIONS_ARCHIVE_INDEX_DDL = `
+  CREATE INDEX IF NOT EXISTS idx_obs_arc_project    ON observations_archive(project_id);
+  CREATE INDEX IF NOT EXISTS idx_obs_arc_scope      ON observations_archive(scope);
+  CREATE INDEX IF NOT EXISTS idx_obs_arc_scope_proj ON observations_archive(scope, project_id);
+  CREATE INDEX IF NOT EXISTS idx_obs_arc_archived   ON observations_archive(archived_at);
+`;
+
+function alignObservationsSchema(db: Database): void {
+  const targets: Array<{
+    table: 'observations' | 'observations_archive';
+    ddl: string;
+    indexDdl: string;
+  }> = [
+    { table: 'observations', ddl: OBSERVATIONS_DDL, indexDdl: OBSERVATIONS_INDEX_DDL },
+    {
+      table: 'observations_archive',
+      ddl: OBSERVATIONS_ARCHIVE_DDL,
+      indexDdl: OBSERVATIONS_ARCHIVE_INDEX_DDL,
+    },
+  ];
+
+  for (const { table, ddl, indexDdl } of targets) {
+    ensureColumns(db, table, [
+      { name: 'user_id', ddl: 'TEXT' },
+      { name: 'agent_id', ddl: 'TEXT' },
+    ]);
+
+    const row = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(table) as { sql?: string } | undefined;
+
+    if (row?.sql && !row.sql.includes("'response'")) {
+      rebuildTable(db, table, `${table}_legacy_kind`, ddl, indexDdl);
+      logger.info({ table }, `${table} schema: kind CHECK updated to include 'response'`);
+    } else {
+      db.exec(indexDdl);
+    }
+  }
+}
+
 /**
  * Trajectory DDL lives in constants because two things need it: the normal
  * `CREATE TABLE IF NOT EXISTS` pass, and `alignTrajectorySchema` below, which
@@ -135,6 +287,8 @@ const TRAJECTORIES_DDL = `
     id            TEXT PRIMARY KEY,
     scope         TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
     project_id    TEXT,
+    user_id       TEXT,
+    agent_id      TEXT,
     note_ref      TEXT,
     task_ref      TEXT,
     session_id    TEXT,
@@ -155,14 +309,15 @@ const TRAJECTORIES_DDL = `
 `;
 
 const TRAJECTORIES_INDEX_DDL = `
-  CREATE INDEX IF NOT EXISTS idx_traj_project  ON trajectories(project_id);
-  CREATE INDEX IF NOT EXISTS idx_traj_scope    ON trajectories(scope);
-  CREATE INDEX IF NOT EXISTS idx_traj_type     ON trajectories(task_type);
-  CREATE INDEX IF NOT EXISTS idx_traj_created  ON trajectories(created_at);
-  CREATE INDEX IF NOT EXISTS idx_traj_success  ON trajectories(success, created_at);
-  CREATE INDEX IF NOT EXISTS idx_traj_note     ON trajectories(note_ref);
-  CREATE INDEX IF NOT EXISTS idx_traj_session  ON trajectories(session_id);
-  CREATE INDEX IF NOT EXISTS idx_traj_rollup   ON trajectories(rollup_source);
+  CREATE INDEX IF NOT EXISTS idx_traj_project    ON trajectories(project_id);
+  CREATE INDEX IF NOT EXISTS idx_traj_scope      ON trajectories(scope);
+  CREATE INDEX IF NOT EXISTS idx_traj_scope_proj ON trajectories(scope, project_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_traj_type       ON trajectories(task_type);
+  CREATE INDEX IF NOT EXISTS idx_traj_created    ON trajectories(created_at);
+  CREATE INDEX IF NOT EXISTS idx_traj_success    ON trajectories(success, created_at);
+  CREATE INDEX IF NOT EXISTS idx_traj_note       ON trajectories(note_ref);
+  CREATE INDEX IF NOT EXISTS idx_traj_session    ON trajectories(session_id);
+  CREATE INDEX IF NOT EXISTS idx_traj_rollup     ON trajectories(rollup_source);
 `;
 
 /**
@@ -178,6 +333,8 @@ const TRAJECTORY_ARCHIVE_DDL = `
     original_trajectory_id TEXT NOT NULL UNIQUE,
     scope                  TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
     project_id             TEXT,
+    user_id                TEXT,
+    agent_id               TEXT,
     note_ref               TEXT,
     task_ref               TEXT,
     session_id             TEXT,
@@ -198,20 +355,12 @@ const TRAJECTORY_ARCHIVE_DDL = `
 `;
 
 const TRAJECTORY_ARCHIVE_INDEX_DDL = `
-  CREATE INDEX IF NOT EXISTS idx_traj_arc_project   ON trajectory_archive(project_id);
-  CREATE INDEX IF NOT EXISTS idx_traj_arc_scope     ON trajectory_archive(scope);
-  CREATE INDEX IF NOT EXISTS idx_traj_arc_archived  ON trajectory_archive(archived_at);
-  CREATE INDEX IF NOT EXISTS idx_traj_arc_session   ON trajectory_archive(session_id);
+  CREATE INDEX IF NOT EXISTS idx_traj_arc_project    ON trajectory_archive(project_id);
+  CREATE INDEX IF NOT EXISTS idx_traj_arc_scope      ON trajectory_archive(scope);
+  CREATE INDEX IF NOT EXISTS idx_traj_arc_scope_proj ON trajectory_archive(scope, project_id);
+  CREATE INDEX IF NOT EXISTS idx_traj_arc_archived   ON trajectory_archive(archived_at);
+  CREATE INDEX IF NOT EXISTS idx_traj_arc_session    ON trajectory_archive(session_id);
 `;
-
-interface ColumnInfo {
-  name: string;
-  notnull: number;
-}
-
-function tableColumns(db: Database, table: string): ColumnInfo[] {
-  return db.prepare(`PRAGMA table_info(${table})`).all() as ColumnInfo[];
-}
 
 /**
  * Bring an already-created trajectory table up to the DDL above.
@@ -230,7 +379,7 @@ function alignTrajectorySchema(
 ): void {
   // 1. Additive columns. Backfill only when the column has just appeared:
   //    every pre-existing row is, by definition, an explicit rollup.
-  const addColumns: Array<{ name: string; ddl: string; backfill?: string }> = [
+  ensureColumns(db, table, [
     { name: 'session_id', ddl: 'TEXT' },
     {
       name: 'rollup_source',
@@ -238,15 +387,9 @@ function alignTrajectorySchema(
       backfill: `UPDATE ${table} SET rollup_source = 'signalled' WHERE rollup_source IS NULL`,
     },
     { name: 'tool_calls', ddl: 'INTEGER NOT NULL DEFAULT 0' },
-  ];
-
-  const existing = new Set(tableColumns(db, table).map((c) => c.name));
-  for (const col of addColumns) {
-    if (existing.has(col.name)) continue;
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${col.name} ${col.ddl}`);
-    if (col.backfill) db.exec(col.backfill);
-    logger.info({ table, column: col.name }, 'trajectory schema: column added');
-  }
+    { name: 'user_id', ddl: 'TEXT' },
+    { name: 'agent_id', ddl: 'TEXT' },
+  ]);
 
   // 2. Relax success to nullable. SQLite has no "ALTER COLUMN", so this is the
   //    documented rebuild: rename, recreate, copy, drop, re-index.
@@ -256,26 +399,8 @@ function alignTrajectorySchema(
     return;
   }
 
-  const legacy = `${table}_legacy_notnull`;
-  db.exec(`DROP TABLE IF EXISTS ${legacy}`);
-  pragma(db, 'foreign_keys = OFF');
-  try {
-    transaction(db, () => {
-      db.exec(`ALTER TABLE ${table} RENAME TO ${legacy}`);
-      db.exec(createDdl);
-      const oldCols = new Set(tableColumns(db, legacy).map((c) => c.name));
-      const shared = tableColumns(db, table)
-        .map((c) => c.name)
-        .filter((name) => oldCols.has(name));
-      const list = shared.join(', ');
-      db.exec(`INSERT INTO ${table} (${list}) SELECT ${list} FROM ${legacy}`);
-      db.exec(`DROP TABLE ${legacy}`);
-      db.exec(indexDdl);
-    })();
-    logger.info({ table }, 'trajectory schema: success relaxed to nullable (NULL = unknown)');
-  } finally {
-    pragma(db, 'foreign_keys = ON');
-  }
+  rebuildTable(db, table, `${table}_legacy_notnull`, createDdl, indexDdl);
+  logger.info({ table }, 'trajectory schema: success relaxed to nullable (NULL = unknown)');
 }
 
 const NOTES_DDL = `
@@ -283,6 +408,8 @@ const NOTES_DDL = `
     id           TEXT PRIMARY KEY,
     scope        TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
     project_id   TEXT,
+    user_id      TEXT,
+    agent_id     TEXT,
     session_id   TEXT,
     type         TEXT NOT NULL CHECK (type IN
                    ('fact','architecture','pattern','workflow','bug','preference','lesson')),
@@ -294,6 +421,9 @@ const NOTES_DDL = `
     supersedes   TEXT REFERENCES notes(id),
     is_latest    INTEGER NOT NULL DEFAULT 1,
     embedding    BLOB,
+    event_at     TEXT,
+    valid_from   TEXT,
+    valid_until  TEXT,
     created_at   INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at   INTEGER NOT NULL DEFAULT (unixepoch()),
     CHECK ((scope = 'project') = (project_id IS NOT NULL))
@@ -301,58 +431,376 @@ const NOTES_DDL = `
 `;
 
 const NOTES_INDEX_DDL = `
-  CREATE INDEX IF NOT EXISTS idx_notes_project   ON notes(project_id);
-  CREATE INDEX IF NOT EXISTS idx_notes_scope     ON notes(scope);
-  CREATE INDEX IF NOT EXISTS idx_notes_type      ON notes(type);
-  CREATE INDEX IF NOT EXISTS idx_notes_latest    ON notes(is_latest, updated_at);
-  CREATE INDEX IF NOT EXISTS idx_notes_session   ON notes(session_id);
+  CREATE INDEX IF NOT EXISTS idx_notes_project    ON notes(project_id);
+  CREATE INDEX IF NOT EXISTS idx_notes_scope      ON notes(scope);
+  CREATE INDEX IF NOT EXISTS idx_notes_scope_proj ON notes(scope, project_id, is_latest, updated_at);
+  CREATE INDEX IF NOT EXISTS idx_notes_type       ON notes(type);
+  CREATE INDEX IF NOT EXISTS idx_notes_latest     ON notes(is_latest, updated_at);
+  CREATE INDEX IF NOT EXISTS idx_notes_session    ON notes(session_id);
+  CREATE INDEX IF NOT EXISTS idx_notes_temporal   ON notes(event_at, valid_from, valid_until);
+  CREATE INDEX IF NOT EXISTS idx_notes_user       ON notes(user_id) WHERE user_id IS NOT NULL;
 `;
 
 function alignNotesSchema(db: Database): void {
-  const existing = new Set(tableColumns(db, 'notes').map((c) => c.name));
-  if (!existing.has('session_id')) {
-    db.exec('ALTER TABLE notes ADD COLUMN session_id TEXT');
-    logger.info({ table: 'notes', column: 'session_id' }, 'notes schema: column added');
-  }
+  ensureColumns(db, 'notes', [
+    { name: 'session_id', ddl: 'TEXT' },
+    { name: 'user_id', ddl: 'TEXT' },
+    { name: 'agent_id', ddl: 'TEXT' },
+    { name: 'event_at', ddl: 'TEXT' },
+    { name: 'valid_from', ddl: 'TEXT' },
+    { name: 'valid_until', ddl: 'TEXT' },
+  ]);
 
   const row = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notes'")
     .get() as { sql?: string } | undefined;
 
   if (row?.sql && !row.sql.includes("'lesson'")) {
-    const legacy = 'notes_legacy_type';
-    db.exec(`DROP TABLE IF EXISTS ${legacy}`);
-    pragma(db, 'foreign_keys = OFF');
-    try {
-      transaction(db, () => {
-        db.exec(`ALTER TABLE notes RENAME TO ${legacy}`);
-        db.exec(NOTES_DDL);
-        const oldCols = new Set(tableColumns(db, legacy).map((c) => c.name));
-        const shared = tableColumns(db, 'notes')
-          .map((c) => c.name)
-          .filter((name) => oldCols.has(name));
-        const list = shared.join(', ');
-        db.exec(`INSERT INTO notes (${list}) SELECT ${list} FROM ${legacy}`);
-        db.exec(`DROP TABLE ${legacy}`);
-      })();
-      logger.info({ table: 'notes' }, "notes schema: type CHECK updated to include 'lesson'");
-    } finally {
-      pragma(db, 'foreign_keys = ON');
-    }
+    rebuildTable(db, 'notes', 'notes_legacy_type', NOTES_DDL);
+    logger.info({ table: 'notes' }, "notes schema: type CHECK updated to include 'lesson'");
   }
 
   db.exec(NOTES_INDEX_DDL);
 }
 
+function alignSessionsSchema(db: Database): void {
+  ensureColumns(db, 'sessions', [
+    { name: 'user_id', ddl: 'TEXT' },
+    { name: 'agent_id', ddl: 'TEXT' },
+  ]);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_sessions_proj_status ON sessions(project_id, status, started_at);
+    CREATE INDEX IF NOT EXISTS idx_sessions_scope_proj ON sessions(scope, project_id, status, started_at);
+  `);
+}
+
+function alignSummariesSchema(db: Database): void {
+  ensureColumns(db, 'summaries', [
+    { name: 'user_id', ddl: 'TEXT' },
+    { name: 'agent_id', ddl: 'TEXT' },
+  ]);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_sum_project    ON summaries(project_id);
+    CREATE INDEX IF NOT EXISTS idx_sum_scope_proj ON summaries(scope, project_id, is_latest, created_at);
+    CREATE INDEX IF NOT EXISTS idx_sum_kind       ON summaries(kind, created_at);
+    CREATE INDEX IF NOT EXISTS idx_sum_latest     ON summaries(is_latest);
+    CREATE INDEX IF NOT EXISTS idx_sum_producer   ON summaries(producer_tier, producer_model);
+  `);
+}
+
 function alignFailurePatternsSchema(db: Database): void {
-  const existing = new Set(tableColumns(db, 'failure_patterns').map((c) => c.name));
-  if (!existing.has('session_id')) {
-    db.exec('ALTER TABLE failure_patterns ADD COLUMN session_id TEXT');
-    logger.info(
-      { table: 'failure_patterns', column: 'session_id' },
-      'failure_patterns schema: column added'
-    );
+  ensureColumns(db, 'failure_patterns', [
+    { name: 'session_id', ddl: 'TEXT' },
+    { name: 'user_id', ddl: 'TEXT' },
+    { name: 'agent_id', ddl: 'TEXT' },
+  ]);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_fp_lookup     ON failure_patterns(project_id, task_type, count DESC);
+    CREATE INDEX IF NOT EXISTS idx_fp_scope_proj ON failure_patterns(scope, project_id, task_type, count DESC);
+    CREATE INDEX IF NOT EXISTS idx_fp_recent     ON failure_patterns(last_seen_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_fp_unique_coalesce ON failure_patterns(COALESCE(project_id, '__GLOBAL_OR_UNKNOWN__:' || scope), task_type, error_text);
+  `);
+}
+
+function alignActionsSchema(db: Database): void {
+  ensureColumns(db, 'actions', [
+    { name: 'user_id', ddl: 'TEXT' },
+    { name: 'agent_id', ddl: 'TEXT' },
+    { name: 'due_at', ddl: 'TEXT' },
+    { name: 'remind_at', ddl: 'TEXT' },
+    { name: 'recurrence', ddl: 'TEXT' },
+    { name: 'last_reminded_at', ddl: 'TEXT' },
+    { name: 'snooze_until', ddl: 'TEXT' },
+    { name: 'parent_action_id', ddl: 'TEXT' },
+    { name: 'embedding', ddl: 'BLOB' },
+  ]);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_actions_proj_status ON actions(project_id, status, priority);
+    CREATE INDEX IF NOT EXISTS idx_actions_scope_proj  ON actions(scope, project_id, status, priority);
+    CREATE INDEX IF NOT EXISTS idx_actions_due ON actions(status, due_at) WHERE status IN ('ready','in_progress') AND due_at IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_actions_remind ON actions(status, remind_at) WHERE status IN ('ready','in_progress') AND remind_at IS NOT NULL;
+  `);
+}
+
+const EMBED_QUEUE_DDL = `
+  CREATE TABLE IF NOT EXISTS embed_queue (
+    record_id   TEXT NOT NULL,
+    record_type TEXT NOT NULL CHECK (record_type IN ('observation','trajectory','note','summary','entity','action')),
+    status      TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','running','done','failed')),
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT,
+    target      TEXT NOT NULL DEFAULT 'live',   -- 'live' or a re-embed collection name
+    queued_at   INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (record_id, record_type, target)
+  );
+`;
+
+const EMBED_QUEUE_INDEX_DDL = `
+  CREATE INDEX IF NOT EXISTS idx_eq_claim ON embed_queue(target, status, queued_at);
+`;
+
+function alignEmbedQueueSchema(db: Database): void {
+  const row = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'embed_queue'")
+    .get() as { sql?: string } | undefined;
+
+  if (row?.sql && !row.sql.includes("'entity'")) {
+    rebuildTable(db, 'embed_queue', 'embed_queue_legacy_types', EMBED_QUEUE_DDL, EMBED_QUEUE_INDEX_DDL);
+    logger.info({ table: 'embed_queue' }, "embed_queue schema: record_type CHECK updated to include 'entity' and 'action'");
+  } else {
+    db.exec(EMBED_QUEUE_INDEX_DDL);
   }
+}
+
+const NOTES_EXTRA_EXPR = `
+  TRIM(
+    COALESCE((SELECT GROUP_CONCAT(concept, ' ') FROM note_concepts WHERE note_id = n.id), '') ||
+    ' ' ||
+    COALESCE((SELECT GROUP_CONCAT(file_path, ' ') FROM note_files WHERE note_id = n.id), '')
+  )
+`;
+
+const SUMMARIES_TEXT_EXPR = `
+  COALESCE((SELECT GROUP_CONCAT(text, char(10)) FROM (SELECT text FROM summary_claims WHERE summary_id = s.id ORDER BY ordinal ASC)), '')
+`;
+
+/**
+ * Create FTS5 virtual tables, sync triggers, and run one-time backfill on
+ * existing databases. Must run AFTER all table rebuilds so triggers are never
+ * dropped by ALTER/DROP TABLE operations.
+ */
+function alignFtsSchema(db: Database): void {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(
+      record_id UNINDEXED, title, content, extra, tokenize='porter unicode61'
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_trajectories USING fts5(
+      record_id UNINDEXED, description, result, task_type, tokenize='porter unicode61'
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_observations USING fts5(
+      record_id UNINDEXED, tool_name, file_path, input, output, tokenize='porter unicode61'
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_summaries USING fts5(
+      record_id UNINDEXED, text, tokenize='porter unicode61'
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_entities USING fts5(
+      record_id UNINDEXED, name, entity_type, description, external_ref, tokenize='porter unicode61'
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_actions USING fts5(
+      record_id UNINDEXED, title, description, blocked_reason, tokenize='porter unicode61'
+    );
+
+    -- notes triggers
+    CREATE TRIGGER IF NOT EXISTS trg_fts_notes_ai AFTER INSERT ON notes BEGIN
+      DELETE FROM fts_notes WHERE record_id = new.id;
+      INSERT INTO fts_notes(record_id, title, content, extra)
+      SELECT n.id, COALESCE(n.title, ''), COALESCE(n.content, ''), ${NOTES_EXTRA_EXPR}
+      FROM notes n WHERE n.id = new.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_notes_au AFTER UPDATE ON notes BEGIN
+      DELETE FROM fts_notes WHERE record_id = old.id;
+      INSERT INTO fts_notes(record_id, title, content, extra)
+      SELECT n.id, COALESCE(n.title, ''), COALESCE(n.content, ''), ${NOTES_EXTRA_EXPR}
+      FROM notes n WHERE n.id = new.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_notes_ad AFTER DELETE ON notes BEGIN
+      DELETE FROM fts_notes WHERE record_id = old.id;
+    END;
+
+    -- note_concepts triggers
+    CREATE TRIGGER IF NOT EXISTS trg_fts_note_concepts_ai AFTER INSERT ON note_concepts BEGIN
+      DELETE FROM fts_notes WHERE record_id = new.note_id;
+      INSERT INTO fts_notes(record_id, title, content, extra)
+      SELECT n.id, COALESCE(n.title, ''), COALESCE(n.content, ''), ${NOTES_EXTRA_EXPR}
+      FROM notes n WHERE n.id = new.note_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_note_concepts_ad AFTER DELETE ON note_concepts BEGIN
+      DELETE FROM fts_notes WHERE record_id = old.note_id;
+      INSERT INTO fts_notes(record_id, title, content, extra)
+      SELECT n.id, COALESCE(n.title, ''), COALESCE(n.content, ''), ${NOTES_EXTRA_EXPR}
+      FROM notes n WHERE n.id = old.note_id;
+    END;
+
+    -- note_files triggers
+    CREATE TRIGGER IF NOT EXISTS trg_fts_note_files_ai AFTER INSERT ON note_files BEGIN
+      DELETE FROM fts_notes WHERE record_id = new.note_id;
+      INSERT INTO fts_notes(record_id, title, content, extra)
+      SELECT n.id, COALESCE(n.title, ''), COALESCE(n.content, ''), ${NOTES_EXTRA_EXPR}
+      FROM notes n WHERE n.id = new.note_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_note_files_ad AFTER DELETE ON note_files BEGIN
+      DELETE FROM fts_notes WHERE record_id = old.note_id;
+      INSERT INTO fts_notes(record_id, title, content, extra)
+      SELECT n.id, COALESCE(n.title, ''), COALESCE(n.content, ''), ${NOTES_EXTRA_EXPR}
+      FROM notes n WHERE n.id = old.note_id;
+    END;
+
+    -- trajectories triggers
+    CREATE TRIGGER IF NOT EXISTS trg_fts_trajectories_ai AFTER INSERT ON trajectories BEGIN
+      DELETE FROM fts_trajectories WHERE record_id = new.id;
+      INSERT INTO fts_trajectories(record_id, description, result, task_type)
+      VALUES (new.id, COALESCE(new.description, ''), COALESCE(new.result, ''), COALESCE(new.task_type, ''));
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_trajectories_au AFTER UPDATE ON trajectories BEGIN
+      DELETE FROM fts_trajectories WHERE record_id = old.id;
+      INSERT INTO fts_trajectories(record_id, description, result, task_type)
+      VALUES (new.id, COALESCE(new.description, ''), COALESCE(new.result, ''), COALESCE(new.task_type, ''));
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_trajectories_ad AFTER DELETE ON trajectories BEGIN
+      DELETE FROM fts_trajectories WHERE record_id = old.id;
+    END;
+
+    -- observations triggers
+    CREATE TRIGGER IF NOT EXISTS trg_fts_observations_ai AFTER INSERT ON observations BEGIN
+      DELETE FROM fts_observations WHERE record_id = new.id;
+      INSERT INTO fts_observations(record_id, tool_name, file_path, input, output)
+      VALUES (new.id, COALESCE(new.tool_name, ''), COALESCE(new.file_path, ''), COALESCE(new.input, ''), COALESCE(new.output, ''));
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_observations_au AFTER UPDATE ON observations BEGIN
+      DELETE FROM fts_observations WHERE record_id = old.id;
+      INSERT INTO fts_observations(record_id, tool_name, file_path, input, output)
+      VALUES (new.id, COALESCE(new.tool_name, ''), COALESCE(new.file_path, ''), COALESCE(new.input, ''), COALESCE(new.output, ''));
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_observations_ad AFTER DELETE ON observations BEGIN
+      DELETE FROM fts_observations WHERE record_id = old.id;
+    END;
+
+    -- summaries triggers
+    CREATE TRIGGER IF NOT EXISTS trg_fts_summaries_ai AFTER INSERT ON summaries BEGIN
+      DELETE FROM fts_summaries WHERE record_id = new.id;
+      INSERT INTO fts_summaries(record_id, text)
+      SELECT s.id, ${SUMMARIES_TEXT_EXPR}
+      FROM summaries s WHERE s.id = new.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_summaries_au AFTER UPDATE ON summaries BEGIN
+      DELETE FROM fts_summaries WHERE record_id = old.id;
+      INSERT INTO fts_summaries(record_id, text)
+      SELECT s.id, ${SUMMARIES_TEXT_EXPR}
+      FROM summaries s WHERE s.id = new.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_summaries_ad AFTER DELETE ON summaries BEGIN
+      DELETE FROM fts_summaries WHERE record_id = old.id;
+    END;
+
+    -- summary_claims triggers
+    CREATE TRIGGER IF NOT EXISTS trg_fts_summary_claims_ai AFTER INSERT ON summary_claims BEGIN
+      DELETE FROM fts_summaries WHERE record_id = new.summary_id;
+      INSERT INTO fts_summaries(record_id, text)
+      SELECT s.id, ${SUMMARIES_TEXT_EXPR}
+      FROM summaries s WHERE s.id = new.summary_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_summary_claims_au AFTER UPDATE ON summary_claims BEGIN
+      DELETE FROM fts_summaries WHERE record_id IN (old.summary_id, new.summary_id);
+      INSERT INTO fts_summaries(record_id, text)
+      SELECT s.id, ${SUMMARIES_TEXT_EXPR}
+      FROM summaries s WHERE s.id IN (old.summary_id, new.summary_id);
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_summary_claims_ad AFTER DELETE ON summary_claims BEGIN
+      DELETE FROM fts_summaries WHERE record_id = old.summary_id;
+      INSERT INTO fts_summaries(record_id, text)
+      SELECT s.id, ${SUMMARIES_TEXT_EXPR}
+      FROM summaries s WHERE s.id = old.summary_id;
+    END;
+
+    -- entities triggers
+    CREATE TRIGGER IF NOT EXISTS trg_fts_entities_ai AFTER INSERT ON entities BEGIN
+      DELETE FROM fts_entities WHERE record_id = new.id;
+      INSERT INTO fts_entities(record_id, name, entity_type, description, external_ref)
+      VALUES (new.id, COALESCE(new.name, ''), COALESCE(new.entity_type, ''), COALESCE(new.description, ''), COALESCE(new.external_ref, ''));
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_entities_au AFTER UPDATE ON entities BEGIN
+      DELETE FROM fts_entities WHERE record_id = old.id;
+      INSERT INTO fts_entities(record_id, name, entity_type, description, external_ref)
+      VALUES (new.id, COALESCE(new.name, ''), COALESCE(new.entity_type, ''), COALESCE(new.description, ''), COALESCE(new.external_ref, ''));
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_entities_ad AFTER DELETE ON entities BEGIN
+      DELETE FROM fts_entities WHERE record_id = old.id;
+    END;
+
+    -- actions triggers
+    CREATE TRIGGER IF NOT EXISTS trg_fts_actions_ai AFTER INSERT ON actions BEGIN
+      DELETE FROM fts_actions WHERE record_id = new.id;
+      INSERT INTO fts_actions(record_id, title, description, blocked_reason)
+      VALUES (new.id, COALESCE(new.title, ''), COALESCE(new.description, ''), COALESCE(new.blocked_reason, ''));
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_actions_au AFTER UPDATE ON actions BEGIN
+      DELETE FROM fts_actions WHERE record_id = old.id;
+      INSERT INTO fts_actions(record_id, title, description, blocked_reason)
+      VALUES (new.id, COALESCE(new.title, ''), COALESCE(new.description, ''), COALESCE(new.blocked_reason, ''));
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_fts_actions_ad AFTER DELETE ON actions BEGIN
+      DELETE FROM fts_actions WHERE record_id = old.id;
+    END;
+  `);
+
+  const backfills: Array<{ source: string; fts: string; sql: string }> = [
+    {
+      source: 'notes',
+      fts: 'fts_notes',
+      sql: `
+        INSERT INTO fts_notes(record_id, title, content, extra)
+        SELECT n.id, COALESCE(n.title, ''), COALESCE(n.content, ''), ${NOTES_EXTRA_EXPR}
+        FROM notes n
+      `,
+    },
+    {
+      source: 'trajectories',
+      fts: 'fts_trajectories',
+      sql: `
+        INSERT INTO fts_trajectories(record_id, description, result, task_type)
+        SELECT id, COALESCE(description, ''), COALESCE(result, ''), COALESCE(task_type, '')
+        FROM trajectories
+      `,
+    },
+    {
+      source: 'observations',
+      fts: 'fts_observations',
+      sql: `
+        INSERT INTO fts_observations(record_id, tool_name, file_path, input, output)
+        SELECT id, COALESCE(tool_name, ''), COALESCE(file_path, ''), COALESCE(input, ''), COALESCE(output, '')
+        FROM observations
+      `,
+    },
+    {
+      source: 'summaries',
+      fts: 'fts_summaries',
+      sql: `
+        INSERT INTO fts_summaries(record_id, text)
+        SELECT s.id, ${SUMMARIES_TEXT_EXPR}
+        FROM summaries s
+      `,
+    },
+    {
+      source: 'entities',
+      fts: 'fts_entities',
+      sql: `
+        INSERT INTO fts_entities(record_id, name, entity_type, description, external_ref)
+        SELECT id, COALESCE(name, ''), COALESCE(entity_type, ''), COALESCE(description, ''), COALESCE(external_ref, '')
+        FROM entities
+      `,
+    },
+    {
+      source: 'actions',
+      fts: 'fts_actions',
+      sql: `
+        INSERT INTO fts_actions(record_id, title, description, blocked_reason)
+        SELECT id, COALESCE(title, ''), COALESCE(description, ''), COALESCE(blocked_reason, '')
+        FROM actions
+      `,
+    },
+  ];
+
+  transaction(db, () => {
+    for (const item of backfills) {
+      const hasSrc = db.prepare(`SELECT 1 FROM ${item.source} LIMIT 1`).get();
+      if (!hasSrc) continue;
+      const hasFts = db.prepare(`SELECT 1 FROM ${item.fts} LIMIT 1`).get();
+      if (hasFts) continue;
+      db.exec(item.sql);
+      logger.info({ source: item.source, fts: item.fts }, 'FTS5 backfill complete');
+    }
+  })();
 }
 
 function runMigrations(db: Database): void {
@@ -373,62 +821,9 @@ function runMigrations(db: Database): void {
       set_at          INTEGER NOT NULL DEFAULT (unixepoch())
     );
 
-    -- observations
-    CREATE TABLE IF NOT EXISTS observations (
-      id           TEXT PRIMARY KEY,
-      scope        TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
-      project_id   TEXT,
-      note_ref     TEXT,                          -- -> notes.id, optional
-      task_ref     TEXT,                          -- provenance only, not a scope filter
-      session_id   TEXT,
-      agent        TEXT,
-      kind         TEXT NOT NULL CHECK (kind IN ('tool_call','prompt')),
-      tool_name    TEXT,
-      file_path    TEXT,                           -- the tool's TARGET path, nothing else
-      input        TEXT,
-      output       TEXT,
-      duration_ms  INTEGER NOT NULL DEFAULT 0,
-      failed       INTEGER NOT NULL DEFAULT 0,     -- set by the failure hook, never inferred
-      created_at   INTEGER NOT NULL DEFAULT (unixepoch()),
-      archived_at  INTEGER,
-      CHECK ((scope = 'project') = (project_id IS NOT NULL))
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_obs_project   ON observations(project_id);
-    CREATE INDEX IF NOT EXISTS idx_obs_scope     ON observations(scope);
-    CREATE INDEX IF NOT EXISTS idx_obs_session   ON observations(session_id);
-    CREATE INDEX IF NOT EXISTS idx_obs_created   ON observations(created_at);
-    CREATE INDEX IF NOT EXISTS idx_obs_note      ON observations(note_ref);
-    CREATE INDEX IF NOT EXISTS idx_obs_task      ON observations(task_ref);
-    CREATE INDEX IF NOT EXISTS idx_obs_file      ON observations(file_path);
-    CREATE INDEX IF NOT EXISTS idx_obs_failed    ON observations(failed, created_at);
-    CREATE INDEX IF NOT EXISTS idx_observations_archived ON observations(archived_at);
-
-    -- observations_archive
-    CREATE TABLE IF NOT EXISTS observations_archive (
-      id                      TEXT PRIMARY KEY,
-      original_observation_id TEXT NOT NULL UNIQUE,
-      scope                   TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
-      project_id              TEXT,
-      note_ref                TEXT,
-      task_ref                TEXT,
-      session_id              TEXT,
-      agent                   TEXT,
-      kind                    TEXT NOT NULL CHECK (kind IN ('tool_call','prompt')),
-      tool_name               TEXT,
-      file_path               TEXT,
-      input                   TEXT,
-      output                  TEXT,
-      duration_ms             INTEGER NOT NULL DEFAULT 0,
-      failed                  INTEGER NOT NULL DEFAULT 0,
-      created_at              INTEGER NOT NULL,
-      archived_at             INTEGER NOT NULL,
-      CHECK ((scope = 'project') = (project_id IS NOT NULL))
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_obs_arc_project   ON observations_archive(project_id);
-    CREATE INDEX IF NOT EXISTS idx_obs_arc_scope     ON observations_archive(scope);
-    CREATE INDEX IF NOT EXISTS idx_obs_arc_archived  ON observations_archive(archived_at);
+    -- observations (DDL in OBSERVATIONS_DDL; see alignObservationsSchema)
+    ${OBSERVATIONS_DDL}
+    ${OBSERVATIONS_ARCHIVE_DDL}
 
     -- trajectories (DDL in TRAJECTORIES_DDL; see alignTrajectorySchema)
     ${TRAJECTORIES_DDL}
@@ -457,6 +852,8 @@ function runMigrations(db: Database): void {
       id             TEXT PRIMARY KEY,
       scope          TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
       project_id     TEXT,
+      user_id        TEXT,
+      agent_id       TEXT,
       session_id     TEXT,
       task_type      TEXT NOT NULL DEFAULT 'unknown',
       error_text     TEXT NOT NULL,
@@ -472,6 +869,8 @@ function runMigrations(db: Database): void {
       id                 TEXT PRIMARY KEY,
       scope              TEXT NOT NULL DEFAULT 'unknown' CHECK(scope IN ('project','global','unknown')),
       project_id         TEXT,
+      user_id            TEXT,
+      agent_id           TEXT,
       agent_name         TEXT,
       cwd                TEXT,
       status             TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused','completed','abandoned')),
@@ -483,20 +882,27 @@ function runMigrations(db: Database): void {
       CHECK ((scope = 'project') = (project_id IS NOT NULL))
     );
 
-    CREATE INDEX IF NOT EXISTS idx_sessions_proj_status ON sessions(project_id, status, started_at);
-
     -- actions
     CREATE TABLE IF NOT EXISTS actions (
       id                     TEXT PRIMARY KEY,
       session_id             TEXT,
       scope                  TEXT NOT NULL DEFAULT 'unknown' CHECK(scope IN ('project','global','unknown')),
       project_id             TEXT,
+      user_id                TEXT,
+      agent_id               TEXT,
       title                  TEXT NOT NULL,
       description            TEXT,
       status                 TEXT NOT NULL DEFAULT 'ready' CHECK(status IN ('ready','blocked','in_progress','done','dismissed')),
       priority               TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low','normal','high','urgent')),
       blocked_reason         TEXT,
       files_json             TEXT,
+      due_at                 TEXT,
+      remind_at              TEXT,
+      recurrence             TEXT,
+      last_reminded_at       TEXT,
+      snooze_until           TEXT,
+      parent_action_id       TEXT,
+      embedding              BLOB,
       created_at             TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at             TEXT NOT NULL DEFAULT (datetime('now')),
       resolved_at            TEXT,
@@ -504,17 +910,13 @@ function runMigrations(db: Database): void {
       CHECK ((scope = 'project') = (project_id IS NOT NULL))
     );
 
-    CREATE INDEX IF NOT EXISTS idx_actions_proj_status ON actions(project_id, status, priority);
-
-    CREATE INDEX IF NOT EXISTS idx_fp_lookup ON failure_patterns(project_id, task_type, count DESC);
-    CREATE INDEX IF NOT EXISTS idx_fp_recent ON failure_patterns(last_seen_at);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_fp_unique_coalesce ON failure_patterns(COALESCE(project_id, '__GLOBAL_OR_UNKNOWN__:' || scope), task_type, error_text);
-
     -- summaries
     CREATE TABLE IF NOT EXISTS summaries (
       id              TEXT PRIMARY KEY,
       scope           TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
       project_id      TEXT,
+      user_id         TEXT,
+      agent_id        TEXT,
       kind            TEXT NOT NULL CHECK (kind IN ('session','rollup','failure_digest')),
       window_from     INTEGER,
       window_to       INTEGER,
@@ -547,11 +949,47 @@ function runMigrations(db: Database): void {
       PRIMARY KEY (summary_id, claim_id, record_id)
     );
 
-    CREATE INDEX IF NOT EXISTS idx_sum_project  ON summaries(project_id);
-    CREATE INDEX IF NOT EXISTS idx_sum_kind     ON summaries(kind, created_at);
-    CREATE INDEX IF NOT EXISTS idx_sum_latest   ON summaries(is_latest);
-    CREATE INDEX IF NOT EXISTS idx_sum_producer ON summaries(producer_tier, producer_model);
     CREATE INDEX IF NOT EXISTS idx_sum_src_rec  ON summary_sources(record_id);
+
+    -- entities
+    CREATE TABLE IF NOT EXISTS entities (
+      id            TEXT PRIMARY KEY,
+      scope         TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
+      project_id    TEXT,
+      user_id       TEXT,
+      agent_id      TEXT,
+      entity_type   TEXT NOT NULL,
+      name          TEXT NOT NULL,
+      description   TEXT,
+      external_ref  TEXT,
+      metadata_json TEXT,
+      embedding     BLOB,
+      created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+      CHECK ((scope = 'project') = (project_id IS NOT NULL))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_entities_scope_proj ON entities(scope, project_id, entity_type);
+    CREATE INDEX IF NOT EXISTS idx_entities_ext_ref    ON entities(external_ref) WHERE external_ref IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_entities_user       ON entities(user_id) WHERE user_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_entities_dedup      ON entities(COALESCE(project_id, '__SCOPE__:' || scope), entity_type, lower(name));
+
+    -- entity_edges
+    CREATE TABLE IF NOT EXISTS entity_edges (
+      id            TEXT PRIMARY KEY,
+      source_type   TEXT NOT NULL,
+      source_id     TEXT NOT NULL,
+      target_type   TEXT NOT NULL,
+      target_id     TEXT NOT NULL,
+      relation      TEXT NOT NULL,
+      metadata_json TEXT,
+      created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+      UNIQUE (source_type, source_id, target_type, target_id, relation)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_entity_edges_src ON entity_edges(source_id, relation);
+    CREATE INDEX IF NOT EXISTS idx_entity_edges_tgt ON entity_edges(target_id, relation);
+    CREATE INDEX IF NOT EXISTS idx_entity_edges_rel ON entity_edges(relation);
 
     -- consolidation_leases
     CREATE TABLE IF NOT EXISTS consolidation_leases (
@@ -569,20 +1007,8 @@ function runMigrations(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_lease_expires ON consolidation_leases(expires_at);
     CREATE INDEX IF NOT EXISTS idx_lease_session ON consolidation_leases(session_id);
 
-    -- embed_queue
-    CREATE TABLE IF NOT EXISTS embed_queue (
-      record_id   TEXT NOT NULL,
-      record_type TEXT NOT NULL CHECK (record_type IN ('observation','trajectory','note','summary')),
-      status      TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending','running','done','failed')),
-      attempts    INTEGER NOT NULL DEFAULT 0,
-      last_error  TEXT,
-      target      TEXT NOT NULL DEFAULT 'live',   -- 'live' or a re-embed collection name
-      queued_at   INTEGER NOT NULL DEFAULT (unixepoch()),
-      PRIMARY KEY (record_id, record_type, target)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_eq_claim ON embed_queue(target, status, queued_at);
+    -- embed_queue (DDL in EMBED_QUEUE_DDL; see alignEmbedQueueSchema)
+    ${EMBED_QUEUE_DDL}
 
     -- dead_letters
     CREATE TABLE IF NOT EXISTS dead_letters (
@@ -612,18 +1038,7 @@ function runMigrations(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key);
   `);
 
-  // The trajectory tables above are only created when absent; these two calls
-  // are what reach a store that already has them. Both are idempotent and
-  // also (re)create the trajectory indexes.
-  alignTrajectorySchema(db, 'trajectories', TRAJECTORIES_DDL, TRAJECTORIES_INDEX_DDL);
-  alignTrajectorySchema(
-    db,
-    'trajectory_archive',
-    TRAJECTORY_ARCHIVE_DDL,
-    TRAJECTORY_ARCHIVE_INDEX_DDL
-  );
-  alignNotesSchema(db);
-  alignFailurePatternsSchema(db);
+  // Legacy grain -> record_type rename before schema alignments/rebuilds
   for (const table of ['summary_sources', 'embed_queue'] as const) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
     const hasGrain = cols.some((c) => c.name === 'grain');
@@ -632,4 +1047,23 @@ function runMigrations(db: Database): void {
       db.exec(`ALTER TABLE ${table} RENAME COLUMN grain TO record_type`);
     }
   }
+
+  // Schema alignments & rebuilds for pre-existing databases
+  alignObservationsSchema(db);
+  alignTrajectorySchema(db, 'trajectories', TRAJECTORIES_DDL, TRAJECTORIES_INDEX_DDL);
+  alignTrajectorySchema(
+    db,
+    'trajectory_archive',
+    TRAJECTORY_ARCHIVE_DDL,
+    TRAJECTORY_ARCHIVE_INDEX_DDL
+  );
+  alignNotesSchema(db);
+  alignSessionsSchema(db);
+  alignSummariesSchema(db);
+  alignFailurePatternsSchema(db);
+  alignActionsSchema(db);
+  alignEmbedQueueSchema(db);
+
+  // Must run AFTER all table rebuilds so FTS triggers are never lost
+  alignFtsSchema(db);
 }

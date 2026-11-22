@@ -1,6 +1,6 @@
 import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
-import { normalizeProjectId } from '../lib/scope';
+import { getProjectAncestors, normalizeProjectId } from '../lib/scope';
 import { getQdrantClient } from '../learning/embedWorker';
 import { getStoreMeta } from '../learning/storeMeta';
 import { transaction } from '../lib/sqlite';
@@ -22,6 +22,7 @@ const STANDARD_PROJECT_TABLES = [
   'observations_archive',
   'sessions',
   'actions',
+  'entities',
   'summaries',
   'consolidation_leases',
 ] as const;
@@ -115,7 +116,10 @@ export async function renameProject(
     const collection = getStoreMeta()?.qdrant_alias || 'brain';
     try {
       await qdrant.setPayload(collection, {
-        payload: { project_id: toId },
+        payload: {
+          project_id: toId,
+          project_ancestors: getProjectAncestors(toId),
+        },
         filter: {
           must: [{ key: 'project_id', match: { value: fromId } }],
         },

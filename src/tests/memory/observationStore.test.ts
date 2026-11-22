@@ -37,12 +37,92 @@ describe('observationStore', () => {
     expect(obs).toBeDefined();
     expect(obs?.scope).toBe('unknown'); // defaulted to unknown, NEVER global
     expect(obs?.project_id).toBeNull();
+    expect(obs?.user_id).toBeNull();
+    expect(obs?.agent_id).toBeNull();
     expect(obs?.input).toHaveLength(8000);
     expect(obs?.output).toHaveLength(8000);
     expect(obs?.failed).toBe(0);
 
     // Enqueued for embedding
     expect(getPendingEmbedCount('live')).toBe(1);
+  });
+
+  it("supports kind: 'response', nullable user_id and agent_id, and hierarchical listing", () => {
+    const result = captureObservations([
+      {
+        scope: 'project',
+        project_id: 'acme',
+        user_id: 'alice',
+        agent_id: 'agent-a',
+        kind: 'prompt',
+        input: 'Root prompt',
+      },
+      {
+        scope: 'project',
+        project_id: 'acme/socials',
+        userId: 'bob',
+        agentId: 'agent-b',
+        kind: 'response',
+        output: 'Assistant response',
+      },
+      {
+        scope: 'project',
+        project_id: 'acme/socials/calendar',
+        user_id: 'alice',
+        agent_id: 'agent-c',
+        kind: 'tool_call',
+        tool_name: 'read',
+      },
+      {
+        scope: 'global',
+        user_id: 'alice',
+        agent_id: 'agent-d',
+        kind: 'response',
+        output: 'Global response',
+      },
+    ]);
+
+    expect(result.accepted).toBe(4);
+    expect(result.rejected).toHaveLength(0);
+
+    const resp = getObservation(result.ids[1]);
+    expect(resp?.kind).toBe('response');
+    expect(resp?.user_id).toBe('bob');
+    expect(resp?.agent_id).toBe('agent-b');
+
+    // Default includeAncestors=true, includeGlobal=false, includeChildren=false
+    expect(listObservations({ projectId: 'acme/socials/calendar' }).map((o) => o.project_id).sort()).toEqual([
+      'acme',
+      'acme/socials',
+      'acme/socials/calendar',
+    ]);
+
+    // includeAncestors=false -> exact only
+    expect(
+      listObservations({ projectId: 'acme/socials/calendar', includeAncestors: false }).map(
+        (o) => o.project_id
+      )
+    ).toEqual(['acme/socials/calendar']);
+
+    // includeChildren=true -> returns descendants too
+    expect(
+      listObservations({ projectId: 'acme/socials', includeChildren: true, includeAncestors: false })
+        .map((o) => o.project_id)
+        .sort()
+    ).toEqual(['acme/socials', 'acme/socials/calendar']);
+
+    // includeGlobal=true + userId filter
+    const aliceItems = listObservations({
+      projectId: 'acme/socials/calendar',
+      includeGlobal: true,
+      userId: 'alice',
+    });
+    expect(aliceItems.map((o) => o.project_id)).toHaveLength(3);
+    expect(aliceItems.every((o) => o.user_id === 'alice')).toBe(true);
+    // Returns rows from multiple agent_ids (never filters on agent_id)
+    expect(new Set(aliceItems.map((o) => o.agent_id))).toEqual(
+      new Set(['agent-a', 'agent-c', 'agent-d'])
+    );
   });
 
   it('rejects malformed items to dead_letters while accepting valid items in batch', () => {

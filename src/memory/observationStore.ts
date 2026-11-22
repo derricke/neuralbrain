@@ -3,17 +3,19 @@ import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
 import { enqueueForEmbedding } from './embedQueueStore';
 import { recordDeadLetter } from './deadLetterStore';
-import { resolveScope } from '../lib/scope';
+import { buildHierarchicalScopeSql, resolveScope } from '../lib/scope';
 import { redactOptional } from '../lib/redactSecrets';
 import { transaction } from '../lib/sqlite';
 
 export type ObservationScope = 'project' | 'global' | 'unknown';
-export type ObservationKind = 'tool_call' | 'prompt';
+export type ObservationKind = 'tool_call' | 'prompt' | 'response';
 
 export interface ObservationRecord {
   id: string;
   scope: ObservationScope;
   project_id: string | null;
+  user_id?: string | null;
+  agent_id?: string | null;
   note_ref: string | null;
   task_ref: string | null;
   session_id: string | null;
@@ -43,6 +45,8 @@ interface ValidatedObservation {
   id: string;
   scope: ObservationScope;
   projectId: string | null;
+  userId: string | null;
+  agentId: string | null;
   noteRef: string | null;
   taskRef: string | null;
   sessionId: string | null;
@@ -57,7 +61,10 @@ interface ValidatedObservation {
   createdAt: number;
 }
 
-function validateObservationItem(item: unknown, index: number): { valid: true; item: ValidatedObservation } | { valid: false; error: string } {
+function validateObservationItem(
+  item: unknown,
+  _index: number
+): { valid: true; item: ValidatedObservation } | { valid: false; error: string } {
   if (!item || typeof item !== 'object' || Array.isArray(item)) {
     return { valid: false, error: 'Observation item must be a non-null object' };
   }
@@ -73,9 +80,12 @@ function validateObservationItem(item: unknown, index: number): { valid: true; i
   const scope: ObservationScope = scoped.scope;
   const projectId: string | null = scoped.projectId;
 
-  // kind must be 'tool_call' or 'prompt'
-  if (raw.kind !== 'tool_call' && raw.kind !== 'prompt') {
-    return { valid: false, error: `Invalid kind '${String(raw.kind)}'. Must be 'tool_call' or 'prompt'` };
+  // kind must be 'tool_call', 'prompt', or 'response'
+  if (raw.kind !== 'tool_call' && raw.kind !== 'prompt' && raw.kind !== 'response') {
+    return {
+      valid: false,
+      error: `Invalid kind '${String(raw.kind)}'. Must be 'tool_call', 'prompt', or 'response'`,
+    };
   }
   const kind = raw.kind as ObservationKind;
 
@@ -111,6 +121,8 @@ function validateObservationItem(item: unknown, index: number): { valid: true; i
     typeof val === 'string' && val.trim() !== '' ? val.trim() : null;
 
   // Optional string fields
+  const userId = toCleanString(raw.user_id ?? raw.userId);
+  const agentId = toCleanString(raw.agent_id ?? raw.agentId);
   const noteRef = toCleanString(raw.note_ref ?? raw.noteRef);
   const taskRef = toCleanString(raw.task_ref ?? raw.taskRef);
   const sessionId = toCleanString(raw.session_id ?? raw.sessionId);
@@ -133,6 +145,8 @@ function validateObservationItem(item: unknown, index: number): { valid: true; i
       id,
       scope,
       projectId,
+      userId,
+      agentId,
       noteRef,
       taskRef,
       sessionId,
@@ -181,10 +195,10 @@ export function captureObservations(rawItems: unknown[]): CaptureResult {
     const db = getDb();
     const insertStmt = db.prepare(`
       INSERT INTO observations (
-        id, scope, project_id, note_ref, task_ref, session_id, agent,
+        id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, agent,
         kind, tool_name, file_path, input, output, duration_ms, failed,
         created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const reactivateSessionStmt = db.prepare(`
@@ -202,6 +216,8 @@ export function captureObservations(rawItems: unknown[]): CaptureResult {
         item.id,
         item.scope,
         item.projectId,
+        item.userId,
+        item.agentId,
         item.noteRef,
         item.taskRef,
         item.sessionId,
@@ -263,6 +279,10 @@ export function listObservations(filters?: {
   scope?: string;
   sessionId?: string;
   failed?: number;
+  includeAncestors?: boolean;
+  includeChildren?: boolean;
+  includeGlobal?: boolean;
+  userId?: string;
   limit?: number;
   offset?: number;
 }): ObservationRecord[] {
@@ -270,14 +290,25 @@ export function listObservations(filters?: {
   const conditions: string[] = [];
   const queryParams: unknown[] = [];
 
-  if (filters?.projectId) {
-    conditions.push('project_id = ?');
-    queryParams.push(filters.projectId);
+  const hasProjectId = typeof filters?.projectId === 'string' && filters.projectId.trim() !== '';
+  const hasScope = typeof filters?.scope === 'string' && filters.scope.trim() !== '';
+
+  if (hasProjectId || hasScope) {
+    const scopeSql = buildHierarchicalScopeSql({
+      scope: hasScope ? filters!.scope : undefined,
+      projectId: hasProjectId ? filters!.projectId : undefined,
+      includeAncestors: filters?.includeAncestors ?? true,
+      includeChildren: filters?.includeChildren ?? false,
+      includeGlobal: filters?.includeGlobal ?? false,
+      userId: filters?.userId,
+    });
+    conditions.push(scopeSql.clause);
+    queryParams.push(...scopeSql.params);
+  } else if (typeof filters?.userId === 'string' && filters.userId.trim() !== '') {
+    conditions.push('user_id = ?');
+    queryParams.push(filters.userId.trim());
   }
-  if (filters?.scope) {
-    conditions.push('scope = ?');
-    queryParams.push(filters.scope);
-  }
+
   if (filters?.sessionId) {
     conditions.push('session_id = ?');
     queryParams.push(filters.sessionId);

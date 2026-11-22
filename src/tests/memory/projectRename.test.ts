@@ -6,6 +6,7 @@ import { createNote, listNotes } from '../../memory/noteStore';
 import { startSession, listSessions } from '../../memory/sessionStore';
 import { createAction, listActions } from '../../memory/actionStore';
 import { renameProject } from '../../memory/projectRename';
+import * as embedWorker from '../../learning/embedWorker';
 
 describe('Project Rename (renameProject + POST /maintenance/rename-project)', () => {
   beforeEach(() => {
@@ -17,67 +18,97 @@ describe('Project Rename (renameProject + POST /maintenance/rename-project)', ()
   });
 
   afterEach(() => {
+    jest.restoreAllMocks();
     resetDb();
   });
 
-  test('renames project_id across notes, sessions, actions, and merges failure_patterns conflicts', async () => {
+  test('renames project_id across notes, sessions, actions, entities, merges failure_patterns, and updates Qdrant project_ancestors', async () => {
     createNote({
       type: 'architecture',
       title: 'Old project note',
       content: 'Created under old project_id',
       scope: 'project',
-      projectId: 'old-proj',
+      projectId: 'acme/old-proj',
     });
 
     startSession({
       id: 'sess-old-1',
       scope: 'project',
-      project_id: 'old-proj',
+      project_id: 'acme/old-proj',
     });
 
     createAction({
       title: 'Follow up',
       scope: 'project',
-      project_id: 'old-proj',
+      project_id: 'acme/old-proj',
     });
 
     const db = getDb();
     db.prepare(
+      `INSERT INTO entities (id, scope, project_id, entity_type, name)
+       VALUES ('ent-old-1', 'project', 'acme/old-proj', 'service', 'Calendar')`
+    ).run();
+
+    db.prepare(
       `INSERT INTO failure_patterns (id, scope, project_id, task_type, error_text, count, last_seen_at)
-       VALUES ('fp-1', 'project', 'old-proj', 'test_run', 'ECONNREFUSED', 3, 1000)`
+       VALUES ('fp-1', 'project', 'acme/old-proj', 'test_run', 'ECONNREFUSED', 3, 1000)`
     ).run();
     db.prepare(
       `INSERT INTO failure_patterns (id, scope, project_id, task_type, error_text, count, last_seen_at)
-       VALUES ('fp-2', 'project', 'new-proj', 'test_run', 'ECONNREFUSED', 2, 2000)`
+       VALUES ('fp-2', 'project', 'acme/new-proj', 'test_run', 'ECONNREFUSED', 2, 2000)`
     ).run();
     db.prepare(
       `INSERT INTO failure_patterns (id, scope, project_id, task_type, error_text, count, last_seen_at)
-       VALUES ('fp-3', 'project', 'old-proj', 'build', 'TS2304', 1, 1500)`
+       VALUES ('fp-3', 'project', 'acme/old-proj', 'build', 'TS2304', 1, 1500)`
     ).run();
 
-    const result = await renameProject('old-proj', 'new-proj');
+    const setPayload = jest.fn(async () => ({}));
+    jest.spyOn(embedWorker, 'getQdrantClient').mockReturnValue({ setPayload } as any);
 
-    expect(result.from_project_id).toBe('old-proj');
-    expect(result.to_project_id).toBe('new-proj');
+    const result = await renameProject('acme/old-proj', 'acme/new-proj');
+
+    expect(result.from_project_id).toBe('acme/old-proj');
+    expect(result.to_project_id).toBe('acme/new-proj');
     expect(result.updated_counts.notes).toBe(1);
     expect(result.updated_counts.sessions).toBe(1);
     expect(result.updated_counts.actions).toBe(1);
+    expect(result.updated_counts.entities).toBe(1);
     expect(result.updated_counts.failure_patterns).toBe(2);
-    expect(result.total_updated).toBe(5);
+    expect(result.total_updated).toBe(6);
+    expect(result.qdrant_updated).toBe(true);
 
-    expect(listNotes({ projectId: 'old-proj', includeGlobal: false })).toHaveLength(0);
-    expect(listNotes({ projectId: 'new-proj', includeGlobal: false })).toHaveLength(1);
+    expect(setPayload).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        payload: {
+          project_id: 'acme/new-proj',
+          project_ancestors: ['acme', 'acme/new-proj'],
+        },
+        filter: {
+          must: [{ key: 'project_id', match: { value: 'acme/old-proj' } }],
+        },
+        wait: true,
+      })
+    );
 
-    expect(listSessions({ projectId: 'old-proj' })).toHaveLength(0);
-    expect(listSessions({ projectId: 'new-proj' })).toHaveLength(1);
+    const renamedEntity = db
+      .prepare('SELECT project_id FROM entities WHERE id = ?')
+      .get('ent-old-1') as { project_id: string };
+    expect(renamedEntity.project_id).toBe('acme/new-proj');
 
-    expect(listActions({ projectId: 'old-proj', includeGlobal: false })).toHaveLength(0);
-    expect(listActions({ projectId: 'new-proj', includeGlobal: false })).toHaveLength(1);
+    expect(listNotes({ projectId: 'acme/old-proj', includeGlobal: false })).toHaveLength(0);
+    expect(listNotes({ projectId: 'acme/new-proj', includeGlobal: false })).toHaveLength(1);
+
+    expect(listSessions({ projectId: 'acme/old-proj' })).toHaveLength(0);
+    expect(listSessions({ projectId: 'acme/new-proj' })).toHaveLength(1);
+
+    expect(listActions({ projectId: 'acme/old-proj', includeGlobal: false })).toHaveLength(0);
+    expect(listActions({ projectId: 'acme/new-proj', includeGlobal: false })).toHaveLength(1);
 
     const mergedFp = db
       .prepare(
         `SELECT count, last_seen_at FROM failure_patterns
-         WHERE project_id = 'new-proj' AND task_type = 'test_run' AND error_text = 'ECONNREFUSED'`
+         WHERE project_id = 'acme/new-proj' AND task_type = 'test_run' AND error_text = 'ECONNREFUSED'`
       )
       .get() as { count: number; last_seen_at: number };
     expect(mergedFp.count).toBe(5);
