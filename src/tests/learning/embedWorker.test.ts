@@ -2,6 +2,7 @@ import { getDb, resetDb } from '../../lib/db';
 import { setCustomEmbedder } from '../../learning/embedding';
 import { verifyOrCreateStoreMeta } from '../../learning/storeMeta';
 import {
+  createQdrantCollectionWithIndexes,
   drainEmbedQueue,
   getReembedStatus,
   startReembed,
@@ -13,6 +14,8 @@ import {
   recoverStaleRunningEmbeds,
 } from '../../memory/embedQueueStore';
 import { createNote } from '../../memory/noteStore';
+import { captureObservations } from '../../memory/observationStore';
+import { logTrajectory } from '../../memory/trajectoryStore';
 
 describe('embedWorker single-flight and re-embed yield', () => {
   const originalEnv = { ...process.env };
@@ -309,5 +312,176 @@ describe('embedWorker single-flight and re-embed yield', () => {
     }
     expect(getPendingEmbedCount('live')).toBe(0);
     expect(badQdrant.upsert).toHaveBeenCalledTimes(3);
+  });
+
+  it('embeds entity and action records, writes BLOBs, and includes project_ancestors and user_id on all Qdrant payloads', async () => {
+    const db = getDb();
+
+    db.prepare(`
+      INSERT INTO entities (id, scope, project_id, user_id, agent_id, entity_type, name, description, external_ref, created_at)
+      VALUES ('ent_1', 'project', 'acme/socials/calendar', 'user-42', 'agent-1', 'asset', 'Q4 Brand Kit', 'Visual guidelines', 'drive://brand-kit', 1700000100)
+    `).run();
+    enqueueForEmbedding('ent_1', 'entity', 'live');
+
+    db.prepare(`
+      INSERT INTO actions (id, scope, project_id, user_id, agent_id, title, description, status, priority, blocked_reason, created_at)
+      VALUES ('act_1', 'project', 'acme/cogs', 'user-7', 'agent-2', 'Publish ledger', 'Monthly cost report', 'blocked', 'high', 'Waiting on finance CSV', '2026-11-22 08:30:00')
+    `).run();
+    enqueueForEmbedding('act_1', 'action', 'live');
+
+    const note = createNote({
+      scope: 'project',
+      projectId: 'acme/socials',
+      type: 'fact',
+      title: 'Socials Note',
+      content: 'Scheduling notes',
+    });
+    db.prepare(`UPDATE notes SET user_id = 'user-99' WHERE id = ?`).run(note.id);
+
+    captureObservations([
+      {
+        scope: 'project',
+        project_id: 'acme/socials/calendar',
+        user_id: 'user-obs',
+        kind: 'tool_call',
+        tool_name: 'read_file',
+        input: 'README.md',
+      },
+    ]);
+
+    const trajId = logTrajectory({
+      scope: 'project',
+      projectId: 'acme/cogs',
+      userId: 'user-traj',
+      taskType: 'build',
+      description: 'Compile ledger',
+      success: true,
+    });
+
+    db.prepare(`
+      INSERT INTO summaries (id, scope, project_id, user_id, kind, outcome, producer_tier, prompt_version, is_latest, created_at)
+      VALUES ('sum_1', 'global', NULL, 'user-sum', 'session', 'success', 'agent', 'v1', 1, 1700000200)
+    `).run();
+    db.prepare(`
+      INSERT INTO summary_claims (id, summary_id, text, ordinal)
+      VALUES ('clm_1', 'sum_1', 'Summary claim text', 0)
+    `).run();
+    enqueueForEmbedding('sum_1', 'summary', 'live');
+
+    setCustomEmbedder(async () => Array.from({ length: 512 }, () => 0.1));
+
+    const upsertedPoints: any[] = [];
+    const mockQdrant = {
+      upsert: jest.fn(async (_col: string, body: { points: any[] }) => {
+        upsertedPoints.push(...body.points);
+        return true;
+      }),
+    } as any;
+
+    const drainRes = await drainEmbedQueue({ target: 'live', batchSize: 50, client: mockQdrant });
+    expect(drainRes.failed).toBe(0);
+    expect(drainRes.remaining).toBe(0);
+    expect(upsertedPoints).toHaveLength(6);
+
+    const byRecordId = new Map(upsertedPoints.map((p) => [p.payload.record_id, p.payload]));
+
+    const entPayload = byRecordId.get('ent_1');
+    expect(entPayload).toMatchObject({
+      record_type: 'entity',
+      scope: 'project',
+      project_id: 'acme/socials/calendar',
+      project_ancestors: ['acme', 'acme/socials', 'acme/socials/calendar'],
+      user_id: 'user-42',
+      entity_type: 'asset',
+      created_at: 1700000100,
+    });
+    expect(entPayload.text).toContain('asset\nQ4 Brand Kit\nVisual guidelines\ndrive://brand-kit');
+
+    const actPayload = byRecordId.get('act_1');
+    expect(actPayload).toMatchObject({
+      record_type: 'action',
+      scope: 'project',
+      project_id: 'acme/cogs',
+      project_ancestors: ['acme', 'acme/cogs'],
+      user_id: 'user-7',
+      kind: 'blocked',
+      type: 'high',
+      created_at: Math.floor(Date.parse('2026-11-22T08:30:00Z') / 1000),
+    });
+    expect(actPayload.text).toContain('Publish ledger\nMonthly cost report\nWaiting on finance CSV');
+
+    expect(byRecordId.get(note.id)).toMatchObject({
+      record_type: 'note',
+      project_ancestors: ['acme', 'acme/socials'],
+      user_id: 'user-99',
+    });
+    expect(byRecordId.get(trajId)).toMatchObject({
+      record_type: 'trajectory',
+      project_ancestors: ['acme', 'acme/cogs'],
+      user_id: 'user-traj',
+    });
+    const obsPayload = upsertedPoints.find((p) => p.payload.record_type === 'observation')?.payload;
+    expect(obsPayload).toMatchObject({
+      project_ancestors: ['acme', 'acme/socials', 'acme/socials/calendar'],
+      user_id: 'user-obs',
+    });
+    expect(byRecordId.get('sum_1')).toMatchObject({
+      record_type: 'summary',
+      project_ancestors: [],
+      user_id: 'user-sum',
+    });
+
+    const entRow = db.prepare('SELECT embedding FROM entities WHERE id = ?').get('ent_1') as { embedding: Buffer | null };
+    expect(entRow.embedding).not.toBeNull();
+    const actRow = db.prepare('SELECT embedding FROM actions WHERE id = ?').get('act_1') as { embedding: Buffer | null };
+    expect(actRow.embedding).not.toBeNull();
+  });
+
+  it('indexes project_ancestors, user_id, and entity_type and includes entities/actions in startReembed', async () => {
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO entities (id, scope, project_id, entity_type, name)
+      VALUES ('ent_reembed', 'project', 'acme/socials', 'brand', 'Acme Brand')
+    `).run();
+    db.prepare(`
+      INSERT INTO actions (id, scope, project_id, title, status, priority)
+      VALUES ('act_reembed', 'project', 'acme/socials', 'Review post', 'ready', 'normal')
+    `).run();
+
+    setCustomEmbedder(async () => Array.from({ length: 512 }, () => 0.07));
+
+    const indexedFields: string[] = [];
+    const upsertedIds: string[] = [];
+    const mockQdrant = {
+      getCollections: jest.fn().mockResolvedValue({ collections: [] }),
+      createCollection: jest.fn().mockResolvedValue(true),
+      createPayloadIndex: jest.fn(async (_col: string, opts: { field_name: string }) => {
+        indexedFields.push(opts.field_name);
+        return true;
+      }),
+      upsert: jest.fn(async (_col: string, body: { points: any[] }) => {
+        for (const p of body.points) upsertedIds.push(p.payload.record_id);
+        return true;
+      }),
+      updateCollectionAliases: jest.fn().mockResolvedValue(true),
+    } as any;
+
+    await createQdrantCollectionWithIndexes(mockQdrant, 'brain_idx_check', 512);
+    expect(indexedFields).toEqual(
+      expect.arrayContaining(['project_ancestors', 'user_id', 'entity_type', 'project_id', 'scope'])
+    );
+
+    const reembedRes = await startReembed({
+      newCollectionName: 'brain_v_ent_act',
+      client: mockQdrant,
+    });
+    expect(reembedRes.processed).toBe(2);
+    expect(reembedRes.failed).toBe(0);
+    expect(upsertedIds).toEqual(expect.arrayContaining(['ent_reembed', 'act_reembed']));
+
+    const entBlob = db.prepare('SELECT embedding FROM entities WHERE id = ?').get('ent_reembed') as { embedding: Buffer | null };
+    const actBlob = db.prepare('SELECT embedding FROM actions WHERE id = ?').get('act_reembed') as { embedding: Buffer | null };
+    expect(entBlob.embedding).not.toBeNull();
+    expect(actBlob.embedding).not.toBeNull();
   });
 });

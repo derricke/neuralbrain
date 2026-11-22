@@ -2,6 +2,7 @@ import { QdrantClient } from '@qdrant/js-client-rest';
 import crypto from 'crypto';
 import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
+import { getProjectAncestors } from '../lib/scope';
 import {
   claimEmbedQueue,
   clearEmbedQueueTarget,
@@ -138,6 +139,33 @@ export async function deleteQdrantPoints(
   }
 }
 
+const EMBEDDING_TABLE_BY_TYPE: Partial<Record<EmbedRecordType, string>> = {
+  trajectory: 'trajectories',
+  note: 'notes',
+  summary: 'summaries',
+  entity: 'entities',
+  action: 'actions',
+};
+
+function toUnixSeconds(raw: unknown): number {
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return Math.floor(raw);
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed) {
+      const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(trimmed)
+        ? `${trimmed.replace(' ', 'T')}Z`
+        : trimmed;
+      const ms = Date.parse(iso);
+      if (Number.isFinite(ms)) {
+        return Math.floor(ms / 1000);
+      }
+    }
+  }
+  return Math.floor(Date.now() / 1000);
+}
+
 let isDrainRunning = false;
 
 export async function drainEmbedQueue(
@@ -213,6 +241,8 @@ export async function drainEmbedQueue(
               record_type: 'observation',
               scope: obs.scope,
               project_id: obs.project_id,
+              project_ancestors: obs.project_id ? getProjectAncestors(obs.project_id) : [],
+              user_id: obs.user_id ?? null,
               kind: obs.kind,
               type: null,
               task_type: null,
@@ -247,6 +277,8 @@ export async function drainEmbedQueue(
               record_type: 'trajectory',
               scope: traj.scope,
               project_id: traj.project_id,
+              project_ancestors: traj.project_id ? getProjectAncestors(traj.project_id) : [],
+              user_id: traj.user_id ?? null,
               kind: null,
               type: null,
               task_type: traj.task_type,
@@ -274,6 +306,8 @@ export async function drainEmbedQueue(
               record_type: 'note',
               scope: note.scope,
               project_id: note.project_id,
+              project_ancestors: note.project_id ? getProjectAncestors(note.project_id) : [],
+              user_id: note.user_id ?? null,
               kind: null,
               type: note.type,
               task_type: null,
@@ -304,6 +338,8 @@ export async function drainEmbedQueue(
               record_type: 'summary',
               scope: summary.scope,
               project_id: summary.project_id,
+              project_ancestors: summary.project_id ? getProjectAncestors(summary.project_id) : [],
+              user_id: summary.user_id ?? null,
               kind: summary.kind,
               type: null,
               task_type: null,
@@ -317,6 +353,69 @@ export async function drainEmbedQueue(
             };
             break;
           }
+          case 'entity': {
+            const entity = db
+              .prepare('SELECT * FROM entities WHERE id = ?')
+              .get(item.record_id) as any;
+            if (!entity) {
+              markEmbedDone(item.record_id, item.record_type, target);
+              totalProcessed++;
+              continue;
+            }
+            text = [entity.entity_type, entity.name, entity.description, entity.external_ref]
+              .filter(Boolean)
+              .join('\n');
+            payload = {
+              record_type: 'entity',
+              scope: entity.scope,
+              project_id: entity.project_id,
+              project_ancestors: entity.project_id ? getProjectAncestors(entity.project_id) : [],
+              user_id: entity.user_id ?? null,
+              entity_type: entity.entity_type,
+              kind: null,
+              type: null,
+              task_type: null,
+              note_ref: null,
+              task_ref: null,
+              file_path: null,
+              agent: null,
+              success: null,
+              created_at: entity.created_at,
+              text,
+            };
+            break;
+          }
+          case 'action': {
+            const action = db
+              .prepare('SELECT * FROM actions WHERE id = ?')
+              .get(item.record_id) as any;
+            if (!action) {
+              markEmbedDone(item.record_id, item.record_type, target);
+              totalProcessed++;
+              continue;
+            }
+            text = [action.title, action.description, action.blocked_reason]
+              .filter(Boolean)
+              .join('\n');
+            payload = {
+              record_type: 'action',
+              scope: action.scope,
+              project_id: action.project_id,
+              project_ancestors: action.project_id ? getProjectAncestors(action.project_id) : [],
+              user_id: action.user_id ?? null,
+              kind: action.status,
+              type: action.priority,
+              task_type: null,
+              note_ref: null,
+              task_ref: null,
+              file_path: null,
+              agent: null,
+              success: null,
+              created_at: toUnixSeconds(action.created_at),
+              text,
+            };
+            break;
+          }
         }
 
         let queuedForQdrant = false;
@@ -324,15 +423,10 @@ export async function drainEmbedQueue(
           const vector = await embedDocument(text);
           const blob = serializeEmbedding(vector);
 
-          if (item.record_type === 'trajectory' || item.record_type === 'note' || item.record_type === 'summary') {
+          const blobTable = EMBEDDING_TABLE_BY_TYPE[item.record_type];
+          if (blobTable) {
             if (!skipSqliteBlobUpdate) {
-              const table =
-                item.record_type === 'trajectory'
-                  ? 'trajectories'
-                  : item.record_type === 'note'
-                    ? 'notes'
-                    : 'summaries';
-              db.prepare(`UPDATE ${table} SET embedding = ? WHERE id = ?`).run(
+              db.prepare(`UPDATE ${blobTable} SET embedding = ? WHERE id = ?`).run(
                 blob,
                 item.record_id
               );
@@ -532,6 +626,9 @@ export async function createQdrantCollectionWithIndexes(
   const keywordFields = [
     'scope',
     'project_id',
+    'project_ancestors',
+    'user_id',
+    'entity_type',
     'record_type',
     'kind',
     'type',
@@ -612,8 +709,16 @@ export async function startReembed(options?: {
     const trajRows = db.prepare('SELECT id FROM trajectories').all() as Array<{ id: string }>;
     const obsRows = db.prepare('SELECT id FROM observations').all() as Array<{ id: string }>;
     const sumRows = db.prepare('SELECT id FROM summaries WHERE is_latest = 1').all() as Array<{ id: string }>;
+    const entityRows = db.prepare('SELECT id FROM entities').all() as Array<{ id: string }>;
+    const actionRows = db.prepare('SELECT id FROM actions').all() as Array<{ id: string }>;
 
-    activeReembedStatus.total = noteRows.length + trajRows.length + obsRows.length + sumRows.length;
+    activeReembedStatus.total =
+      noteRows.length +
+      trajRows.length +
+      obsRows.length +
+      sumRows.length +
+      entityRows.length +
+      actionRows.length;
 
     // Enqueue to embed_queue with target = newCollectionName in a single atomic transaction (CR-11)
     transaction(db, () => {
@@ -621,6 +726,8 @@ export async function startReembed(options?: {
       for (const r of trajRows) enqueueForEmbedding(r.id, 'trajectory', newCollectionName);
       for (const r of obsRows) enqueueForEmbedding(r.id, 'observation', newCollectionName);
       for (const r of sumRows) enqueueForEmbedding(r.id, 'summary', newCollectionName);
+      for (const r of entityRows) enqueueForEmbedding(r.id, 'entity', newCollectionName);
+      for (const r of actionRows) enqueueForEmbedding(r.id, 'action', newCollectionName);
     })();
 
     // Create new collection in Qdrant if reachable
@@ -713,13 +820,10 @@ export async function startReembed(options?: {
     // Apply deferred SQLite embedding BLOB updates and store_meta atomically on success
     transaction(db, () => {
       for (const item of deferredBlobs) {
-        const table =
-          item.record_type === 'trajectory'
-            ? 'trajectories'
-            : item.record_type === 'note'
-              ? 'notes'
-              : 'summaries';
-        db.prepare(`UPDATE ${table} SET embedding = ? WHERE id = ?`).run(item.blob, item.id);
+        const table = EMBEDDING_TABLE_BY_TYPE[item.record_type];
+        if (table) {
+          db.prepare(`UPDATE ${table} SET embedding = ? WHERE id = ?`).run(item.blob, item.id);
+        }
       }
       commitStoreMeta(recipe, aliasName);
     })();

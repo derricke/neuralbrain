@@ -7,7 +7,7 @@ import {
   serializeEmbedding,
 } from '../../learning/embedding';
 import { verifyOrCreateStoreMeta } from '../../learning/storeMeta';
-import { hybridSearch } from '../../learning/search';
+import { buildQdrantFilter, buildSafeFtsQuery, hybridSearch } from '../../learning/search';
 import * as embedWorker from '../../learning/embedWorker';
 import { createNote, getNotesByFile } from '../../memory/noteStore';
 import { captureObservations } from '../../memory/observationStore';
@@ -420,5 +420,138 @@ describe('hybridSearch', () => {
     } finally {
       qdrantSpy.mockRestore();
     }
+  });
+
+  it('builds safe FTS5 queries from punctuation and FTS operators without crashing hybridSearch', async () => {
+    expect(buildSafeFtsQuery('')).toBeNull();
+    expect(buildSafeFtsQuery('   --- /// ::: *** "" ')).toBeNull();
+    expect(buildSafeFtsQuery('AND OR NOT "src/lib/db.ts" foo:bar* foo')).toBe(
+      '"and" OR "or" OR "not" OR "src" OR "lib" OR "db" OR "ts" OR "foo" OR "bar"'
+    );
+
+    verifyOrCreateStoreMeta();
+    process.env.BRAIN_EMBED = 'none';
+
+    createNote({
+      scope: 'project',
+      projectId: 'acme/cogs',
+      type: 'bug',
+      title: 'Fix db.ts NOT OR crash',
+      content: 'Operator tokens in query must never trigger FTS5 syntax errors',
+    });
+
+    const res = await hybridSearch({
+      q: '"db.ts" NOT OR AND -crash/syntax:error*',
+      project_id: 'acme/cogs',
+      record_types: ['note'],
+    });
+    expect(res.results).toHaveLength(1);
+    expect(res.results[0].match_tier).toBe('exact');
+    expect(res.results[0].project_id).toBe('acme/cogs');
+  });
+
+  it('builds hierarchical Qdrant filters with ancestors, children, user_id, and entity_type', () => {
+    const ancestorFilter = buildQdrantFilter(
+      {
+        q: 'calendar',
+        project_id: 'acme/socials/calendar',
+        user_id: 'user-1',
+        filters: { entity_type: 'asset' },
+      },
+      ['entity'],
+      true
+    );
+    expect(ancestorFilter?.must).toContainEqual({ key: 'user_id', match: { value: 'user-1' } });
+    expect(ancestorFilter?.must).toContainEqual({ key: 'entity_type', match: { value: 'asset' } });
+    expect(ancestorFilter?.must).toContainEqual({
+      should: [
+        {
+          must: [
+            { key: 'scope', match: { value: 'project' } },
+            { key: 'project_id', match: { any: ['acme', 'acme/socials', 'acme/socials/calendar'] } },
+          ],
+        },
+        { key: 'scope', match: { value: 'global' } },
+      ],
+    });
+
+    const childFilter = buildQdrantFilter(
+      {
+        q: 'rollup',
+        project_id: 'acme',
+        include_children: true,
+        include_ancestors: false,
+      },
+      ['note'],
+      false,
+      ['acme/cogs', 'acme/socials']
+    );
+    expect(childFilter?.must).toContainEqual({ key: 'scope', match: { value: 'project' } });
+    expect(childFilter?.must).toContainEqual({
+      should: [
+        { key: 'project_id', match: { value: 'acme' } },
+        { key: 'project_ancestors', match: { value: 'acme' } },
+        { key: 'project_id', match: { any: ['acme/cogs', 'acme/socials'] } },
+      ],
+    });
+  });
+
+  it('filters notes by memory_layer intersected with filters.type', async () => {
+    process.env.BRAIN_EMBED = 'none';
+    verifyOrCreateStoreMeta();
+
+    const factNote = createNote({
+      scope: 'project',
+      projectId: 'acme/cogs',
+      type: 'fact',
+      title: 'Memory layer item fact',
+      content: 'Semantic fact memory layer item',
+    });
+    const prefNote = createNote({
+      scope: 'project',
+      projectId: 'acme/cogs',
+      type: 'preference',
+      title: 'Memory layer item pref',
+      content: 'Semantic preference memory layer item',
+    });
+    const patternNote = createNote({
+      scope: 'project',
+      projectId: 'acme/cogs',
+      type: 'pattern',
+      title: 'Memory layer item pattern',
+      content: 'Procedural pattern memory layer item',
+    });
+
+    const semanticRes = await hybridSearch({
+      q: 'memory layer item',
+      project_id: 'acme/cogs',
+      record_types: ['note'],
+      filters: { memory_layer: 'semantic' },
+    });
+    expect(semanticRes.results.map((r) => r.id).sort()).toEqual([factNote.id, prefNote.id].sort());
+
+    const proceduralRes = await hybridSearch({
+      q: 'memory layer item',
+      project_id: 'acme/cogs',
+      record_types: ['note'],
+      filters: { memory_layer: 'procedural' },
+    });
+    expect(proceduralRes.results.map((r) => r.id)).toEqual([patternNote.id]);
+
+    const intersectedRes = await hybridSearch({
+      q: 'memory layer item',
+      project_id: 'acme/cogs',
+      record_types: ['note'],
+      filters: { memory_layer: 'semantic', type: ['fact', 'pattern'] },
+    });
+    expect(intersectedRes.results.map((r) => r.id)).toEqual([factNote.id]);
+
+    const disjointRes = await hybridSearch({
+      q: 'memory layer item',
+      project_id: 'acme/cogs',
+      record_types: ['note'],
+      filters: { memory_layer: 'semantic', type: ['bug'] },
+    });
+    expect(disjointRes.results).toHaveLength(0);
   });
 });
