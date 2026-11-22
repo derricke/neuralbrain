@@ -8,6 +8,7 @@ data/*.txt
 data/qdrant/
 data/spool/
 data/models/
+data/bench/
 .env
 .env.local
 *.log

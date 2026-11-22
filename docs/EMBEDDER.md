@@ -78,7 +78,7 @@ Setting `BRAIN_EMBED=local-gpu` (or installing with `neuralbrain install --gpu`)
 **Operational Restrictions & Notes:**
 - **Cold Start & Image Pull**: The first `neuralbrain start` with `local-gpu` pulls `michaelf34/infinity:latest` (several GB) and downloads `nomic-ai/nomic-embed-text-v1.5` into `~/.neuralbrain/data/models`. Expect a 30–120s initial startup while the model loads into VRAM (~1–2 GB VRAM).
 - **Re-embed on Tier Switch**: Switching between `local` (CPU Q8 ONNX) and `local-gpu` (GPU ONNX/FP16) changes `store_meta.embed_tier` and produces slightly different vector spaces; `neuralbrain` will loudly require `POST /maintenance/reembed`.
-- **Overrides**: `BRAIN_GPU_PORT` (default `7997`), `BRAIN_GPU_ENDPOINT`, `BRAIN_GPU_IMAGE`, `BRAIN_GPU_MODEL_ID`, and `BRAIN_GPU_ENGINE` (`optimum` or `torch`) can be customized in `~/.neuralbrain/.env`.
+- **Overrides**: `BRAIN_GPU_PORT` (default `7997`), `BRAIN_GPU_ENDPOINT`, `BRAIN_GPU_IMAGE`, `BRAIN_GPU_MODEL_ID`, and `BRAIN_GPU_ENGINE` (`torch` default for CUDA GPU; `optimum` uses ONNX Runtime, which runs on CPU in `michaelf34/infinity:latest`) can be customized in `~/.neuralbrain/.env`.
 
 ---
 
