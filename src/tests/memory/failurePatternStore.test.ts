@@ -104,4 +104,85 @@ describe('failurePatternStore', () => {
     expect(patterns[0].error_text).not.toContain('ghp_');
     expect(patterns[0].error_text).toContain('[REDACTED_TOKEN]');
   });
+
+  it('stores user_id and agent_id, supports hierarchical scoping and userId filter, and attaches match_tier', () => {
+    upsertFailurePattern({
+      scope: 'project',
+      projectId: 'acme',
+      userId: 'alice',
+      agentId: 'claude',
+      taskType: 'build',
+      errorText: 'Root workspace build error',
+    });
+
+    upsertFailurePattern({
+      scope: 'project',
+      projectId: 'acme/socials',
+      userId: 'bob',
+      agentId: 'antigravity',
+      taskType: 'build',
+      errorText: 'Socials package build error',
+    });
+
+    upsertFailurePattern({
+      scope: 'project',
+      projectId: 'acme/socials/calendar',
+      agentId: 'cursor',
+      taskType: 'build',
+      errorText: 'Calendar module build error',
+    });
+
+    // Updating existing conflict coalesces user_id / agent_id
+    upsertFailurePattern({
+      scope: 'project',
+      projectId: 'acme/socials/calendar',
+      userId: 'alice',
+      taskType: 'build',
+      errorText: 'Calendar module build error',
+    });
+
+    upsertFailurePattern({
+      scope: 'global',
+      userId: 'alice',
+      agentId: 'claude',
+      taskType: 'build',
+      errorText: 'Global build failure',
+    });
+
+    const hier = getFailurePatterns({ projectId: 'acme/socials/calendar', taskType: 'build' });
+    const byError = new Map(hier.map((p) => [p.error_text, p]));
+    expect(byError.get('Calendar module build error')?.match_tier).toBe('exact');
+    expect(byError.get('Calendar module build error')?.user_id).toBe('alice');
+    expect(byError.get('Calendar module build error')?.agent_id).toBe('cursor');
+    expect(byError.get('Socials package build error')?.match_tier).toBe('ancestor');
+    expect(byError.get('Root workspace build error')?.match_tier).toBe('ancestor');
+    expect(byError.get('Global build failure')?.match_tier).toBe('global');
+
+    // includeAncestors=false excludes parent failures
+    const noAncestors = getFailurePatterns({
+      projectId: 'acme/socials/calendar',
+      includeAncestors: false,
+      includeGlobal: false,
+    });
+    expect(noAncestors.map((p) => p.error_text)).toEqual(['Calendar module build error']);
+
+    // includeChildren=true from parent picks up children
+    const withChildren = getFailurePatterns({
+      projectId: 'acme',
+      includeChildren: true,
+      includeGlobal: false,
+    });
+    expect(withChildren.find((p) => p.project_id === 'acme/socials/calendar')?.match_tier).toBe('child');
+
+    // userId filter filters by user_id and NEVER by agent_id
+    const aliceOnly = getFailurePatterns({
+      projectId: 'acme/socials/calendar',
+      userId: 'alice',
+    });
+    expect(aliceOnly.map((p) => p.error_text).sort()).toEqual([
+      'Calendar module build error',
+      'Global build failure',
+      'Root workspace build error',
+    ]);
+  });
 });

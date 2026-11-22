@@ -10,12 +10,16 @@ import {
   getSession,
   listSessions,
   getSessionDetails,
+  getLatestSessionSummary,
 } from '../../memory/sessionStore';
 import {
   createAction,
   getAction,
   listActions,
   getReadyActions,
+  getDueActions,
+  checkReminders,
+  ackReminders,
   updateAction,
 } from '../../memory/actionStore';
 import { createNote, getNote, listNotes } from '../../memory/noteStore';
@@ -645,6 +649,230 @@ describe('Phase 1+2: Sessions, Next Actions, Provenance, and Lesson Notes', () =
       expect(limited?.observations[0].output?.endsWith('... [truncated]')).toBe(true);
       expect(limited?.notes).toHaveLength(1);
       expect('embedding' in limited!.notes[0]).toBe(false);
+    });
+  });
+
+  describe('Hierarchical scoping, reminders, recurrence, and user_id/agent_id', () => {
+    it('supports user_id/agent_id, hierarchical listSessions, and ancestor fallback in getLatestSessionSummary', () => {
+      startSession({
+        id: 'sess-root',
+        scope: 'project',
+        project_id: 'acme',
+        user_id: 'alice',
+        agent_id: 'claude',
+      });
+      endSession('sess-root', { status: 'completed', summary: 'Root summary' });
+
+      startSession({
+        id: 'sess-mid',
+        scope: 'project',
+        project_id: 'acme/socials',
+        user_id: 'bob',
+        agent_id: 'cursor',
+      });
+      endSession('sess-mid', { status: 'completed', summary: 'Mid summary' });
+
+      startSession({
+        id: 'sess-global',
+        scope: 'global',
+        user_id: 'alice',
+        agent_id: 'claude',
+      });
+
+      // Default listSessions({ projectId }) includes ancestors and excludes global
+      const forLeaf = listSessions({ projectId: 'acme/socials/calendar' });
+      expect(forLeaf.map((s) => s.id).sort()).toEqual(['sess-mid', 'sess-root']);
+      expect(forLeaf.every((s) => s.match_tier === 'ancestor')).toBe(true);
+
+      // includeGlobal=true includes global sessions
+      const withGlobal = listSessions({ projectId: 'acme/socials/calendar', includeGlobal: true });
+      expect(withGlobal.find((s) => s.id === 'sess-global')?.match_tier).toBe('global');
+
+      // userId filter without projectId returns user's sessions across projects and global
+      const aliceSessions = listSessions({ userId: 'alice' });
+      expect(aliceSessions.map((s) => s.id).sort()).toEqual(['sess-global', 'sess-root']);
+
+      // getLatestSessionSummary falls back through closest ancestor unless includeAncestors=false
+      expect(getLatestSessionSummary('acme/socials/calendar')?.id).toBe('sess-mid');
+      expect(
+        getLatestSessionSummary('acme/socials/calendar', { includeAncestors: false })
+      ).toBeNull();
+
+      // Exact project wins over ancestor
+      startSession({
+        id: 'sess-leaf',
+        scope: 'project',
+        project_id: 'acme/socials/calendar',
+        user_id: 'alice',
+      });
+      endSession('sess-leaf', { status: 'completed', summary: 'Leaf summary' });
+      expect(getLatestSessionSummary('acme/socials/calendar')?.id).toBe('sess-leaf');
+    });
+
+    it('creates actions with reminder fields, omits embedding BLOB, and enqueues for embedding on create and text/status updates', () => {
+      const db = getDb();
+      const act = createAction({
+        scope: 'project',
+        project_id: 'acme/cogs',
+        user_id: 'alice',
+        agent_id: 'claude',
+        title: 'Rotate staging key',
+        due_at: '2026-11-23T10:00:00-02:00',
+        remind_at: '2026-11-23T09:30:00-02:00',
+        recurrence: '@daily',
+      });
+
+      expect(act.user_id).toBe('alice');
+      expect(act.agent_id).toBe('claude');
+      expect(act.due_at).toBe('2026-11-23T12:00:00.000Z');
+      expect(act.remind_at).toBe('2026-11-23T11:30:00.000Z');
+      expect(act.recurrence).toBe('0 0 * * *');
+      expect('embedding' in act).toBe(false);
+
+      const queueRow = db
+        .prepare("SELECT status FROM embed_queue WHERE record_id = ? AND record_type = 'action'")
+        .get(act.id) as { status: string } | undefined;
+      expect(queueRow?.status).toBe('pending');
+
+      // Mark queue done, verify snooze_until update does NOT re-enqueue while title update DOES
+      db.prepare("UPDATE embed_queue SET status = 'done' WHERE record_id = ?").run(act.id);
+      updateAction(act.id, { snooze_until: '2026-11-23T11:45:00Z' });
+      const afterSnooze = db
+        .prepare("SELECT status FROM embed_queue WHERE record_id = ? AND record_type = 'action'")
+        .get(act.id) as { status: string };
+      expect(afterSnooze.status).toBe('done');
+
+      updateAction(act.id, { title: 'Rotate staging key immediately' });
+      const afterTitle = db
+        .prepare("SELECT status FROM embed_queue WHERE record_id = ? AND record_type = 'action'")
+        .get(act.id) as { status: string };
+      expect(afterTitle.status).toBe('pending');
+
+      // Verify embedding BLOB is never returned even when populated in SQLite
+      db.prepare('UPDATE actions SET embedding = ? WHERE id = ?').run(
+        Buffer.from(new Float32Array([1, 2, 3, 4]).buffer),
+        act.id
+      );
+      expect('embedding' in getAction(act.id)!).toBe(false);
+      expect('embedding' in listActions({ projectId: 'acme/cogs' })[0]).toBe(false);
+
+      expect(() =>
+        createAction({
+          scope: 'global',
+          title: 'Invalid recurrence',
+          recurrence: 'every other blue moon',
+        })
+      ).toThrow(/Cron expression|Invalid/);
+    });
+
+    it('supports getDueActions, checkReminders (dryRun + cooldown), ackReminders, and snooze_until', () => {
+      const past2h = new Date(Date.now() - 2 * 3_600_000).toISOString();
+      const past1h = new Date(Date.now() - 3_600_000).toISOString();
+      const future2h = new Date(Date.now() + 2 * 3_600_000).toISOString();
+
+      const overdueAct = createAction({
+        scope: 'project',
+        project_id: 'acme',
+        user_id: 'alice',
+        title: 'Overdue ancestor action',
+        priority: 'normal',
+        due_at: past1h,
+        remind_at: past2h,
+      });
+
+      const remindedOnlyAct = createAction({
+        scope: 'project',
+        project_id: 'acme/socials',
+        user_id: 'alice',
+        title: 'Upcoming due with past remind_at',
+        priority: 'urgent',
+        due_at: future2h,
+        remind_at: past1h,
+      });
+
+      const snoozedAct = createAction({
+        scope: 'project',
+        project_id: 'acme/socials',
+        title: 'Snoozed action',
+        due_at: past2h,
+        snooze_until: future2h,
+      });
+
+      const due = getDueActions({ projectId: 'acme/socials/calendar', userId: 'alice' });
+      expect(due.map((a) => a.id)).toEqual([overdueAct.id, remindedOnlyAct.id]);
+      expect(due[0].overdue).toBe(true);
+      expect(due[0].match_tier).toBe('ancestor');
+      expect(due[1].overdue).toBe(false);
+      expect(due.some((a) => a.id === snoozedAct.id)).toBe(false);
+
+      // listActions dueOnly and before
+      const listedDue = listActions({ projectId: 'acme/socials/calendar', dueOnly: true });
+      expect(listedDue.map((a) => a.id)).toEqual([remindedOnlyAct.id, overdueAct.id]);
+
+      // dryRun check does not stamp last_reminded_at
+      const dryRes = checkReminders({ projectId: 'acme/socials/calendar', dryRun: true });
+      expect(dryRes.marked_count).toBe(0);
+      expect(dryRes.reminders).toHaveLength(2);
+      expect(getAction(overdueAct.id)?.last_reminded_at).toBeNull();
+
+      // real check stamps last_reminded_at
+      const checkRes = checkReminders({ projectId: 'acme/socials/calendar' });
+      expect(checkRes.marked_count).toBe(2);
+      expect(getAction(overdueAct.id)?.last_reminded_at).not.toBeNull();
+
+      // subsequent check without cooldown returns empty
+      expect(checkReminders({ projectId: 'acme/socials/calendar' }).reminders).toHaveLength(0);
+
+      // with large cooldown still skipped; after backdating last_reminded_at, cooldown allows re-remind
+      expect(
+        checkReminders({ projectId: 'acme/socials/calendar', cooldownMs: 60_000 }).reminders
+      ).toHaveLength(0);
+
+      const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000).toISOString();
+      const acked = ackReminders([overdueAct.id], twoHoursAgo);
+      expect(acked.updated).toBe(1);
+      expect(acked.reminded_at).toBe(twoHoursAgo);
+
+      const reReminded = checkReminders({
+        projectId: 'acme/socials/calendar',
+        cooldownMs: 3_600_000,
+      });
+      expect(reReminded.reminders.map((r) => r.id)).toEqual([overdueAct.id]);
+    });
+
+    it('spawns next_occurrence with preserved lead offset when completing a recurring action', () => {
+      const db = getDb();
+      const recurring = createAction({
+        scope: 'project',
+        project_id: 'acme/cogs',
+        user_id: 'alice',
+        agent_id: 'claude',
+        title: 'Weekly digest',
+        description: 'Send team digest',
+        priority: 'high',
+        due_at: '2026-11-22T10:00:00.000Z',
+        remind_at: '2026-11-22T09:30:00.000Z',
+        recurrence: 'P1W',
+      });
+
+      const updated = updateAction(recurring.id, { status: 'done' });
+      expect(updated?.status).toBe('done');
+      expect(updated?.next_occurrence).toBeDefined();
+      const next = updated!.next_occurrence!;
+      expect(next.parent_action_id).toBe(recurring.id);
+      expect(next.status).toBe('ready');
+      expect(next.user_id).toBe('alice');
+      expect(next.agent_id).toBe('claude');
+      expect(next.recurrence).toBe('P1W');
+      expect(next.due_at).toBe('2026-11-29T10:00:00.000Z');
+      expect(next.remind_at).toBe('2026-11-29T09:30:00.000Z');
+      expect(next.last_reminded_at).toBeNull();
+      expect(next.snooze_until).toBeNull();
+
+      const qRow = db
+        .prepare("SELECT status FROM embed_queue WHERE record_id = ? AND record_type = 'action'")
+        .get(next.id) as { status: string } | undefined;
+      expect(qRow?.status).toBe('pending');
     });
   });
 });

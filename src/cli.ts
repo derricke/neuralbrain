@@ -18,6 +18,7 @@ import {
 } from './lib/brainHome';
 import { createLocalTlsFetch, ensureLocalTlsCerts, getDefaultCertsDir } from './lib/tls';
 import { resolveCanonicalProjectId, writeBrainRc } from './lib/projectSlug';
+import { parseDurationMs } from './lib/recurrence';
 import { normalizeProjectId } from './lib/scope';
 import {
   installAgentIntegration,
@@ -931,16 +932,29 @@ export interface InitResult {
 }
 
 /**
- * `neuralbrain init [project-id] [--force]`: writes .brainrc in `cwd` so every
- * agent working anywhere below it records the same project_id.
+ * `neuralbrain init [project-id] [--force] [--auto-subproject] [--max-depth <n>]`:
+ * writes .brainrc in `cwd` so every agent working anywhere below it records the same project_id.
  *
  * Defaults to the folder's own name. An existing .brainrc is kept unless
  * `force` is set. An explicit id that is not a valid project_id is an error,
  * never silently replaced.
  */
-export function runInit(options: { cwd: string; projectId?: string; force?: boolean }): InitResult {
+export function runInit(options: {
+  cwd: string;
+  projectId?: string;
+  force?: boolean;
+  autoSubproject?: boolean;
+  maxDepth?: number;
+}): InitResult {
   const cwd = path.resolve(options.cwd);
   const filePath = path.join(cwd, '.brainrc');
+
+  if (
+    options.maxDepth !== undefined &&
+    (!Number.isInteger(options.maxDepth) || options.maxDepth <= 0)
+  ) {
+    throw new Error('--max-depth must be a positive integer');
+  }
 
   let explicit: string | undefined;
   if (options.projectId !== undefined) {
@@ -962,21 +976,59 @@ export function runInit(options: { cwd: string; projectId?: string; force?: bool
     return { filePath, projectId: existing ?? '', written: false, enclosingProjectId: null };
   }
 
-  const written = writeBrainRc(cwd, explicit);
+  const written = writeBrainRc(cwd, explicit, {
+    autoSubproject: options.autoSubproject,
+    maxDepth: options.maxDepth,
+  });
   const enclosingProjectId = gitOrParent && gitOrParent !== written.projectId ? gitOrParent : null;
   return { filePath: written.filePath, projectId: written.projectId, written: true, enclosingProjectId };
 }
 
 function cmdInit(argv: string[]): void {
-  const force = argv.includes('--force') || argv.includes('-f');
-  const positional = argv.filter((a) => !a.startsWith('-'));
+  let force = false;
+  let autoSubproject = false;
+  let maxDepth: number | undefined;
+  const positional: string[] = [];
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--force' || arg === '-f') {
+      force = true;
+    } else if (arg === '--auto-subproject') {
+      autoSubproject = true;
+    } else if (arg === '--max-depth' || arg.startsWith('--max-depth=')) {
+      const raw = arg.startsWith('--max-depth=') ? arg.slice('--max-depth='.length) : argv[++i];
+      if (!raw || raw.startsWith('-')) {
+        console.error('Missing value for --max-depth');
+        process.exit(1);
+      }
+      const parsed = Number(raw);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        console.error(`Invalid --max-depth '${raw}': must be a positive integer`);
+        process.exit(1);
+      }
+      maxDepth = parsed;
+    } else if (arg.startsWith('-')) {
+      console.error(`Unknown option for init: ${arg}`);
+      process.exit(1);
+    } else {
+      positional.push(arg);
+    }
+  }
+
   if (positional.length > 1) {
-    console.error('Usage: neuralbrain init [project-id] [--force]');
+    console.error('Usage: neuralbrain init [project-id] [--force] [--auto-subproject] [--max-depth <n>]');
     process.exit(1);
   }
   let result: InitResult;
   try {
-    result = runInit({ cwd: process.cwd(), projectId: positional[0], force });
+    result = runInit({
+      cwd: process.cwd(),
+      projectId: positional[0],
+      force,
+      autoSubproject,
+      maxDepth,
+    });
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
@@ -988,6 +1040,11 @@ function cmdInit(argv: string[]): void {
   }
   console.log(`Wrote ${result.filePath}`);
   console.log(`project_id: ${result.projectId}`);
+  if (autoSubproject) {
+    console.log(
+      `auto_subproject: true${maxDepth !== undefined ? ` (max_depth: ${maxDepth})` : ''}`
+    );
+  }
   if (result.enclosingProjectId) {
     console.log(
       `Note: this folder was part of project "${result.enclosingProjectId}". ` +
@@ -995,6 +1052,292 @@ function cmdInit(argv: string[]): void {
         'If that was not intended, delete the file or run init in the project root.'
     );
   }
+}
+
+export interface RemindersCheckOptions {
+  json?: boolean;
+  webhookUrl?: string;
+  webhook?: string;
+  projectId?: string;
+  project?: string;
+  includeAncestors?: boolean;
+  includeChildren?: boolean;
+  includeGlobal?: boolean;
+  cooldownMs?: number;
+  cooldown?: string;
+  dryRun?: boolean;
+  limit?: number;
+  apiUrl?: string;
+  apiKey?: string;
+  fetchFn?: typeof fetch;
+}
+
+export interface RemindersCheckResult {
+  checked_at: string;
+  reminders: any[];
+  marked_count: number;
+  acked_count?: number;
+  webhook_delivered?: boolean;
+  webhook_status?: number;
+  output: string;
+}
+
+function validateWebhookUrl(raw: string): string {
+  const val = raw.trim();
+  if (!/^https?:\/\//i.test(val)) {
+    throw new Error(`Invalid --webhook URL '${val}': must start with http:// or https://`);
+  }
+  try {
+    new URL(val);
+  } catch {
+    throw new Error(`Invalid --webhook URL '${val}'`);
+  }
+  return val;
+}
+
+export function parseRemindersArgs(argv: string[]): RemindersCheckOptions {
+  const opts: RemindersCheckOptions = {
+    json: false,
+    includeAncestors: true,
+    includeChildren: false,
+    includeGlobal: true,
+    dryRun: false,
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    const eqIdx = arg.indexOf('=');
+    const flag = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
+    const inlineVal = eqIdx !== -1 ? arg.slice(eqIdx + 1) : undefined;
+
+    const takeValue = (name: string): string => {
+      if (inlineVal !== undefined) {
+        if (!inlineVal) throw new Error(`Missing value for ${name}`);
+        return inlineVal;
+      }
+      const next = argv[++i];
+      if (!next || next.startsWith('--')) {
+        throw new Error(`Missing value for ${name}`);
+      }
+      return next;
+    };
+
+    if (flag === '--json') {
+      opts.json = true;
+    } else if (flag === '--include-children') {
+      opts.includeChildren = true;
+    } else if (flag === '--no-ancestors') {
+      opts.includeAncestors = false;
+    } else if (flag === '--no-global') {
+      opts.includeGlobal = false;
+    } else if (flag === '--dry-run') {
+      opts.dryRun = true;
+    } else if (flag === '--webhook') {
+      opts.webhookUrl = validateWebhookUrl(takeValue('--webhook'));
+    } else if (flag === '--project') {
+      const val = takeValue('--project').trim();
+      const norm = normalizeProjectId(val);
+      if (!norm.ok) {
+        throw new Error(`Invalid --project '${val}': ${norm.error}`);
+      }
+      opts.projectId = norm.projectId;
+    } else if (flag === '--cooldown') {
+      const val = takeValue('--cooldown').trim();
+      const ms = parseDurationMs(val);
+      if (ms === null) {
+        throw new Error(`Invalid --cooldown duration '${val}' (examples: 30m, 2h, 1d, PT15M)`);
+      }
+      opts.cooldownMs = ms;
+      opts.cooldown = val;
+    } else if (flag === '--limit') {
+      const val = takeValue('--limit').trim();
+      const parsed = Number(val);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        throw new Error(`Invalid --limit '${val}': must be a positive integer`);
+      }
+      opts.limit = parsed;
+    } else {
+      throw new Error(`Unknown option: ${arg}`);
+    }
+  }
+
+  return opts;
+}
+
+function formatRemindersHuman(result: Omit<RemindersCheckResult, 'output'>): string {
+  if (result.reminders.length === 0) {
+    return `No due reminders (checked at ${result.checked_at}).`;
+  }
+  const lines = [`Due reminders (${result.reminders.length}, checked at ${result.checked_at}):`];
+  for (const r of result.reminders) {
+    const overdueTag = r.overdue ? '[OVERDUE] ' : '';
+    const prio = r.priority ? `[${String(r.priority).toUpperCase()}] ` : '';
+    const when = r.due_at ? `due ${r.due_at}` : r.remind_at ? `remind ${r.remind_at}` : '';
+    const loc = r.project_id ? `${r.scope}:${r.project_id}` : r.scope;
+    const tier = r.match_tier ? ` [${r.match_tier}]` : '';
+    lines.push(`- ${overdueTag}${prio}${r.title} (${r.id}, ${loc}${tier}${when ? `, ${when}` : ''})`);
+  }
+  const statusBits = [`marked=${result.marked_count}`];
+  if (result.webhook_delivered !== undefined) {
+    statusBits.push(`webhook_delivered=${result.webhook_delivered}`);
+  }
+  if (result.acked_count !== undefined) {
+    statusBits.push(`acked=${result.acked_count}`);
+  }
+  lines.push(`Summary: ${statusBits.join(', ')}`);
+  return lines.join('\n');
+}
+
+export async function runRemindersCheck(
+  options: RemindersCheckOptions = {}
+): Promise<RemindersCheckResult> {
+  const rawWebhook = options.webhookUrl !== undefined ? options.webhookUrl : options.webhook;
+  const webhookUrl = rawWebhook !== undefined && rawWebhook !== null ? validateWebhookUrl(rawWebhook) : undefined;
+
+  let projectId: string | undefined;
+  const rawProject = options.projectId !== undefined ? options.projectId : options.project;
+  if (rawProject !== undefined && rawProject !== null && rawProject.trim() !== '') {
+    const norm = normalizeProjectId(rawProject.trim());
+    if (!norm.ok) {
+      throw new Error(`Invalid project_id '${rawProject}': ${norm.error}`);
+    }
+    projectId = norm.projectId;
+  }
+
+  let cooldownMs: number | undefined = options.cooldownMs;
+  if (cooldownMs !== undefined) {
+    if (typeof cooldownMs !== 'number' || !Number.isFinite(cooldownMs) || cooldownMs < 0) {
+      throw new Error('cooldownMs must be a non-negative finite number');
+    }
+  } else if (options.cooldown !== undefined) {
+    const parsed = parseDurationMs(options.cooldown);
+    if (parsed === null) {
+      throw new Error(`Invalid --cooldown duration '${options.cooldown}'`);
+    }
+    cooldownMs = parsed;
+  }
+
+  if (options.limit !== undefined && (!Number.isInteger(options.limit) || options.limit <= 0)) {
+    throw new Error('limit must be a positive integer');
+  }
+
+  const packageRoot = getPackageRoot();
+  const apiUrl = (
+    options.apiUrl || resolveApiUrl({}, packageRoot, process.cwd(), os.homedir())
+  ).replace(/\/+$/, '');
+  const apiKey =
+    options.apiKey !== undefined
+      ? options.apiKey
+      : resolveApiKey({}, packageRoot, process.cwd(), os.homedir());
+  const fetchFn = options.fetchFn || createLocalTlsFetch();
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+
+  const dryRun = Boolean(options.dryRun);
+  const checkPayload: Record<string, unknown> = {
+    include_ancestors: options.includeAncestors ?? true,
+    include_children: options.includeChildren ?? false,
+    include_global: options.includeGlobal ?? true,
+    dry_run: webhookUrl ? true : dryRun,
+  };
+  if (projectId) checkPayload.project_id = projectId;
+  if (cooldownMs !== undefined) checkPayload.cooldown_ms = cooldownMs;
+  if (options.limit !== undefined) checkPayload.limit = options.limit;
+
+  const checkRes = await fetchFn(`${apiUrl}/actions/reminders/check`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(checkPayload),
+  });
+
+  const checkData = (await checkRes.json().catch(() => ({}))) as any;
+  if (!checkRes.ok) {
+    throw new Error(
+      `Reminders check failed (${checkRes.status}): ${checkData?.error?.message || JSON.stringify(checkData)}`
+    );
+  }
+
+  const checkedAt = typeof checkData.checked_at === 'string' ? checkData.checked_at : new Date().toISOString();
+  const reminders = Array.isArray(checkData.reminders) ? checkData.reminders : [];
+  let markedCount = typeof checkData.marked_count === 'number' ? checkData.marked_count : 0;
+  let ackedCount: number | undefined;
+  let webhookDelivered: boolean | undefined;
+  let webhookStatus: number | undefined;
+
+  if (webhookUrl && reminders.length > 0) {
+    const webhookRes = await fetchFn(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'neuralbrain.reminders.due',
+        checked_at: checkedAt,
+        count: reminders.length,
+        reminders,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    webhookStatus = webhookRes.status;
+    if (!webhookRes.ok) {
+      throw new Error(`Webhook delivery failed with status ${webhookRes.status}`);
+    }
+    webhookDelivered = true;
+
+    if (!dryRun) {
+      const ackRes = await fetchFn(`${apiUrl}/actions/reminders/ack`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ ids: reminders.map((r: any) => r.id) }),
+      });
+      const ackData = (await ackRes.json().catch(() => ({}))) as any;
+      if (!ackRes.ok) {
+        throw new Error(
+          `Reminders ack failed (${ackRes.status}): ${ackData?.error?.message || JSON.stringify(ackData)}`
+        );
+      }
+      ackedCount = typeof ackData.updated === 'number' ? ackData.updated : reminders.length;
+      markedCount = ackedCount ?? reminders.length;
+    }
+  } else if (webhookUrl) {
+    webhookDelivered = false;
+  }
+
+  const summaryData: Omit<RemindersCheckResult, 'output'> = {
+    checked_at: checkedAt,
+    reminders,
+    marked_count: markedCount,
+    ...(ackedCount !== undefined ? { acked_count: ackedCount } : {}),
+    ...(webhookDelivered !== undefined ? { webhook_delivered: webhookDelivered } : {}),
+    ...(webhookStatus !== undefined ? { webhook_status: webhookStatus } : {}),
+  };
+
+  const output = options.json
+    ? JSON.stringify(summaryData, null, 2)
+    : formatRemindersHuman(summaryData);
+
+  return {
+    ...summaryData,
+    output,
+  };
+}
+
+async function cmdReminders(argv: string[]): Promise<void> {
+  const action = argv[0];
+  if (!action || action === '-h' || action === '--help' || action === 'help') {
+    printHelp();
+    return;
+  }
+  if (action !== 'check') {
+    console.error(`Unknown reminders subcommand '${action}'. Expected: check`);
+    process.exit(1);
+  }
+  loadBrainEnv();
+  const opts = parseRemindersArgs(argv.slice(1));
+  const result = await runRemindersCheck(opts);
+  console.log(result.output);
 }
 
 function printHelp(): void {
@@ -1017,8 +1360,20 @@ Commands:
   doctor          Run health and AI conformance diagnostics
   install-agent   Configure Antigravity, Claude Code, Cursor, or project rules
   init            Write .brainrc here so agents use one project_id for this folder
-    [project-id]    Defaults to this folder's name
+    [project-id]    Defaults to this folder's name (supports hierarchical a/b/c)
     --force, -f     Replace an existing .brainrc
+    --auto-subproject Derive subproject segments from subfolder path below .brainrc
+    --max-depth <n> Limit auto-subproject depth below .brainrc
+  reminders check Check due/overdue action reminders via Brain HTTP API
+    --json          Print machine-readable JSON output
+    --webhook <url> POST due reminders payload to http(s) webhook before acking
+    --project <id>  Filter reminders to project_id
+    --include-children Include child subprojects under --project
+    --no-ancestors  Exclude ancestor projects when --project is set
+    --no-global     Exclude global-scoped actions
+    --cooldown <d>  Minimum interval before re-notifying (e.g. 30m, 2h, PT15M)
+    --dry-run       Evaluate without stamping last_reminded_at
+    --limit <n>     Max reminders to return
   rename-project  Rename a project_id across SQLite and Qdrant (<from> <to>)
   mcp             Start the stdio MCP server
 `);
@@ -1071,6 +1426,10 @@ async function main(): Promise<void> {
   }
   if (sub === 'init') {
     cmdInit(args.slice(1));
+    return;
+  }
+  if (sub === 'reminders') {
+    await cmdReminders(args.slice(1));
     return;
   }
   if (sub === 'rename-project') {

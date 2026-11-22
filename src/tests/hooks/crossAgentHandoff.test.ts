@@ -448,6 +448,93 @@ describe('Phase 2: Cross-Agent Handoff, MCP Action Tools, Hooks, and BRAIN_HOME'
         agent_name: 'antigravity',
       });
     });
+
+    it('formats data.due_actions as top DUE / OVERDUE ACTIONS block before READY NEXT ACTIONS', async () => {
+      const mockFetch = async (url: string) => {
+        if (url.endsWith('/sessions/start')) {
+          return {
+            ok: true,
+            status: 201,
+            json: async () => ({ session: { id: 'sess-due-1' } }),
+          };
+        }
+        if (url.includes('/inject?')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              due_actions: [
+                {
+                  id: 'act_due_1',
+                  title: 'Renew API token',
+                  priority: 'urgent',
+                  due_at: '2026-11-22T08:00:00.000Z',
+                  overdue: true,
+                  match_tier: 'ancestor',
+                  project_id: 'acme',
+                },
+                {
+                  id: 'act_due_2',
+                  title: 'Check global backups',
+                  priority: 'normal',
+                  remind_at: '2026-11-22T09:00:00.000Z',
+                  overdue: false,
+                  match_tier: 'global',
+                  project_id: null,
+                },
+              ],
+              ready_actions: [
+                {
+                  id: 'act_ready_1',
+                  title: 'Normal task',
+                  priority: 'normal',
+                  status: 'ready',
+                },
+              ],
+            }),
+          };
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      };
+
+      const result = await sessionStartHook.runSessionStart(
+        { session_id: 'sess-due-1', cwd: '/tmp/acme' },
+        { apiUrl: 'http://127.0.0.1:3000', projectId: 'acme/cogs', fetchFn: mockFetch }
+      );
+
+      const sysMsg = result.systemMessage as string;
+      expect(sysMsg).toContain('DUE / OVERDUE ACTIONS:');
+      expect(sysMsg).toContain('[OVERDUE] [URGENT] Renew API token (due 2026-11-22T08:00:00.000Z) [ancestor: acme]');
+      expect(sysMsg).toContain('[NORMAL] Check global backups (remind 2026-11-22T09:00:00.000Z) [global]');
+      expect(sysMsg.indexOf('DUE / OVERDUE ACTIONS:')).toBeLessThan(
+        sysMsg.indexOf('READY NEXT ACTIONS:')
+      );
+    });
+
+    it('inline fallback resolveProjectId in all 3 hooks handles auto_subproject and max_depth when helpers are absent', () => {
+      const { spawnSync } = require('child_process');
+      const tmp = makeTempBrainHome();
+      const workspace = path.join(tmp, 'acme');
+      const sub = path.join(workspace, 'Socials', 'Calendar App', 'v1');
+      fs.mkdirSync(sub, { recursive: true });
+      fs.writeFileSync(
+        path.join(workspace, '.brainrc'),
+        JSON.stringify({ project_id: 'acme', auto_subproject: true, max_depth: 2 }),
+        'utf-8'
+      );
+
+      for (const hookName of ['sessionStart.js', 'postToolUse.js', 'sessionStop.js']) {
+        const isolatedHook = path.join(tmp, hookName);
+        fs.copyFileSync(path.resolve(__dirname, '../../../plugin/hooks', hookName), isolatedHook);
+        const res = spawnSync(
+          process.execPath,
+          ['-e', `const h = require(${JSON.stringify(isolatedHook)}); console.log(h.resolveProjectId(${JSON.stringify(sub)}));`],
+          { encoding: 'utf8' }
+        );
+        expect(res.status).toBe(0);
+        expect(res.stdout.trim()).toBe('acme/socials/calendar-app');
+      }
+    });
   });
 
   describe('plugin/hooks/sessionStop.js', () => {

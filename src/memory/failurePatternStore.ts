@@ -2,7 +2,12 @@ import { randomUUID } from 'crypto';
 import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
 import { redactSecrets } from '../lib/redactSecrets';
-import { resolveScope } from '../lib/scope';
+import {
+  buildHierarchicalScopeSql,
+  classifyMatchTier,
+  MatchTier,
+  resolveScope,
+} from '../lib/scope';
 import { transaction } from '../lib/sqlite';
 
 export type FailureScope = 'project' | 'global' | 'unknown';
@@ -43,17 +48,24 @@ export interface FailurePattern {
   id: string;
   scope: FailureScope;
   project_id: string | null;
+  user_id?: string | null;
+  agent_id?: string | null;
   session_id: string | null;
   task_type: string;
   error_text: string;
   count: number;
   first_seen_at: number;
   last_seen_at: number;
+  match_tier?: MatchTier;
 }
 
 export function upsertFailurePattern(params: {
   scope: FailureScope;
   projectId?: string | null;
+  userId?: string | null;
+  user_id?: string | null;
+  agentId?: string | null;
+  agent_id?: string | null;
   sessionId?: string | null;
   session_id?: string | null;
   taskType?: string | null;
@@ -63,6 +75,8 @@ export function upsertFailurePattern(params: {
   const taskType = params.taskType?.trim() || 'unknown';
   const cleanErrorText = sanitizeErrorText(params.errorText);
   const sessionId = (params.sessionId ?? params.session_id)?.trim() || null;
+  const userId = (params.userId ?? params.user_id)?.trim() || null;
+  const agentId = (params.agentId ?? params.agent_id)?.trim() || null;
 
   // Normalised here too, or the UNIQUE(project_id, task_type, error_text) key
   // would split one project's failure counts across spellings of its name —
@@ -83,16 +97,27 @@ export function upsertFailurePattern(params: {
       // For project-scoped rows, project_id is NOT NULL, so standard UNIQUE(project_id, task_type, error_text) applies
       const newId = randomUUID();
       const stmt = db.prepare(`
-        INSERT INTO failure_patterns (id, scope, project_id, session_id, task_type, error_text, count, first_seen_at, last_seen_at)
-        VALUES (?, ?, ?, ?, ?, ?, 1, unixepoch(), unixepoch())
+        INSERT INTO failure_patterns (id, scope, project_id, user_id, agent_id, session_id, task_type, error_text, count, first_seen_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, unixepoch(), unixepoch())
         ON CONFLICT(project_id, task_type, error_text) DO UPDATE SET
           count = failure_patterns.count + 1,
+          user_id = COALESCE(excluded.user_id, failure_patterns.user_id),
+          agent_id = COALESCE(excluded.agent_id, failure_patterns.agent_id),
           session_id = COALESCE(excluded.session_id, failure_patterns.session_id),
           last_seen_at = unixepoch()
         RETURNING id
       `);
 
-      const result = stmt.get(newId, scoped.scope, projectId, sessionId, taskType, cleanErrorText) as { id: string } | undefined;
+      const result = stmt.get(
+        newId,
+        scoped.scope,
+        projectId,
+        userId,
+        agentId,
+        sessionId,
+        taskType,
+        cleanErrorText
+      ) as { id: string } | undefined;
       return result?.id ?? newId;
     } else {
       // For global or unknown scope, project_id IS NULL.
@@ -110,17 +135,19 @@ export function upsertFailurePattern(params: {
           db.prepare(`
             UPDATE failure_patterns
             SET count = count + 1,
+                user_id = COALESCE(?, user_id),
+                agent_id = COALESCE(?, agent_id),
                 session_id = COALESCE(?, session_id),
                 last_seen_at = unixepoch()
             WHERE id = ?
-          `).run(sessionId, existing.id);
+          `).run(userId, agentId, sessionId, existing.id);
           return existing.id;
         } else {
           const newId = randomUUID();
           db.prepare(`
-            INSERT INTO failure_patterns (id, scope, project_id, session_id, task_type, error_text, count, first_seen_at, last_seen_at)
-            VALUES (?, ?, NULL, ?, ?, ?, 1, unixepoch(), unixepoch())
-          `).run(newId, scoped.scope, sessionId, taskType, cleanErrorText);
+            INSERT INTO failure_patterns (id, scope, project_id, user_id, agent_id, session_id, task_type, error_text, count, first_seen_at, last_seen_at)
+            VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 1, unixepoch(), unixepoch())
+          `).run(newId, scoped.scope, userId, agentId, sessionId, taskType, cleanErrorText);
           return newId;
         }
       });
@@ -145,31 +172,25 @@ export function upsertFailurePattern(params: {
 export function getFailurePatterns(params: {
   projectId?: string | null;
   taskType?: string | null;
+  includeAncestors?: boolean;
+  includeChildren?: boolean;
   includeGlobal?: boolean;
+  userId?: string | null;
   limit?: number;
 }): FailurePattern[] {
   const db = getDb();
   const conditions: string[] = [];
   const queryParams: unknown[] = [];
 
-  const projectId = params.projectId?.trim() || null;
-  const includeGlobal = params.includeGlobal !== false;
-
-  if (projectId) {
-    if (includeGlobal) {
-      conditions.push("((project_id = ? AND scope = 'project') OR scope = 'global')");
-      queryParams.push(projectId);
-    } else {
-      conditions.push("(project_id = ? AND scope = 'project')");
-      queryParams.push(projectId);
-    }
-  } else if (!projectId) {
-    if (includeGlobal) {
-      conditions.push("(scope = 'global')");
-    } else {
-      conditions.push("1 = 0");
-    }
-  }
+  const scopeSql = buildHierarchicalScopeSql({
+    projectId: params.projectId,
+    includeAncestors: params.includeAncestors ?? true,
+    includeChildren: params.includeChildren ?? false,
+    includeGlobal: params.includeGlobal !== false,
+    userId: params.userId,
+  });
+  conditions.push(scopeSql.clause);
+  queryParams.push(...scopeSql.params);
 
   if (params.taskType) {
     conditions.push('task_type = ?');
@@ -181,15 +202,20 @@ export function getFailurePatterns(params: {
   queryParams.push(limit);
 
   try {
-    return db
+    const rows = db
       .prepare(`
-        SELECT id, scope, project_id, session_id, task_type, error_text, count, first_seen_at, last_seen_at
+        SELECT id, scope, project_id, user_id, agent_id, session_id, task_type, error_text, count, first_seen_at, last_seen_at
         FROM failure_patterns
         ${whereClause}
         ORDER BY count DESC, last_seen_at DESC
         LIMIT ?
       `)
       .all(...queryParams) as FailurePattern[];
+
+    return rows.map((row) => ({
+      ...row,
+      match_tier: classifyMatchTier(row.scope, row.project_id, scopeSql.normalizedProjectId).match_tier,
+    }));
   } catch (error) {
     logger.error(
       {

@@ -39,11 +39,40 @@ describe('neuralbrain init', () => {
     expect(read(dir)).toEqual({ project_id: 'my-project' });
   });
 
-  test('rejects an invalid explicit id instead of silently using the folder name', () => {
+  test('accepts hierarchical explicit project ids and rejects invalid ones', () => {
     const dir = mk('Projects', 'whatever');
     expect(() => runInit({ cwd: dir, projectId: '///' })).toThrow(/not a valid project id/);
-    expect(() => runInit({ cwd: dir, projectId: 'foo/bar' })).toThrow(/not a valid project id/);
+    expect(() => runInit({ cwd: dir, projectId: '../bad' })).toThrow(/not a valid project id/);
+    expect(() => runInit({ cwd: dir, projectId: 'foo@bar' })).toThrow(/not a valid project id/);
     expect(fs.existsSync(path.join(dir, '.brainrc'))).toBe(false);
+
+    const hier = runInit({ cwd: dir, projectId: 'acme/socials' });
+    expect(hier.projectId).toBe('acme/socials');
+    expect(hier.written).toBe(true);
+    expect(read(dir)).toEqual({ project_id: 'acme/socials' });
+  });
+
+  test('supports --auto-subproject and --max-depth options', () => {
+    const root = mk('Projects', 'acme');
+    const res = runInit({
+      cwd: root,
+      projectId: 'acme',
+      autoSubproject: true,
+      maxDepth: 2,
+    });
+    expect(res.written).toBe(true);
+    expect(read(root)).toEqual({
+      project_id: 'acme',
+      auto_subproject: true,
+      max_depth: 2,
+    });
+
+    const deep = mk('Projects', 'acme', 'socials', 'calendar', 'v1');
+    expect(resolveCanonicalProjectId({ cwd: deep })).toBe('acme/socials/calendar');
+
+    expect(() =>
+      runInit({ cwd: mk('Projects', 'bad-depth'), autoSubproject: true, maxDepth: 0 })
+    ).toThrow(/positive integer/);
   });
 
   test('keeps an existing .brainrc unless forced', () => {
