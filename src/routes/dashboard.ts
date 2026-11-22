@@ -9,7 +9,15 @@ import { drainEmbedQueue, getReembedStatus, probeQdrant } from '../learning/embe
 import { listNotes } from '../memory/noteStore';
 import { listTrajectories } from '../memory/trajectoryStore';
 import { listObservations } from '../memory/observationStore';
-import { getKnowledgeGraph, parseGraphQuery } from '../memory/graphStore';
+import {
+  getKnowledgeGraph,
+  linkEntities,
+  listEntities,
+  parseGraphQuery,
+  unlinkEntities,
+  upsertEntity,
+} from '../memory/graphStore';
+import { getDueActions } from '../memory/actionStore';
 import { migrateAgentMemoryNotes } from '../scripts/migrateAgentMemory';
 import {
   hasActiveApiKeys,
@@ -325,16 +333,19 @@ dashboardRouter.get('/api/stats', async (_req: Request, res: Response, next: Nex
           project_id,
           COALESCE(SUM(CASE WHEN source = 'note' THEN 1 ELSE 0 END), 0) as notes_count,
           COALESCE(SUM(CASE WHEN source = 'trajectory' THEN 1 ELSE 0 END), 0) as trajectories_count,
-          COALESCE(SUM(CASE WHEN source = 'observation' THEN 1 ELSE 0 END), 0) as observations_count
+          COALESCE(SUM(CASE WHEN source = 'observation' THEN 1 ELSE 0 END), 0) as observations_count,
+          COALESCE(SUM(CASE WHEN source = 'entity' THEN 1 ELSE 0 END), 0) as entities_count
         FROM (
           SELECT project_id, 'note' as source FROM notes WHERE project_id IS NOT NULL
           UNION ALL
           SELECT project_id, 'trajectory' as source FROM trajectories WHERE project_id IS NOT NULL
           UNION ALL
           SELECT project_id, 'observation' as source FROM observations WHERE project_id IS NOT NULL
+          UNION ALL
+          SELECT project_id, 'entity' as source FROM entities WHERE project_id IS NOT NULL
         )
         GROUP BY project_id
-        ORDER BY (notes_count + trajectories_count + observations_count) DESC
+        ORDER BY (notes_count + trajectories_count + observations_count + entities_count) DESC
       `)
       .all() as any[];
 
@@ -471,6 +482,23 @@ dashboardRouter.get('/api/stats', async (_req: Request, res: Response, next: Nex
       .get() as any;
     const lessonsCount = lessonsRow?.count ?? 0;
 
+    const entitiesRow = db
+      .prepare(`SELECT COUNT(*) as count FROM entities`)
+      .get() as any;
+    const entitiesCount = entitiesRow?.count ?? 0;
+
+    const nowIso = new Date().toISOString();
+    const dueActionsRow = db
+      .prepare(`
+        SELECT COUNT(*) as count
+        FROM actions
+        WHERE status IN ('ready', 'in_progress')
+          AND ((remind_at IS NOT NULL AND remind_at <= ?) OR (due_at IS NOT NULL AND due_at <= ?))
+          AND (snooze_until IS NULL OR snooze_until <= ?)
+      `)
+      .get(nowIso, nowIso, nowIso) as any;
+    const dueActionsCount = dueActionsRow?.count ?? 0;
+
     res.json({
       health,
       counts,
@@ -487,17 +515,79 @@ dashboardRouter.get('/api/stats', async (_req: Request, res: Response, next: Nex
       sessions,
       actions,
       lessonsCount,
+      entities_count: entitiesCount,
+      due_actions_count: dueActionsCount,
     });
   } catch (err) {
     next(err);
   }
 });
 
+function parseOptionalBoolQuery(raw: unknown): boolean | undefined {
+  if (raw === true || raw === 'true' || raw === '1') return true;
+  if (raw === false || raw === 'false' || raw === '0') return false;
+  return undefined;
+}
+
+function parseOptionalStringQuery(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  return trimmed === '' ? undefined : trimmed;
+}
+
+function parseBoundedLimitQuery(raw: unknown, defaultLimit = 50, maxLimit = 200): number {
+  if (raw === undefined || raw === null || raw === '') return defaultLimit;
+  const parsed = parseInt(String(raw), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return defaultLimit;
+  return Math.min(parsed, maxLimit);
+}
+
 // GET /dashboard/api/graph: Knowledge graph nodes & edges
 dashboardRouter.get('/api/graph', (req: Request, res: Response, next: NextFunction) => {
   try {
     const graph = getKnowledgeGraph(parseGraphQuery(req.query as Record<string, unknown>));
     res.json(graph);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /dashboard/api/graph/entities: List entities with hierarchical scoping
+dashboardRouter.get('/api/graph/entities', (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const q = req.query as Record<string, unknown>;
+    const entities = listEntities({
+      projectId: parseOptionalStringQuery(q.project_id ?? q.projectId),
+      scope: parseOptionalStringQuery(q.scope),
+      includeAncestors: parseOptionalBoolQuery(q.include_ancestors ?? q.includeAncestors),
+      includeChildren: parseOptionalBoolQuery(q.include_children ?? q.includeChildren),
+      includeGlobal: parseOptionalBoolQuery(q.include_global ?? q.includeGlobal),
+      entityType: parseOptionalStringQuery(q.entity_type ?? q.entityType),
+      externalRef: parseOptionalStringQuery(q.external_ref ?? q.externalRef),
+      userId: parseOptionalStringQuery(q.user_id ?? q.userId),
+      limit: parseBoundedLimitQuery(q.limit, 50, 200),
+    });
+    res.json({ entities });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /dashboard/api/actions/due: Due/overdue reminders across project hierarchy
+dashboardRouter.get('/api/actions/due', (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const q = req.query as Record<string, unknown>;
+    const actions = getDueActions({
+      projectId: parseOptionalStringQuery(q.project_id ?? q.projectId),
+      includeAncestors: parseOptionalBoolQuery(q.include_ancestors ?? q.includeAncestors),
+      includeChildren: parseOptionalBoolQuery(q.include_children ?? q.includeChildren),
+      includeGlobal: parseOptionalBoolQuery(q.include_global ?? q.includeGlobal),
+      before: parseOptionalStringQuery(q.before),
+      userId: parseOptionalStringQuery(q.user_id ?? q.userId),
+      unremindedOnly: parseOptionalBoolQuery(q.unreminded_only ?? q.unremindedOnly),
+      limit: parseBoundedLimitQuery(q.limit, 50, 200),
+    });
+    res.json({ actions });
   } catch (err) {
     next(err);
   }
@@ -532,6 +622,40 @@ function checkDashboardCsrf(req: Request, res: Response, next: NextFunction) {
   }
   next();
 }
+
+// POST /dashboard/api/graph/entities: Upsert an entity node
+dashboardRouter.post('/api/graph/entities', checkDashboardCsrf, (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    const entity = upsertEntity(body);
+    res.status(201).json({ entity });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /dashboard/api/graph/edges: Link two graph nodes
+dashboardRouter.post('/api/graph/edges', checkDashboardCsrf, (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    const edge = linkEntities(body);
+    res.status(201).json({ edge });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /dashboard/api/graph/edges: Unlink graph edges by id, source_id, target_id, and/or relation
+dashboardRouter.delete('/api/graph/edges', checkDashboardCsrf, (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const rawBody = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    const input = { ...(req.query as Record<string, unknown>), ...rawBody };
+    const result = unlinkEntities(input);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
 
 // POST /dashboard/api/migrate: Imports notes from an existing agentmemory store
 dashboardRouter.post('/api/migrate', checkDashboardCsrf, async (_req: Request, res: Response, next: NextFunction) => {

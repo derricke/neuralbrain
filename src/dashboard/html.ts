@@ -399,6 +399,45 @@ export function getDashboardHtml(): string {
                 <label for="searchInputFilePath" class="text-muted form-label-inline">FILE:</label>
                 <input id="searchInputFilePath" type="text" class="form-input input-w-130" placeholder="path filter">
               </div>
+
+              <label class="checkbox-label">
+                <input id="searchCheckAncestors" type="checkbox" checked>
+                <span>include_ancestors</span>
+              </label>
+
+              <label class="checkbox-label">
+                <input id="searchCheckChildren" type="checkbox">
+                <span>include_children</span>
+              </label>
+
+              <label class="checkbox-label">
+                <input id="searchCheckHistory" type="checkbox">
+                <span>include_history</span>
+              </label>
+
+              <div class="form-row-inline">
+                <label for="searchInputUserId" class="text-muted form-label-inline">USER:</label>
+                <input id="searchInputUserId" type="text" class="form-input input-w-130" placeholder="user_id">
+              </div>
+
+              <div class="form-row-inline">
+                <label for="searchInputAfter" class="text-muted form-label-inline">AFTER:</label>
+                <input id="searchInputAfter" type="text" class="form-input input-w-150" placeholder="ISO date (UTC)">
+              </div>
+
+              <div class="form-row-inline">
+                <label for="searchInputBefore" class="text-muted form-label-inline">BEFORE:</label>
+                <input id="searchInputBefore" type="text" class="form-input input-w-150" placeholder="ISO date (UTC)">
+              </div>
+
+              <div class="form-row-inline">
+                <label for="searchSelectTemporalBias" class="text-muted form-label-inline">TEMPORAL BIAS:</label>
+                <select id="searchSelectTemporalBias" class="form-select input-w-130">
+                  <option value="none" selected>none</option>
+                  <option value="recent">recent</option>
+                  <option value="upcoming">upcoming</option>
+                </select>
+              </div>
             </div>
 
             <div class="record-types-selection-bar">
@@ -407,6 +446,8 @@ export function getDashboardHtml(): string {
               <label class="checkbox-label"><input type="checkbox" id="recordTypeCheckTrajectory" checked> trajectory</label>
               <label class="checkbox-label"><input type="checkbox" id="recordTypeCheckObservation" checked> observation</label>
               <label class="checkbox-label"><input type="checkbox" id="recordTypeCheckSummary" checked> summary</label>
+              <label class="checkbox-label"><input type="checkbox" id="recordTypeCheckEntity" checked> entity</label>
+              <label class="checkbox-label"><input type="checkbox" id="recordTypeCheckAction" checked> action</label>
             </div>
           </form>
 
@@ -431,7 +472,7 @@ export function getDashboardHtml(): string {
           <form id="injectForm">
             <div class="control-row mb-4">
               <div id="injectProjectDropdownWrapper" class="searchable-dropdown flex-1">
-                <input id="injectInputProject" type="text" class="form-input input-w-full-pr" placeholder="Project ID (e.g. example-app, demo-project)..." value="example-app" aria-label="Project ID for injection simulation" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false">
+                <input id="injectInputProject" type="text" class="form-input input-w-full-pr" placeholder="Project ID (e.g. acme/socials/calendar, example-app)..." value="example-app" aria-label="Project ID for injection simulation" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false">
                 <span id="injectProjectDropdownToggle" class="dropdown-chevron" role="button" tabindex="0" aria-label="Toggle project dropdown" aria-expanded="false" title="Toggle project dropdown">▼</span>
                 <div id="injectProjectDropdownMenu" class="dropdown-menu"></div>
               </div>
@@ -454,6 +495,20 @@ export function getDashboardHtml(): string {
                 </span>
                 <span class="btn-label">Simulate Task-Start Injection</span>
               </button>
+            </div>
+            <div class="filter-bar">
+              <label class="checkbox-label">
+                <input id="injectCheckAncestors" type="checkbox" checked>
+                <span>include_ancestors</span>
+              </label>
+              <label class="checkbox-label">
+                <input id="injectCheckChildren" type="checkbox">
+                <span>include_children</span>
+              </label>
+              <div class="form-row-inline">
+                <label for="injectInputUserId" class="text-muted form-label-inline">USER:</label>
+                <input id="injectInputUserId" type="text" class="form-input input-w-130" placeholder="user_id">
+              </div>
             </div>
           </form>
 
@@ -535,6 +590,21 @@ export function getDashboardHtml(): string {
           <div class="form-row-inline">
             <label for="notesFilterFile" class="text-muted form-label-inline">FILE:</label>
             <input id="notesFilterFile" type="text" class="form-input input-w-150" placeholder="e.g. src/lib/db.ts">
+          </div>
+
+          <label class="checkbox-label">
+            <input id="notesCheckAncestors" type="checkbox" checked>
+            <span>include_ancestors</span>
+          </label>
+
+          <label class="checkbox-label">
+            <input id="notesCheckChildren" type="checkbox">
+            <span>include_children</span>
+          </label>
+
+          <div class="form-row-inline">
+            <label for="notesInputUserId" class="text-muted form-label-inline">USER:</label>
+            <input id="notesInputUserId" type="text" class="form-input input-w-130" placeholder="user_id">
           </div>
 
           <button id="btnApplyNotesFilter" type="button" class="btn">
@@ -620,6 +690,18 @@ export function getDashboardHtml(): string {
               <option value="abandoned">abandoned</option>
             </select>
           </div>
+          <label class="checkbox-label">
+            <input id="shortSessionsCheckAncestors" type="checkbox" checked>
+            <span>include_ancestors</span>
+          </label>
+          <label class="checkbox-label">
+            <input id="shortSessionsCheckChildren" type="checkbox">
+            <span>include_children</span>
+          </label>
+          <div class="form-row-inline">
+            <label for="shortSessionsInputUserId" class="text-muted form-label-inline">USER:</label>
+            <input id="shortSessionsInputUserId" type="text" class="form-input input-w-130" placeholder="user_id">
+          </div>
           <button id="btnFilterShortSessions" type="button" class="btn">
             <span class="icon-swap-slot icon-swap-in">
               <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
@@ -651,6 +733,22 @@ export function getDashboardHtml(): string {
               <option value="dismissed">dismissed</option>
             </select>
           </div>
+          <label class="checkbox-label">
+            <input id="shortActionsCheckAncestors" type="checkbox" checked>
+            <span>include_ancestors</span>
+          </label>
+          <label class="checkbox-label">
+            <input id="shortActionsCheckChildren" type="checkbox">
+            <span>include_children</span>
+          </label>
+          <label class="checkbox-label">
+            <input id="shortActionsCheckDueOnly" type="checkbox">
+            <span>due_only</span>
+          </label>
+          <div class="form-row-inline">
+            <label for="shortActionsInputUserId" class="text-muted form-label-inline">USER:</label>
+            <input id="shortActionsInputUserId" type="text" class="form-input input-w-130" placeholder="user_id">
+          </div>
           <button id="btnFilterShortActions" type="button" class="btn">
             <span class="icon-swap-slot icon-swap-in">
               <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
@@ -659,6 +757,15 @@ export function getDashboardHtml(): string {
               </svg>
             </span>
             <span class="btn-label">Refresh Actions</span>
+          </button>
+          <button id="btnOpenCreateActionModal" type="button" class="btn btn-primary">
+            <span class="icon-swap-slot icon-swap-in">
+              <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+                <path d="M12 5v14"></path>
+                <path d="M5 12h14"></path>
+              </svg>
+            </span>
+            <span class="btn-label">+ Create Action</span>
           </button>
         </div>
 
@@ -683,7 +790,27 @@ export function getDashboardHtml(): string {
             </h2>
             <div class="card-subtitle">GET /dashboard/api/graph — Interactive relational topology across notes, lessons, concepts, files, sessions, actions, and summaries</div>
           </div>
-          <div id="graphStatsBadge" class="badge badge-subtle badge-mono">0 nodes · 0 edges</div>
+          <div class="control-row">
+            <div id="graphStatsBadge" class="badge badge-subtle badge-mono">0 nodes · 0 edges</div>
+            <button id="btnOpenAddEntityModal" type="button" class="btn">
+              <span class="icon-swap-slot icon-swap-in">
+                <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+                  <path d="M12 5v14"></path>
+                  <path d="M5 12h14"></path>
+                </svg>
+              </span>
+              <span class="btn-label">+ Add Entity</span>
+            </button>
+            <button id="btnOpenLinkNodesModal" type="button" class="btn">
+              <span class="icon-swap-slot icon-swap-in">
+                <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+                  <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                  <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+                </svg>
+              </span>
+              <span class="btn-label">+ Link Nodes</span>
+            </button>
+          </div>
         </div>
 
         <div class="filter-bar">
@@ -713,6 +840,38 @@ export function getDashboardHtml(): string {
               <option value="200">200 nodes</option>
             </select>
           </div>
+          <div class="form-row-inline">
+            <label for="graphFilterDepth" class="text-muted form-label-inline">DEPTH:</label>
+            <select id="graphFilterDepth" class="form-select input-w-130">
+              <option value="1" selected>1 hop</option>
+              <option value="2">2 hops</option>
+              <option value="3">3 hops</option>
+            </select>
+          </div>
+          <div class="form-row-inline">
+            <label for="graphFilterEntityType" class="text-muted form-label-inline">ENTITY TYPE:</label>
+            <select id="graphFilterEntityType" class="form-select input-w-140">
+              <option value="all" selected>All Types</option>
+              <option value="brand">brand</option>
+              <option value="person">person</option>
+              <option value="asset">asset</option>
+              <option value="metric">metric</option>
+              <option value="document">document</option>
+              <option value="tool">tool</option>
+            </select>
+          </div>
+          <label class="checkbox-label">
+            <input id="graphCheckAncestors" type="checkbox" checked>
+            <span>include_ancestors</span>
+          </label>
+          <label class="checkbox-label">
+            <input id="graphCheckChildren" type="checkbox">
+            <span>include_children</span>
+          </label>
+          <label class="checkbox-label">
+            <input id="graphCheckGlobal" type="checkbox">
+            <span>include_global</span>
+          </label>
           <button id="btnLoadGraph" type="button" class="btn btn-primary">
             <span class="icon-swap-slot icon-swap-in">
               <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">

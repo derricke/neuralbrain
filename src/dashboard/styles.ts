@@ -2272,7 +2272,11 @@ tr.row-highlight {
 }
 
 .graph-node:hover circle,
-.graph-node:focus-visible circle {
+.graph-node:hover rect,
+.graph-node:hover polygon,
+.graph-node:focus-visible circle,
+.graph-node:focus-visible rect,
+.graph-node:focus-visible polygon {
   stroke: var(--text-primary);
   stroke-width: 2.5;
 }
@@ -2282,7 +2286,9 @@ tr.row-highlight {
   outline-offset: 2px;
 }
 
-.graph-node.selected circle {
+.graph-node.selected circle,
+.graph-node.selected rect,
+.graph-node.selected polygon {
   stroke: var(--text-primary);
   stroke-width: 3;
 }
@@ -2341,5 +2347,142 @@ tr.row-highlight {
 
 .replay-item.kind-action {
   border-left-color: var(--accent-amber);
+}
+
+/* Hierarchical Multi-Memory, Match Tiers, Reminders & Safe External Refs */
+.kpi-card-interactive {
+  cursor: pointer;
+}
+
+.kpi-card-interactive:hover {
+  border-color: var(--accent-amber-border);
+}
+
+.tier-badge {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.tier-exact {
+  background-color: var(--accent-emerald-bg);
+  border-color: var(--accent-emerald-border);
+  color: var(--accent-emerald);
+}
+
+.tier-ancestor {
+  background-color: var(--accent-amber-bg);
+  border-color: var(--accent-amber-border);
+  color: var(--accent-amber);
+}
+
+.tier-child {
+  background-color: var(--bg-subtle);
+  border-color: var(--border-subtle);
+  color: var(--text-primary);
+}
+
+.tier-global {
+  background-color: var(--bg-subtle);
+  border-color: var(--border-color);
+  color: var(--text-secondary);
+}
+
+.tier-unknown {
+  background-color: var(--accent-rose-bg);
+  border-color: var(--accent-rose-border);
+  color: var(--accent-rose);
+}
+
+.overdue-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px 8px;
+  border-radius: 9999px;
+  background-color: var(--accent-rose-bg);
+  border: 1px solid var(--accent-rose-border);
+  color: var(--accent-rose);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.project-hierarchy-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.project-hierarchy-indent {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-left: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+}
+
+.project-prefix-badge {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.project-segment-leaf {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.external-ref-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.external-ref-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--accent-emerald);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  transition: color 0.15s ease;
+}
+
+.external-ref-link:hover {
+  color: var(--text-primary);
+}
+
+.graph-legend-diamond {
+  width: 10px;
+  height: 10px;
+  display: inline-block;
+  transform: rotate(45deg);
+  border: 1px solid var(--text-primary);
+}
+
+.graph-edge-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.graph-edge-row .graph-edge-link {
+  margin-bottom: 0;
+  flex: 1;
+  min-width: 0;
 }
 `;

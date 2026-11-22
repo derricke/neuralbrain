@@ -309,6 +309,69 @@ export const dashboardJs = `
     );
   }
 
+  function createMatchTierBadge(tier) {
+    if (!tier) return null;
+    const safeTier = ['exact', 'ancestor', 'child', 'global', 'unknown'].includes(tier) ? tier : 'exact';
+    return el('span', {
+      className: 'badge badge-mono tier-badge tier-' + safeTier,
+      textContent: safeTier
+    });
+  }
+
+  function createSafeExternalRefNode(rawRef) {
+    if (typeof rawRef !== 'string') return null;
+    const trimmed = rawRef.trim();
+    if (!trimmed) return null;
+    let isSafeHttp = false;
+    if (/^https?:\\/\\//i.test(trimmed)) {
+      try {
+        const parsed = new URL(trimmed);
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+          isSafeHttp = true;
+        }
+      } catch {
+        isSafeHttp = false;
+      }
+    }
+    if (isSafeHttp) {
+      return el('a', {
+        href: trimmed,
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        className: 'external-ref-link',
+        textContent: trimmed
+      });
+    }
+    return el('span', { className: 'code-pill text-mono', textContent: trimmed });
+  }
+
+  function isActionOverdue(act) {
+    if (!act || act.status === 'done' || act.status === 'dismissed') return false;
+    if (typeof act.overdue === 'boolean') return act.overdue;
+    if (!act.due_at) return false;
+    const ms = Date.parse(act.due_at);
+    return Number.isFinite(ms) && ms <= Date.now();
+  }
+
+  function openDueActionsView() {
+    const dueChk = document.getElementById('shortActionsCheckDueOnly');
+    if (dueChk) dueChk.checked = true;
+    const statusSel = document.getElementById('shortActionsStatus');
+    if (statusSel) statusSel.value = '';
+    activeShortSubTab = 'actions';
+    const buttons = document.querySelectorAll('#paneShortTerm button[data-short-subtab]');
+    buttons.forEach((btn) => {
+      const isSelected = btn.getAttribute('data-short-subtab') === 'actions';
+      btn.className = isSelected ? 'btn btn-primary' : 'btn';
+      btn.setAttribute('aria-selected', isSelected ? 'true' : 'false');
+    });
+    const sessBar = document.getElementById('shortSessionsFilterBar');
+    const actBar = document.getElementById('shortActionsFilterBar');
+    if (sessBar) sessBar.classList.add('hidden');
+    if (actBar) actBar.classList.remove('hidden');
+    switchTab('shortTerm');
+  }
+
   // Always-Visible Provenance Line in Cool Pewter
   function createProvenanceLine(text) {
     const clockIcon = createSvgIcon('clock', 'icon-svg');
@@ -1211,6 +1274,36 @@ export const dashboardJs = `
         [createBadge('Rule 3: 0 volume drops', dlCount > 0 ? 'rose' : 'subtle', true)],
         isStaleRevalidating
       ));
+
+      // Card 8: Entities (Graph)
+      const entitiesCount = typeof statsData.entities_count === 'number' ? statsData.entities_count : 0;
+      kpiGrid.appendChild(createKpiCard(
+        'Entities (Graph)',
+        entitiesCount,
+        [createBadge('Knowledge Graph nodes', entitiesCount > 0 ? 'emerald' : 'subtle', true)],
+        isStaleRevalidating
+      ));
+
+      // Card 9: Due / Overdue Actions (clickable -> Short Term Actions Due Only)
+      const dueActionsCount = typeof statsData.due_actions_count === 'number' ? statsData.due_actions_count : 0;
+      const dueCard = createKpiCard(
+        'Due / Overdue Actions',
+        dueActionsCount,
+        [createBadge(dueActionsCount > 0 ? 'Reminder attention' : 'All caught up', dueActionsCount > 0 ? 'rose' : 'emerald', true)],
+        isStaleRevalidating
+      );
+      dueCard.classList.add('kpi-card-interactive');
+      dueCard.setAttribute('role', 'button');
+      dueCard.setAttribute('tabindex', '0');
+      dueCard.setAttribute('title', 'Open Short Term Actions filtered to due and overdue items');
+      dueCard.addEventListener('click', openDueActionsView);
+      dueCard.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          openDueActionsView();
+        }
+      });
+      kpiGrid.appendChild(dueCard);
     }
 
     // 5. Scope Progress Bar (Rule 4 Telemetry)
@@ -1318,20 +1411,44 @@ export const dashboardJs = `
             el('th', {}, 'Notes'),
             el('th', {}, 'Trajectories'),
             el('th', {}, 'Observations'),
+            el('th', {}, 'Entities'),
             el('th', {}, 'Total Records'),
             el('th', {}, 'Actions')
           )
         ),
         el('tbody', {},
           ...statsData.projects.map((proj) => {
-            const totalGrains = proj.notes_count + proj.trajectories_count + proj.observations_count;
-            return el('tr', {},
-              el('td', {},
+            const entCount = Number(proj.entities_count) || 0;
+            const totalGrains = (proj.notes_count || 0) + (proj.trajectories_count || 0) + (proj.observations_count || 0) + entCount;
+            const segments = String(proj.project_id || '').split('/').filter(Boolean);
+            const depth = Math.max(1, segments.length);
+            const projCellChildren = [];
+            if (depth > 1) {
+              projCellChildren.push(
+                el('span', {
+                  className: 'project-hierarchy-indent',
+                  style: { marginLeft: ((depth - 2) * 12) + 'px' }
+                })
+              );
+              projCellChildren.push(
+                el('strong', { className: 'text-mono' },
+                  el('span', { className: 'project-prefix-badge', textContent: segments.slice(0, -1).join('/') + '/' }),
+                  el('span', { className: 'project-segment-leaf', textContent: segments[segments.length - 1] })
+                )
+              );
+            } else {
+              projCellChildren.push(
                 el('strong', { className: 'text-mono', style: { color: 'var(--text-primary)' } }, proj.project_id)
-              ),
+              );
+            }
+            projCellChildren.push(createBadge('L' + depth, 'subtle', true));
+
+            return el('tr', {},
+              el('td', {}, el('div', { className: 'project-hierarchy-cell' }, ...projCellChildren)),
               el('td', {}, el('span', { className: 'code-pill' }, String(proj.notes_count))),
               el('td', {}, el('span', { className: 'code-pill' }, String(proj.trajectories_count))),
               el('td', {}, el('span', { className: 'code-pill' }, String(proj.observations_count))),
+              el('td', {}, el('span', { className: 'code-pill' }, String(entCount))),
               el('td', {}, el('span', { className: 'badge badge-subtle badge-mono' }, String(totalGrains))),
               el('td', {},
                 el('button', {
@@ -1770,7 +1887,7 @@ export const dashboardJs = `
         if (p.project_id) {
           knownProjects.set(p.project_id, {
             notes_count: p.notes_count || 0,
-            total: (p.notes_count || 0) + (p.trajectories_count || 0) + (p.observations_count || 0)
+            total: (p.notes_count || 0) + (p.trajectories_count || 0) + (p.observations_count || 0) + (p.entities_count || 0)
           });
         }
       });
@@ -1892,7 +2009,14 @@ export const dashboardJs = `
     const scopeSelect = document.getElementById('searchSelectScope');
     const projectInput = document.getElementById('searchInputProject');
     const checkGlobal = document.getElementById('searchCheckGlobal');
+    const checkAncestors = document.getElementById('searchCheckAncestors');
+    const checkChildren = document.getElementById('searchCheckChildren');
+    const checkHistory = document.getElementById('searchCheckHistory');
     const fileInput = document.getElementById('searchInputFilePath');
+    const userInput = document.getElementById('searchInputUserId');
+    const afterInput = document.getElementById('searchInputAfter');
+    const beforeInput = document.getElementById('searchInputBefore');
+    const temporalBiasSelect = document.getElementById('searchSelectTemporalBias');
     const noteTypeSelect = document.getElementById('searchNoteType');
 
     const recordTypes = [];
@@ -1900,6 +2024,8 @@ export const dashboardJs = `
     if (document.getElementById('recordTypeCheckTrajectory')?.checked) recordTypes.push('trajectory');
     if (document.getElementById('recordTypeCheckObservation')?.checked) recordTypes.push('observation');
     if (document.getElementById('recordTypeCheckSummary')?.checked) recordTypes.push('summary');
+    if (document.getElementById('recordTypeCheckEntity')?.checked) recordTypes.push('entity');
+    if (document.getElementById('recordTypeCheckAction')?.checked) recordTypes.push('action');
 
     let proj = projectInput ? projectInput.value.trim() : '';
     if (proj.toLowerCase() === 'all projects (global)' || proj.toLowerCase() === 'all projects') {
@@ -1915,12 +2041,24 @@ export const dashboardJs = `
       filters.type = [selectedNoteType];
     }
 
+    const userVal = userInput ? userInput.value.trim() : '';
+    const afterVal = afterInput ? afterInput.value.trim() : '';
+    const beforeVal = beforeInput ? beforeInput.value.trim() : '';
+    const temporalBiasVal = temporalBiasSelect && temporalBiasSelect.value ? temporalBiasSelect.value : 'none';
+
     const payload = {
       q,
       record_types: recordTypes.length > 0 ? recordTypes : undefined,
       scope: scopeSelect && scopeSelect.value ? scopeSelect.value : undefined,
       project_id: proj || undefined,
       include_global: checkGlobal ? checkGlobal.checked : true,
+      include_ancestors: checkAncestors ? checkAncestors.checked : true,
+      include_children: checkChildren ? checkChildren.checked : false,
+      include_history: checkHistory ? checkHistory.checked : false,
+      user_id: userVal || undefined,
+      after: afterVal || undefined,
+      before: beforeVal || undefined,
+      temporal_bias: temporalBiasVal,
       filters: Object.keys(filters).length > 0 ? filters : undefined,
       limit: 20
     };
@@ -1998,36 +2136,47 @@ export const dashboardJs = `
 
       // Header row
       const recordType = item.record_type || item.grain || 'record';
-      const typeVariant = recordType === 'note' ? 'emerald' : recordType === 'summary' ? 'emerald' : recordType === 'trajectory' ? 'subtle' : 'amber';
+      const typeVariant = (recordType === 'note' || recordType === 'summary' || recordType === 'entity')
+        ? 'emerald'
+        : (recordType === 'action' ? 'rose' : (recordType === 'trajectory' ? 'subtle' : 'amber'));
       const typeBadge = createBadge(recordType.toUpperCase(), typeVariant, true);
 
       const scopeVal = rec.scope || item.scope;
-      const projectVal = rec.project_id || item.project_id;
+      const projectVal = item.project_id !== undefined ? item.project_id : rec.project_id;
       const scopeVariant = scopeVal === 'project' ? 'emerald' : (scopeVal === 'unknown' ? 'rose' : 'subtle');
+      const matchTier = item.match_tier || rec.match_tier;
+      const overdueBadge = recordType === 'action' && isActionOverdue(rec)
+        ? el('span', { className: 'overdue-pill' }, '[OVERDUE]')
+        : null;
 
       const rrfScore = typeof item.score === 'number' ? item.score.toFixed(4) : String(item.score || '');
       const scoreSpan = el('span', { className: 'result-score' }, 'RRF Score: ' + rrfScore);
 
       const header = el('div', { className: 'result-header' },
-        el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+        el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
           el('span', { className: 'code-pill' }, '#' + (index + 1)),
           typeBadge,
-          scopeVal ? createBadge(scopeVal + (projectVal ? ': ' + projectVal : ''), scopeVariant, true) : null
+          scopeVal ? createBadge(scopeVal + (projectVal ? ': ' + projectVal : ''), scopeVariant, true) : (projectVal ? createBadge(projectVal, 'emerald', true) : null),
+          createMatchTierBadge(matchTier),
+          recordType === 'entity' && rec.entity_type ? createBadge(rec.entity_type, 'amber', true) : null,
+          recordType === 'action' && rec.status ? createBadge(String(rec.status).toUpperCase(), getActionStatusVariant(rec.status), true) : null,
+          overdueBadge
         ),
         scoreSpan
       );
 
       // Title & Content
-      const titleText = rec.title || rec.task_type || rec.tool_name || item.title || item.id;
+      const titleText = rec.title || rec.name || rec.task_type || rec.tool_name || item.title || item.id;
       const bodyText = rec.content || rec.description || rec.input || rec.output || item.content || '';
 
       const titleEl = el('div', { className: 'result-title', textContent: titleText });
       const bodyEl = el('div', { className: 'result-body', textContent: bodyText });
 
-      // Tag list (concepts, files)
+      // Tag list (concepts, files, matched_entities, temporal metadata)
       const tagList = el('div', { className: 'tag-list' });
       const conceptsList = Array.isArray(rec.concepts) ? rec.concepts : (Array.isArray(item.concepts) ? item.concepts : []);
       const filesList = Array.isArray(rec.files) ? rec.files : (Array.isArray(item.files) ? item.files : []);
+      const matchedEntities = Array.isArray(item.matched_entities) ? item.matched_entities : [];
       const filePath = rec.file_path || item.file_path;
 
       conceptsList.forEach((c) => tagList.appendChild(createBadge('#' + c, 'subtle', true)));
@@ -2035,6 +2184,25 @@ export const dashboardJs = `
       if (filePath) {
         tagList.appendChild(createBadge(filePath, 'subtle', true, 'folder'));
       }
+      matchedEntities.forEach((entName) => tagList.appendChild(createBadge('entity: ' + entName, 'emerald', true)));
+      if (rec.due_at) {
+        tagList.appendChild(createBadge('due: ' + formatTimestamp(rec.due_at), isActionOverdue(rec) ? 'rose' : 'amber', true));
+      }
+      if (rec.remind_at) {
+        tagList.appendChild(createBadge('remind: ' + formatTimestamp(rec.remind_at), 'subtle', true));
+      }
+      if (rec.event_at) {
+        tagList.appendChild(createBadge('event: ' + formatTimestamp(rec.event_at), 'subtle', true));
+      }
+      if (rec.valid_until) {
+        tagList.appendChild(createBadge('until: ' + formatTimestamp(rec.valid_until), 'subtle', true));
+      }
+      if (rec.user_id) {
+        tagList.appendChild(createBadge('user: ' + rec.user_id, 'subtle', true));
+      }
+
+      const extRef = rec.external_ref || item.external_ref;
+      const extRefNode = extRef ? createSafeExternalRefNode(extRef) : null;
 
       const tsVal = rec.created_at || rec.updated_at || item.created_at || item.updated_at;
 
@@ -2043,6 +2211,14 @@ export const dashboardJs = `
       card.appendChild(bodyEl);
       if (tagList.children.length > 0) {
         card.appendChild(tagList);
+      }
+      if (extRefNode) {
+        card.appendChild(
+          el('div', { className: 'external-ref-row' },
+            el('span', { className: 'text-muted form-label-inline' }, 'EXTERNAL REF:'),
+            extRefNode
+          )
+        );
       }
       card.appendChild(createProvenanceLine(
         'source: ' + recordType + ' · ' + item.id + ' · ' + formatTimestamp(tsVal)
@@ -2055,11 +2231,15 @@ export const dashboardJs = `
   async function executeInjection() {
     const projectInput = document.getElementById('injectInputProject');
     const taskTypeInput = document.getElementById('injectInputTaskType');
+    const checkAncestors = document.getElementById('injectCheckAncestors');
+    const checkChildren = document.getElementById('injectCheckChildren');
+    const userInput = document.getElementById('injectInputUserId');
     const container = document.getElementById('injectOutputContainer');
     if (!container) return;
 
     const proj = projectInput ? projectInput.value.trim() : '';
     const task = taskTypeInput ? taskTypeInput.value.trim() : '';
+    const userVal = userInput ? userInput.value.trim() : '';
 
     if (!proj) {
       showToast('Please specify a project_id for injection simulation', 'amber');
@@ -2071,8 +2251,14 @@ export const dashboardJs = `
     );
 
     try {
-      const url = '/inject?project_id=' + encodeURIComponent(proj) + (task ? '&task_type=' + encodeURIComponent(task) : '') + '&limit=5';
-      const resp = await apiFetch(url);
+      const params = new URLSearchParams();
+      params.set('project_id', proj);
+      if (task) params.set('task_type', task);
+      params.set('include_ancestors', checkAncestors ? (checkAncestors.checked ? 'true' : 'false') : 'true');
+      if (checkChildren && checkChildren.checked) params.set('include_children', 'true');
+      if (userVal) params.set('user_id', userVal);
+      params.set('limit', '5');
+      const resp = await apiFetch('/inject?' + params.toString());
       if (!resp.ok) {
         throw new Error('Injection request failed: ' + resp.status);
       }
@@ -2092,6 +2278,40 @@ export const dashboardJs = `
     const container = document.getElementById('injectOutputContainer');
     if (!container) return;
     container.replaceChildren();
+
+    // 0. Due / Overdue Actions Section
+    const dueActions = Array.isArray(data.due_actions) ? data.due_actions : [];
+    const dueSection = el('div', { style: { marginBottom: '16px' } },
+      el('div', { style: { fontSize: '14px', fontWeight: '700', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '8px' } },
+        createSvgIcon('clock'),
+        el('span', {}, 'Due / Overdue Actions (' + dueActions.length + ')')
+      )
+    );
+    if (dueActions.length === 0) {
+      dueSection.appendChild(el('div', { className: 'text-muted', style: { fontSize: '12px' } }, 'No due or overdue reminders for this scope.'));
+    } else {
+      dueActions.forEach((act) => {
+        const overdue = isActionOverdue(act);
+        const dueCard = el('div', { className: 'result-card', style: { padding: '12px' } },
+          el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: '6px' } },
+            overdue ? el('span', { className: 'overdue-pill' }, '[OVERDUE]') : null,
+            createBadge((act.priority || 'normal').toUpperCase(), getActionPriorityVariant(act.priority), true),
+            createMatchTierBadge(act.match_tier),
+            act.project_id ? createBadge(act.project_id, 'subtle', true) : null
+          ),
+          el('div', { className: 'font-semibold', style: { fontSize: '14px', marginBottom: '4px' }, textContent: act.title || act.id }),
+          act.description ? el('div', { style: { fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '6px' }, textContent: act.description }) : null,
+          el('div', { className: 'tag-list' },
+            act.due_at ? createBadge('due: ' + formatTimestamp(act.due_at), overdue ? 'rose' : 'amber', true) : null,
+            act.remind_at ? createBadge('remind: ' + formatTimestamp(act.remind_at), 'subtle', true) : null,
+            act.recurrence ? createBadge('repeat: ' + act.recurrence, 'emerald', true) : null
+          ),
+          createProvenanceLine('source: action · ' + act.id + (act.project_id ? ' · project: ' + act.project_id : ''))
+        );
+        dueSection.appendChild(dueCard);
+      });
+    }
+    container.appendChild(dueSection);
 
     // 1. Critical Warnings Block (NeuralSwarm reference text)
     const warningBlock = el('div', { style: { marginBottom: '16px' } });
@@ -2209,6 +2429,20 @@ export const dashboardJs = `
       btnApply.addEventListener('click', applyNotesFilter);
     }
 
+    const chkNotesAncestors = document.getElementById('notesCheckAncestors');
+    if (chkNotesAncestors) chkNotesAncestors.addEventListener('change', applyNotesFilter);
+    const chkNotesChildren = document.getElementById('notesCheckChildren');
+    if (chkNotesChildren) chkNotesChildren.addEventListener('change', applyNotesFilter);
+    const inpNotesUserId = document.getElementById('notesInputUserId');
+    if (inpNotesUserId) {
+      inpNotesUserId.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          applyNotesFilter();
+        }
+      });
+    }
+
     const btnCreateModal = document.getElementById('btnOpenCreateNoteModal');
     if (btnCreateModal) {
       btnCreateModal.addEventListener('click', openCreateNoteModal);
@@ -2231,6 +2465,9 @@ export const dashboardJs = `
     const projectInput = document.getElementById('notesFilterProject');
     const typeSelect = document.getElementById('notesFilterType');
     const fileInput = document.getElementById('notesFilterFile');
+    const chkAncestors = document.getElementById('notesCheckAncestors');
+    const chkChildren = document.getElementById('notesCheckChildren');
+    const userInput = document.getElementById('notesInputUserId');
 
     let projectVal = projectInput ? projectInput.value.trim() : '';
     if (projectVal.toLowerCase() === 'all projects') projectVal = '';
@@ -2242,6 +2479,9 @@ export const dashboardJs = `
       params.set('scope', 'unknown');
     }
     if (projectVal) params.set('project_id', projectVal);
+    params.set('include_ancestors', chkAncestors ? (chkAncestors.checked ? 'true' : 'false') : 'true');
+    params.set('include_children', chkChildren && chkChildren.checked ? 'true' : 'false');
+    if (userInput && userInput.value.trim()) params.set('user_id', userInput.value.trim());
 
     if (typeSelect && typeSelect.value) {
       params.set('type', typeSelect.value);
@@ -2257,7 +2497,8 @@ export const dashboardJs = `
 
     const listContainer = document.getElementById('notesListContainer');
     const cacheKey = params.toString() || 'default';
-    const cachedNotes = swrCache.notes.get(cacheKey) || (cacheKey === 'limit=50' ? swrCache.notes.get('default') : null);
+    const isDefaultNotesQuery = !scopeSelect?.value && activeNotesCategory === 'all' && !projectVal && !typeSelect?.value && !fileInput?.value.trim() && !userInput?.value.trim() && (chkAncestors?.checked !== false) && !chkChildren?.checked;
+    const cachedNotes = swrCache.notes.get(cacheKey) || (isDefaultNotesQuery ? swrCache.notes.get('default') : null);
     if (cachedNotes) {
       renderNotesList(cachedNotes, scopeSelect ? scopeSelect.value : '', true);
     } else if (listContainer) {
@@ -2271,7 +2512,7 @@ export const dashboardJs = `
       if (!resp.ok) throw new Error('Notes query failed: ' + resp.status);
       const notes = await resp.json();
       swrCache.notes.set(cacheKey, notes);
-      if (cacheKey === 'limit=50') swrCache.notes.set('default', notes);
+      if (isDefaultNotesQuery) swrCache.notes.set('default', notes);
       renderNotesList(notes, scopeSelect ? scopeSelect.value : '', false);
     } catch (err) {
       if (listContainer && !cachedNotes) {
@@ -2399,6 +2640,7 @@ export const dashboardJs = `
       const headerMetaGroup = el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
         typeBadge,
         scopeBadge,
+        createMatchTierBadge(note.match_tier),
         btnEditScope,
         el('span', { className: 'code-pill' }, 'v' + note.version),
         el('span', { className: 'text-muted', style: { fontSize: '12px' } }, formatTimestamp(note.created_at))
@@ -2413,13 +2655,25 @@ export const dashboardJs = `
       const titleEl = el('div', { className: 'result-title', textContent: note.title });
       const contentEl = el('div', { className: 'result-body', textContent: note.content });
 
-      // Relations
+      // Relations & Temporal Metadata
       const tagList = el('div', { className: 'tag-list', style: { marginBottom: '0' } });
       if (Array.isArray(note.concepts)) {
         note.concepts.forEach((c) => tagList.appendChild(createBadge('#' + c, 'subtle', true)));
       }
       if (Array.isArray(note.files)) {
         note.files.forEach((f) => tagList.appendChild(createBadge(f, 'subtle', true, 'folder')));
+      }
+      if (note.event_at) {
+        tagList.appendChild(createBadge('event: ' + formatTimestamp(note.event_at), 'subtle', true));
+      }
+      if (note.valid_from) {
+        tagList.appendChild(createBadge('from: ' + formatTimestamp(note.valid_from), 'subtle', true));
+      }
+      if (note.valid_until) {
+        tagList.appendChild(createBadge('until: ' + formatTimestamp(note.valid_until), 'amber', true));
+      }
+      if (note.user_id) {
+        tagList.appendChild(createBadge('user: ' + note.user_id, 'subtle', true));
       }
 
       const scopeSelect = el('select', { className: 'form-select', 'aria-label': 'Repair note scope' },
@@ -2610,6 +2864,38 @@ export const dashboardJs = `
       placeholder: 'Files touched (comma-separated paths, e.g. src/lib/db.ts)'
     });
 
+    const userIdInput = el('input', {
+      id: 'createNoteUserId',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      placeholder: 'Optional user_id (e.g. user-alice)'
+    });
+
+    const eventAtInput = el('input', {
+      id: 'createNoteEventAt',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      placeholder: 'Optional ISO timestamp (e.g. 2026-11-22T15:00:00Z)'
+    });
+
+    const validFromInput = el('input', {
+      id: 'createNoteValidFrom',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      placeholder: 'Optional ISO start (e.g. 2026-11-01T00:00:00Z)'
+    });
+
+    const validUntilInput = el('input', {
+      id: 'createNoteValidUntil',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      placeholder: 'Optional ISO expiry (e.g. 2026-12-31T23:59:59Z)'
+    });
+
     const bodyNodes = [
       el('div', {},
         el('label', { for: 'createNoteScope', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'RULE 4 SCOPE *'),
@@ -2638,6 +2924,24 @@ export const dashboardJs = `
       el('div', {},
         el('label', { for: 'createNoteFiles', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'FILES TOUCHED (OPTIONAL)'),
         filesInput
+      ),
+      el('div', {},
+        el('label', { for: 'createNoteUserId', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'USER ID (OPTIONAL)'),
+        userIdInput
+      ),
+      el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '8px' } },
+        el('div', {},
+          el('label', { for: 'createNoteEventAt', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'EVENT AT (OPTIONAL)'),
+          eventAtInput
+        ),
+        el('div', {},
+          el('label', { for: 'createNoteValidFrom', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'VALID FROM (OPTIONAL)'),
+          validFromInput
+        ),
+        el('div', {},
+          el('label', { for: 'createNoteValidUntil', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'VALID UNTIL (OPTIONAL)'),
+          validUntilInput
+        )
       )
     ];
 
@@ -2651,6 +2955,10 @@ export const dashboardJs = `
           const type = typeSelect.value;
           const title = titleInput.value.trim();
           const content = contentTextarea.value.trim();
+          const userIdVal = userIdInput.value.trim() || undefined;
+          const eventAtVal = eventAtInput.value.trim() || undefined;
+          const validFromVal = validFromInput.value.trim() || undefined;
+          const validUntilVal = validUntilInput.value.trim() || undefined;
 
           if (scope === 'project' && !projectId) {
             showToast('projectId is required when scope is project', 'amber');
@@ -2703,7 +3011,11 @@ export const dashboardJs = `
                 title,
                 content,
                 concepts,
-                files
+                files,
+                user_id: userIdVal,
+                event_at: eventAtVal,
+                valid_from: validFromVal,
+                valid_until: validUntilVal
               })
             });
 
@@ -2715,6 +3027,7 @@ export const dashboardJs = `
             optCard.removeAttribute('data-optimistic');
             optCard.style.borderColor = '';
             optCard.style.borderStyle = '';
+            swrCache.notes.clear();
             showToast('Note saved.', 'emerald');
             close();
             fetchStats();
@@ -4558,11 +4871,43 @@ export const dashboardJs = `
     if (btnSess) btnSess.addEventListener('click', loadShortSessions);
     const selSessStatus = document.getElementById('shortSessionsStatus');
     if (selSessStatus) selSessStatus.addEventListener('change', loadShortSessions);
+    const chkSessAncestors = document.getElementById('shortSessionsCheckAncestors');
+    if (chkSessAncestors) chkSessAncestors.addEventListener('change', loadShortSessions);
+    const chkSessChildren = document.getElementById('shortSessionsCheckChildren');
+    if (chkSessChildren) chkSessChildren.addEventListener('change', loadShortSessions);
+    const inpSessUserId = document.getElementById('shortSessionsInputUserId');
+    if (inpSessUserId) {
+      inpSessUserId.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          loadShortSessions();
+        }
+      });
+    }
 
     const btnAct = document.getElementById('btnFilterShortActions');
     if (btnAct) btnAct.addEventListener('click', loadShortActions);
     const selActStatus = document.getElementById('shortActionsStatus');
     if (selActStatus) selActStatus.addEventListener('change', loadShortActions);
+    const chkActAncestors = document.getElementById('shortActionsCheckAncestors');
+    if (chkActAncestors) chkActAncestors.addEventListener('change', loadShortActions);
+    const chkActChildren = document.getElementById('shortActionsCheckChildren');
+    if (chkActChildren) chkActChildren.addEventListener('change', loadShortActions);
+    const chkActDueOnly = document.getElementById('shortActionsCheckDueOnly');
+    if (chkActDueOnly) chkActDueOnly.addEventListener('change', loadShortActions);
+    const inpActUserId = document.getElementById('shortActionsInputUserId');
+    if (inpActUserId) {
+      inpActUserId.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          loadShortActions();
+        }
+      });
+    }
+    const btnCreateAct = document.getElementById('btnOpenCreateActionModal');
+    if (btnCreateAct) {
+      btnCreateAct.addEventListener('click', () => openActionModal(null));
+    }
   }
 
   function switchShortSubTab(subTabKey) {
@@ -4635,7 +4980,9 @@ export const dashboardJs = `
         createBadge(agentName, 'subtle', true),
         createBadge((sess.status || 'active').toUpperCase(), getSessionStatusVariant(sess.status), true),
         createBadge(sess.scope || 'unknown', scopeVariant, true),
-        sess.project_id ? createBadge(sess.project_id, 'subtle', true) : null
+        sess.project_id ? createBadge(sess.project_id, 'subtle', true) : null,
+        createMatchTierBadge(sess.match_tier),
+        sess.user_id ? createBadge('user: ' + sess.user_id, 'subtle', true) : null
       );
 
       const replayBtn = el('button', {
@@ -4669,16 +5016,23 @@ export const dashboardJs = `
 
     const projInput = document.getElementById('shortSessionsProject');
     const statusSelect = document.getElementById('shortSessionsStatus');
+    const chkAncestors = document.getElementById('shortSessionsCheckAncestors');
+    const chkChildren = document.getElementById('shortSessionsCheckChildren');
+    const userInput = document.getElementById('shortSessionsInputUserId');
     let projVal = projInput ? projInput.value.trim() : '';
     if (projVal.toLowerCase() === 'all projects') projVal = '';
 
     const params = new URLSearchParams();
     if (projVal) params.set('project_id', projVal);
     if (statusSelect && statusSelect.value) params.set('status', statusSelect.value);
+    params.set('include_ancestors', chkAncestors ? (chkAncestors.checked ? 'true' : 'false') : 'true');
+    params.set('include_children', chkChildren && chkChildren.checked ? 'true' : 'false');
+    if (userInput && userInput.value.trim()) params.set('user_id', userInput.value.trim());
     params.set('limit', '50');
 
     const cacheKey = params.toString() || 'default';
-    const cachedSessions = swrCache.sessions.get(cacheKey) || (cacheKey === 'limit=50' ? swrCache.sessions.get('default') : null);
+    const isDefaultSessQuery = !projVal && !statusSelect?.value && !userInput?.value.trim() && (chkAncestors?.checked !== false) && !chkChildren?.checked;
+    const cachedSessions = swrCache.sessions.get(cacheKey) || (isDefaultSessQuery ? swrCache.sessions.get('default') : null);
     if (cachedSessions) {
       renderShortSessionsList(container, cachedSessions, true);
     } else {
@@ -4693,7 +5047,7 @@ export const dashboardJs = `
       const data = await resp.json();
       const sessions = Array.isArray(data.sessions) ? data.sessions : [];
       swrCache.sessions.set(cacheKey, sessions);
-      if (cacheKey === 'limit=50') swrCache.sessions.set('default', sessions);
+      if (isDefaultSessQuery) swrCache.sessions.set('default', sessions);
       renderShortSessionsList(container, sessions, false);
     } catch (err) {
       if (!cachedSessions) {
@@ -4830,6 +5184,7 @@ export const dashboardJs = `
       const card = el('div', { className: 'result-card', id: 'actionCard_' + act.id });
       const scopeVariant = act.scope === 'project' ? 'emerald' : (act.scope === 'unknown' ? 'rose' : 'subtle');
       const isTerminal = act.status === 'done' || act.status === 'dismissed';
+      const overdue = isActionOverdue(act);
 
       const statusBadge = createBadge((act.status || 'ready').toUpperCase(), getActionStatusVariant(act.status), true);
 
@@ -4837,8 +5192,16 @@ export const dashboardJs = `
         createBadge((act.priority || 'normal').toUpperCase(), getActionPriorityVariant(act.priority), true),
         statusBadge,
         createBadge(act.scope || 'unknown', scopeVariant, true),
-        act.project_id ? createBadge(act.project_id, 'subtle', true) : null
+        act.project_id ? createBadge(act.project_id, 'subtle', true) : null,
+        createMatchTierBadge(act.match_tier),
+        overdue ? el('span', { className: 'overdue-pill' }, '[OVERDUE]') : null
       );
+
+      const editBtn = el('button', {
+        type: 'button',
+        className: 'btn',
+        onClick: () => openActionModal(act)
+      }, el('span', { className: 'icon-swap-slot icon-swap-in' }, createSvgIcon('edit')), el('span', { className: 'btn-label' }, 'Edit'));
 
       const doneBtn = el('button', {
         type: 'button',
@@ -4864,7 +5227,7 @@ export const dashboardJs = `
 
       card.appendChild(el('div', { className: 'card-header', style: { marginBottom: '8px' } },
         headerLeft,
-        el('div', { className: 'control-row' }, doneBtn, dismissBtn)
+        el('div', { className: 'control-row' }, editBtn, doneBtn, dismissBtn)
       ));
 
       card.appendChild(el('div', { className: 'font-semibold', style: { fontSize: '14px', marginBottom: '4px' } }, act.title));
@@ -4874,6 +5237,26 @@ export const dashboardJs = `
       if (act.blocked_reason) {
         card.appendChild(el('div', { style: { fontSize: '12px', color: 'var(--accent-rose)', marginBottom: '8px' } }, 'Blocked: ' + act.blocked_reason));
       }
+      const metaTags = el('div', { className: 'tag-list', style: { marginBottom: '4px' } });
+      if (act.due_at) {
+        metaTags.appendChild(createBadge('due: ' + formatTimestamp(act.due_at), overdue ? 'rose' : 'amber', true));
+      }
+      if (act.remind_at) {
+        metaTags.appendChild(createBadge('remind: ' + formatTimestamp(act.remind_at), 'subtle', true));
+      }
+      if (act.recurrence) {
+        metaTags.appendChild(createBadge('repeat: ' + act.recurrence, 'emerald', true));
+      }
+      if (act.snooze_until) {
+        metaTags.appendChild(createBadge('snoozed: ' + formatTimestamp(act.snooze_until), 'subtle', true));
+      }
+      if (act.user_id) {
+        metaTags.appendChild(createBadge('user: ' + act.user_id, 'subtle', true));
+      }
+      if (metaTags.children.length > 0) {
+        card.appendChild(metaTags);
+      }
+
       const actScopeLabel = act.scope === 'project' && act.project_id ? ('project/' + act.project_id) : (act.scope || 'unknown');
       card.appendChild(createProvenanceLine(
         'scope: ' + actScopeLabel + (act.session_id ? ' · session: ' + act.session_id : '') + ' · id: ' + act.id + ' · updated: ' + formatTimestamp(act.updated_at || act.created_at)
@@ -4883,21 +5266,260 @@ export const dashboardJs = `
     });
   }
 
+  function openActionModal(existingAction = null) {
+    const isEdit = Boolean(existingAction && existingAction.id);
+    const scopeSelect = el('select', { id: 'actionModalScope', className: 'form-select', style: { width: '100%' } },
+      el('option', { value: 'project', selected: !existingAction || existingAction.scope === 'project' }, 'project (requires project_id)'),
+      el('option', { value: 'global', selected: Boolean(existingAction && existingAction.scope === 'global') }, 'global'),
+      el('option', { value: 'unknown', selected: Boolean(existingAction && existingAction.scope === 'unknown') }, 'unknown')
+    );
+
+    const projWrapper = el('div', { className: 'searchable-dropdown flex-1', style: { width: '100%' } });
+    const projectInput = el('input', {
+      id: 'actionModalProject',
+      type: 'text',
+      className: 'form-input input-w-full-pr',
+      'aria-label': 'Action Project ID',
+      value: existingAction && existingAction.project_id ? existingAction.project_id : '',
+      placeholder: 'Project ID (e.g. acme/socials/calendar)...'
+    });
+    projWrapper.appendChild(projectInput);
+    attachSearchableProjectDropdown(projWrapper, projectInput, { includeAllOption: false });
+
+    const syncActionScopeDisabled = () => {
+      const isProj = scopeSelect.value === 'project';
+      projectInput.disabled = !isProj;
+      if (!isProj) projectInput.value = '';
+    };
+    scopeSelect.addEventListener('change', syncActionScopeDisabled);
+    syncActionScopeDisabled();
+
+    const titleInput = el('input', {
+      id: 'actionModalTitle',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      value: existingAction && existingAction.title ? existingAction.title : '',
+      placeholder: 'Next action title...'
+    });
+
+    const descTextarea = el('textarea', {
+      id: 'actionModalDescription',
+      className: 'form-textarea',
+      placeholder: 'Action details, checklist, or reminder notes...',
+      textContent: existingAction && existingAction.description ? existingAction.description : ''
+    });
+
+    const prioritySelect = el('select', { id: 'actionModalPriority', className: 'form-select', style: { width: '100%' } },
+      el('option', { value: 'low', selected: Boolean(existingAction && existingAction.priority === 'low') }, 'low'),
+      el('option', { value: 'normal', selected: !existingAction || existingAction.priority === 'normal' }, 'normal'),
+      el('option', { value: 'high', selected: Boolean(existingAction && existingAction.priority === 'high') }, 'high'),
+      el('option', { value: 'urgent', selected: Boolean(existingAction && existingAction.priority === 'urgent') }, 'urgent')
+    );
+
+    const statusSelect = el('select', { id: 'actionModalStatus', className: 'form-select', style: { width: '100%' } },
+      el('option', { value: 'ready', selected: !existingAction || existingAction.status === 'ready' }, 'ready'),
+      el('option', { value: 'in_progress', selected: Boolean(existingAction && existingAction.status === 'in_progress') }, 'in_progress'),
+      el('option', { value: 'blocked', selected: Boolean(existingAction && existingAction.status === 'blocked') }, 'blocked'),
+      el('option', { value: 'done', selected: Boolean(existingAction && existingAction.status === 'done') }, 'done'),
+      el('option', { value: 'dismissed', selected: Boolean(existingAction && existingAction.status === 'dismissed') }, 'dismissed')
+    );
+
+    const dueAtInput = el('input', {
+      id: 'actionModalDueAt',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      value: existingAction && existingAction.due_at ? existingAction.due_at : '',
+      placeholder: 'ISO UTC (e.g. 2026-11-25T17:00:00Z)'
+    });
+
+    const remindAtInput = el('input', {
+      id: 'actionModalRemindAt',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      value: existingAction && existingAction.remind_at ? existingAction.remind_at : '',
+      placeholder: 'ISO UTC (e.g. 2026-11-25T15:00:00Z)'
+    });
+
+    const recurrenceInput = el('input', {
+      id: 'actionModalRecurrence',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      value: existingAction && existingAction.recurrence ? existingAction.recurrence : '',
+      placeholder: 'Cron or ISO duration (e.g. P1W, @daily, 0 9 * * 1)'
+    });
+
+    const snoozeUntilInput = el('input', {
+      id: 'actionModalSnoozeUntil',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      value: existingAction && existingAction.snooze_until ? existingAction.snooze_until : '',
+      placeholder: 'ISO UTC (e.g. 2026-11-23T09:00:00Z)'
+    });
+
+    const userIdInput = el('input', {
+      id: 'actionModalUserId',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      value: existingAction && existingAction.user_id ? existingAction.user_id : '',
+      placeholder: 'Optional user_id'
+    });
+
+    const bodyNodes = [
+      el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '8px' } },
+        el('div', {},
+          el('label', { for: 'actionModalScope', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'SCOPE *'),
+          scopeSelect
+        ),
+        el('div', {},
+          el('label', { for: 'actionModalProject', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'PROJECT ID'),
+          projWrapper
+        )
+      ),
+      el('div', {},
+        el('label', { for: 'actionModalTitle', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'TITLE *'),
+        titleInput
+      ),
+      el('div', {},
+        el('label', { for: 'actionModalDescription', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'DESCRIPTION (OPTIONAL)'),
+        descTextarea
+      ),
+      el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '8px' } },
+        el('div', {},
+          el('label', { for: 'actionModalPriority', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'PRIORITY'),
+          prioritySelect
+        ),
+        el('div', {},
+          el('label', { for: 'actionModalStatus', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'STATUS'),
+          statusSelect
+        ),
+        el('div', {},
+          el('label', { for: 'actionModalUserId', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'USER ID'),
+          userIdInput
+        )
+      ),
+      el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '8px' } },
+        el('div', {},
+          el('label', { for: 'actionModalDueAt', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'DUE AT (UTC ISO)'),
+          dueAtInput
+        ),
+        el('div', {},
+          el('label', { for: 'actionModalRemindAt', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'REMIND AT (UTC ISO)'),
+          remindAtInput
+        )
+      ),
+      el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '8px' } },
+        el('div', {},
+          el('label', { for: 'actionModalRecurrence', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'RECURRENCE'),
+          recurrenceInput
+        ),
+        el('div', {},
+          el('label', { for: 'actionModalSnoozeUntil', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'SNOOZE UNTIL (UTC ISO)'),
+          snoozeUntilInput
+        )
+      )
+    ];
+
+    showModal(isEdit ? 'Edit Action · ' + existingAction.id : 'Create Next Action / Reminder', bodyNodes, [
+      {
+        label: isEdit ? 'Save Action' : 'Create Action',
+        variant: 'primary',
+        onClick: async (_e, close) => {
+          const scope = scopeSelect.value;
+          const projectId = scope === 'project' ? projectInput.value.trim() : null;
+          const title = titleInput.value.trim();
+          if (scope === 'project' && !projectId) {
+            showToast('project_id is required when scope is project', 'amber');
+            return;
+          }
+          if (!title) {
+            showToast('Action title is required', 'amber');
+            return;
+          }
+
+          const payload = {
+            scope,
+            project_id: projectId,
+            title,
+            description: descTextarea.value.trim() || null,
+            priority: prioritySelect.value,
+            status: statusSelect.value,
+            due_at: dueAtInput.value.trim() || null,
+            remind_at: remindAtInput.value.trim() || null,
+            recurrence: recurrenceInput.value.trim() || null,
+            snooze_until: snoozeUntilInput.value.trim() || null,
+            user_id: userIdInput.value.trim() || null
+          };
+
+          const submitBtn = _e && _e.currentTarget ? _e.currentTarget : null;
+          try {
+            if (submitBtn) {
+              submitBtn.disabled = true;
+              submitBtn.textContent = 'Saving...';
+            }
+            const url = isEdit ? ('/actions/' + encodeURIComponent(existingAction.id)) : '/actions';
+            const resp = await apiFetch(url, {
+              method: isEdit ? 'PATCH' : 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              throw new Error(data.error?.message || 'Action request failed: ' + resp.status);
+            }
+            swrCache.actions.clear();
+            const nextOcc = data.action && data.action.next_occurrence;
+            showToast(
+              nextOcc
+                ? ('Action saved. Next occurrence scheduled for ' + formatTimestamp(nextOcc.due_at || nextOcc.remind_at))
+                : (isEdit ? 'Action updated.' : 'Action created.'),
+              'emerald'
+            );
+            close();
+            fetchStats();
+            loadShortActions();
+          } catch (err) {
+            if (submitBtn) {
+              submitBtn.disabled = false;
+              submitBtn.textContent = isEdit ? 'Save Action' : 'Create Action';
+            }
+            showToast('Action error: ' + err.message, 'rose');
+          }
+        }
+      }
+    ]);
+  }
+
   async function loadShortActions() {
     const container = document.getElementById('shortTermListContainer');
     if (!container) return;
 
     const projInput = document.getElementById('shortActionsProject');
     const statusSelect = document.getElementById('shortActionsStatus');
+    const chkAncestors = document.getElementById('shortActionsCheckAncestors');
+    const chkChildren = document.getElementById('shortActionsCheckChildren');
+    const chkDueOnly = document.getElementById('shortActionsCheckDueOnly');
+    const userInput = document.getElementById('shortActionsInputUserId');
+
     let projVal = projInput ? projInput.value.trim() : '';
     if (projVal.toLowerCase() === 'all projects') projVal = '';
+    const dueOnly = Boolean(chkDueOnly && chkDueOnly.checked);
+    const statusFilter = statusSelect && statusSelect.value ? statusSelect.value : '';
 
     const params = new URLSearchParams();
     if (projVal) params.set('project_id', projVal);
-    if (statusSelect && statusSelect.value) params.set('status', statusSelect.value);
+    params.set('include_ancestors', chkAncestors ? (chkAncestors.checked ? 'true' : 'false') : 'true');
+    params.set('include_children', chkChildren && chkChildren.checked ? 'true' : 'false');
+    if (userInput && userInput.value.trim()) params.set('user_id', userInput.value.trim());
+    if (!dueOnly && statusFilter) params.set('status', statusFilter);
     params.set('limit', '50');
 
-    const cacheKey = params.toString() || 'default';
+    const cacheKey = (dueOnly ? 'due:' : 'all:') + (params.toString() || 'default');
     const cachedActions = swrCache.actions.get(cacheKey);
     if (cachedActions) {
       renderShortActionsList(container, cachedActions, true);
@@ -4908,10 +5530,14 @@ export const dashboardJs = `
     }
 
     try {
-      const resp = await apiFetch('/actions?' + params.toString());
+      const endpoint = dueOnly ? '/dashboard/api/actions/due?' : '/actions?';
+      const resp = await apiFetch(endpoint + params.toString());
       if (!resp.ok) throw new Error('Failed to load actions: ' + resp.status);
       const data = await resp.json();
-      const actions = Array.isArray(data.actions) ? data.actions : [];
+      let actions = Array.isArray(data.actions) ? data.actions : [];
+      if (dueOnly && statusFilter) {
+        actions = actions.filter((a) => a.status === statusFilter);
+      }
       swrCache.actions.set(cacheKey, actions);
       renderShortActionsList(container, actions, false);
     } catch (err) {
@@ -4941,18 +5567,26 @@ export const dashboardJs = `
         body: JSON.stringify({ status })
       });
       if (!resp.ok) throw new Error('Update failed: ' + resp.status);
+      const data = await resp.json().catch(() => ({}));
       if (targetCard) {
         targetCard.removeAttribute('data-optimistic');
         targetCard.style.borderColor = '';
       }
+      swrCache.actions.clear();
 
-      showUndoToast('Action marked as ' + status, async () => {
+      const nextOcc = data.action && data.action.next_occurrence;
+      const statusMsg = nextOcc
+        ? ('Action marked as ' + status + '. Next occurrence scheduled for ' + formatTimestamp(nextOcc.due_at || nextOcc.remind_at))
+        : ('Action marked as ' + status);
+
+      showUndoToast(statusMsg, async () => {
         const revertResp = await apiFetch('/actions/' + encodeURIComponent(actionId), {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ status: previousStatus })
         });
         if (revertResp.ok) {
+          swrCache.actions.clear();
           showToast('Restored action to ' + previousStatus, 'emerald', 2500);
           loadShortActions();
           fetchStats();
@@ -4981,14 +5615,25 @@ export const dashboardJs = `
   // Knowledge Graph Tab (SVG Renderer + Side Inspector)
   // =========================================================================
   const GRAPH_TYPE_COLORS = {
+    entity: '#F59E0B',
     note: '#10B981',
     lesson: '#F59E0B',
     concept: '#047857',
     file: '#9CA3AF',
     session: '#F3F4F6',
     action: '#FB7185',
-    summary: '#10B981'
+    summary: '#10B981',
+    trajectory: '#9CA3AF',
+    observation: '#047857'
   };
+
+  const SYNTHETIC_GRAPH_EDGE_TYPES = new Set([
+    'has_concept',
+    'touches_file',
+    'supersedes',
+    'from_session',
+    'cites_source'
+  ]);
 
   let savedGraphInspectorEmpty = null;
 
@@ -5016,6 +5661,21 @@ export const dashboardJs = `
     if (scopeSel) scopeSel.addEventListener('change', loadGraph);
     const limitSel = document.getElementById('graphFilterLimit');
     if (limitSel) limitSel.addEventListener('change', loadGraph);
+    const depthSel = document.getElementById('graphFilterDepth');
+    if (depthSel) depthSel.addEventListener('change', loadGraph);
+    const entityTypeSel = document.getElementById('graphFilterEntityType');
+    if (entityTypeSel) entityTypeSel.addEventListener('change', loadGraph);
+    const chkAncestors = document.getElementById('graphCheckAncestors');
+    if (chkAncestors) chkAncestors.addEventListener('change', loadGraph);
+    const chkChildren = document.getElementById('graphCheckChildren');
+    if (chkChildren) chkChildren.addEventListener('change', loadGraph);
+    const chkGlobal = document.getElementById('graphCheckGlobal');
+    if (chkGlobal) chkGlobal.addEventListener('change', loadGraph);
+
+    const btnAddEntity = document.getElementById('btnOpenAddEntityModal');
+    if (btnAddEntity) btnAddEntity.addEventListener('click', openAddEntityModal);
+    const btnLinkNodes = document.getElementById('btnOpenLinkNodesModal');
+    if (btnLinkNodes) btnLinkNodes.addEventListener('click', () => openLinkNodesModal());
   }
 
   function renderGraphSnapshot(data, isUpdating = false) {
@@ -5052,6 +5712,11 @@ export const dashboardJs = `
     const projInput = document.getElementById('graphFilterProject');
     const scopeSel = document.getElementById('graphFilterScope');
     const limitSel = document.getElementById('graphFilterLimit');
+    const depthSel = document.getElementById('graphFilterDepth');
+    const entityTypeSel = document.getElementById('graphFilterEntityType');
+    const chkAncestors = document.getElementById('graphCheckAncestors');
+    const chkChildren = document.getElementById('graphCheckChildren');
+    const chkGlobal = document.getElementById('graphCheckGlobal');
 
     let projVal = projInput ? projInput.value.trim() : '';
     if (projVal.toLowerCase() === 'all projects') projVal = '';
@@ -5060,9 +5725,17 @@ export const dashboardJs = `
     if (projVal) params.set('project_id', projVal);
     if (scopeSel && scopeSel.value) params.set('scope', scopeSel.value);
     if (limitSel && limitSel.value) params.set('limit', limitSel.value);
+    if (depthSel && depthSel.value) params.set('depth', depthSel.value);
+    if (entityTypeSel && entityTypeSel.value && entityTypeSel.value !== 'all') {
+      params.set('entity_type', entityTypeSel.value);
+    }
+    params.set('include_ancestors', chkAncestors ? (chkAncestors.checked ? 'true' : 'false') : 'true');
+    params.set('include_children', chkChildren && chkChildren.checked ? 'true' : 'false');
+    params.set('include_global', chkGlobal && chkGlobal.checked ? 'true' : 'false');
 
     const cacheKey = params.toString() || 'default';
-    const cachedGraph = swrCache.graph.get(cacheKey) || (cacheKey === 'limit=80' ? swrCache.graph.get('default') : null);
+    const isDefaultGraphQuery = !projVal && !scopeSel?.value && (!entityTypeSel || entityTypeSel.value === 'all') && (!depthSel || depthSel.value === '1') && (!limitSel || limitSel.value === '80') && (chkAncestors?.checked !== false) && !chkChildren?.checked && !chkGlobal?.checked;
+    const cachedGraph = swrCache.graph.get(cacheKey) || (isDefaultGraphQuery ? swrCache.graph.get('default') : null);
     if (cachedGraph) {
       renderGraphSnapshot(cachedGraph, true);
     } else {
@@ -5076,7 +5749,7 @@ export const dashboardJs = `
       if (!resp.ok) throw new Error('Graph request failed: ' + resp.status);
       const freshGraph = await resp.json();
       swrCache.graph.set(cacheKey, freshGraph);
-      if (cacheKey === 'limit=80') swrCache.graph.set('default', freshGraph);
+      if (isDefaultGraphQuery) swrCache.graph.set('default', freshGraph);
       renderGraphSnapshot(freshGraph, false);
     } catch (err) {
       if (!cachedGraph) {
@@ -5094,10 +5767,13 @@ export const dashboardJs = `
     if (!legend) return;
     legend.replaceChildren();
     Object.entries(GRAPH_TYPE_COLORS).forEach(([type, color]) => {
+      const swatch = type === 'entity'
+        ? el('span', { className: 'graph-legend-diamond', style: { backgroundColor: color } })
+        : el('span', { className: 'graph-legend-swatch', style: { backgroundColor: color } });
       legend.appendChild(
         el('div', { className: 'graph-legend-item' },
-          el('span', { className: 'graph-legend-swatch', style: { backgroundColor: color } }),
-          el('span', {}, type)
+          swatch,
+          el('span', {}, type === 'entity' ? 'entity (diamond)' : type)
         )
       );
     });
@@ -5106,7 +5782,7 @@ export const dashboardJs = `
   function computeGraphPositions(nodes, edges, width, height) {
     const cx = width / 2;
     const cy = height / 2;
-    const typeOrder = ['session', 'summary', 'note', 'lesson', 'action', 'concept', 'file'];
+    const typeOrder = ['session', 'summary', 'entity', 'note', 'lesson', 'trajectory', 'action', 'observation', 'concept', 'file'];
     const buckets = new Map();
     typeOrder.forEach((t) => buckets.set(t, []));
     nodes.forEach((n) => {
@@ -5117,12 +5793,15 @@ export const dashboardJs = `
     const pos = new Map();
     const ringRadii = {
       session: 70,
-      summary: 120,
-      note: 175,
-      lesson: 175,
-      action: 215,
-      concept: 240,
-      file: 255
+      summary: 115,
+      entity: 150,
+      note: 185,
+      lesson: 185,
+      trajectory: 205,
+      action: 220,
+      observation: 235,
+      concept: 245,
+      file: 260
     };
 
     typeOrder.forEach((type, typeIdx) => {
@@ -5225,6 +5904,8 @@ export const dashboardJs = `
     nodes.forEach((node) => {
       const p = positions.get(node.id);
       if (!p) return;
+      const cx = Math.round(p.x);
+      const cy = Math.round(p.y);
       const g = document.createElementNS(SVG_NS, 'g');
       g.setAttribute('class', 'graph-node' + (selectedGraphNodeId === node.id ? ' selected' : ''));
       g.setAttribute('data-node-id', node.id);
@@ -5232,26 +5913,39 @@ export const dashboardJs = `
       g.setAttribute('tabindex', '0');
       g.setAttribute('aria-label', '[' + node.type + '] ' + (node.label || node.id));
 
-      const circle = document.createElementNS(SVG_NS, 'circle');
-      circle.setAttribute('cx', String(Math.round(p.x)));
-      circle.setAttribute('cy', String(Math.round(p.y)));
-      circle.setAttribute('r', node.type === 'session' || node.type === 'summary' ? '12' : '9');
-      circle.setAttribute('fill', GRAPH_TYPE_COLORS[node.type] || '#9CA3AF');
-      circle.setAttribute('stroke', 'var(--bg-base)');
-      circle.setAttribute('stroke-width', '1.5');
+      if (node.type === 'entity') {
+        const diamond = document.createElementNS(SVG_NS, 'polygon');
+        const r = 13;
+        diamond.setAttribute(
+          'points',
+          cx + ',' + (cy - r) + ' ' + (cx + r) + ',' + cy + ' ' + cx + ',' + (cy + r) + ' ' + (cx - r) + ',' + cy
+        );
+        diamond.setAttribute('fill', GRAPH_TYPE_COLORS.entity);
+        diamond.setAttribute('stroke', '#F3F4F6');
+        diamond.setAttribute('stroke-width', '2');
+        g.appendChild(diamond);
+      } else {
+        const circle = document.createElementNS(SVG_NS, 'circle');
+        circle.setAttribute('cx', String(cx));
+        circle.setAttribute('cy', String(cy));
+        circle.setAttribute('r', node.type === 'session' || node.type === 'summary' ? '12' : '9');
+        circle.setAttribute('fill', GRAPH_TYPE_COLORS[node.type] || '#9CA3AF');
+        circle.setAttribute('stroke', 'var(--bg-base)');
+        circle.setAttribute('stroke-width', '1.5');
+        g.appendChild(circle);
+      }
 
       const labelText = (node.label || node.id || '').slice(0, 18);
       const text = document.createElementNS(SVG_NS, 'text');
-      text.setAttribute('x', String(Math.round(p.x)));
-      text.setAttribute('y', String(Math.round(p.y + 20)));
+      text.setAttribute('x', String(cx));
+      text.setAttribute('y', String(cy + (node.type === 'entity' ? 24 : 20)));
       text.setAttribute('text-anchor', 'middle');
       text.setAttribute('class', 'graph-node-label');
       text.textContent = labelText;
 
       const title = document.createElementNS(SVG_NS, 'title');
-      title.textContent = '[' + node.type + '] ' + (node.label || node.id);
+      title.textContent = '[' + node.type + (node.entity_type ? ':' + node.entity_type : '') + '] ' + (node.label || node.id);
 
-      g.appendChild(circle);
       g.appendChild(text);
       g.appendChild(title);
       g.addEventListener('click', () => selectGraphNode(node.id));
@@ -5296,34 +5990,62 @@ export const dashboardJs = `
 
     const nodeTypeVariant = (node.type === 'note' || node.type === 'summary')
       ? 'emerald'
-      : (node.type === 'lesson' ? 'amber' : (node.type === 'action' ? 'rose' : 'subtle'));
+      : ((node.type === 'lesson' || node.type === 'entity') ? 'amber' : (node.type === 'action' ? 'rose' : 'subtle'));
 
     inspector.appendChild(
       el('div', { className: 'control-row mb-4', style: { flexWrap: 'wrap' } },
         createBadge((node.type || 'node').toUpperCase(), nodeTypeVariant, true),
+        node.entity_type ? createBadge(node.entity_type, 'amber', true) : null,
         node.scope ? createBadge(node.scope, node.scope === 'project' ? 'emerald' : (node.scope === 'unknown' ? 'rose' : 'subtle'), true) : null,
-        node.project_id ? createBadge(node.project_id, 'subtle', true) : null
+        node.project_id ? createBadge(node.project_id, 'subtle', true) : null,
+        createMatchTierBadge(node.match_tier)
       )
     );
 
     inspector.appendChild(el('h3', { style: { fontSize: '16px', marginBottom: '8px', wordBreak: 'break-word' } }, node.label || node.id));
+    inspector.appendChild(
+      el('div', { className: 'control-row mb-4' },
+        el('button', {
+          type: 'button',
+          className: 'btn',
+          style: { height: '28px', padding: '0 10px', fontSize: '12px' },
+          onClick: () => openLinkNodesModal(node.id, node.type)
+        }, '+ Link from Node')
+      )
+    );
     inspector.appendChild(createProvenanceLine(
       'node: ' + (node.type || 'record') + ' · id: ' + node.id +
+      (node.project_id ? ' · project: ' + node.project_id : '') +
       (node.meta && node.meta.created_at ? ' · ' + formatTimestamp(node.meta.created_at) : '')
     ));
 
-    if (node.meta && typeof node.meta === 'object' && Object.keys(node.meta).length > 0) {
-      const metaBox = el('div', { className: 'result-card', style: { marginBottom: '12px', padding: '10px' } });
-      Object.entries(node.meta).forEach(([k, v]) => {
-        if (v === null || v === undefined) return;
-        metaBox.appendChild(
-          el('div', { style: { fontSize: '12px', marginBottom: '4px' } },
-            el('span', { className: 'text-muted text-mono' }, k + ': '),
-            el('span', {}, typeof v === 'object' ? JSON.stringify(v) : String(v))
+    const extRef = node.external_ref || (node.meta && node.meta.external_ref);
+    if (extRef) {
+      const extNode = createSafeExternalRefNode(extRef);
+      if (extNode) {
+        inspector.appendChild(
+          el('div', { className: 'result-card', style: { marginBottom: '12px', padding: '10px' } },
+            el('div', { className: 'inspector-label' }, 'EXTERNAL REF'),
+            extNode
           )
         );
-      });
-      inspector.appendChild(metaBox);
+      }
+    }
+
+    if (node.meta && typeof node.meta === 'object' && Object.keys(node.meta).length > 0) {
+      const metaEntries = Object.entries(node.meta).filter(([k, v]) => v !== null && v !== undefined && k !== 'external_ref');
+      if (metaEntries.length > 0) {
+        const metaBox = el('div', { className: 'result-card', style: { marginBottom: '12px', padding: '10px' } });
+        metaEntries.forEach(([k, v]) => {
+          metaBox.appendChild(
+            el('div', { style: { fontSize: '12px', marginBottom: '4px' } },
+              el('span', { className: 'text-muted text-mono' }, k + ': '),
+              el('span', {}, typeof v === 'object' ? JSON.stringify(v) : String(v))
+            )
+          );
+        });
+        inspector.appendChild(metaBox);
+      }
     }
 
     const connected = edges.filter((e) => e.source === node.id || e.target === node.id);
@@ -5341,21 +6063,343 @@ export const dashboardJs = `
       const otherId = isOutgoing ? edge.target : edge.source;
       const otherNode = nodesById.get(otherId);
       const otherLabel = otherNode ? ('[' + otherNode.type + '] ' + (otherNode.label || otherId)) : otherId;
+      const isSynthetic = SYNTHETIC_GRAPH_EDGE_TYPES.has(edge.type);
 
-      inspector.appendChild(
-        el('button', {
-          type: 'button',
-          className: 'graph-edge-link',
-          onClick: () => selectGraphNode(otherId)
-        },
-          el('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-            (isOutgoing ? '→ ' : '← ') + otherLabel
-          ),
-          el('span', { className: 'text-muted text-mono', style: { fontSize: '12px', flexShrink: '0' } }, edge.type)
-        )
+      const navBtn = el('button', {
+        type: 'button',
+        className: 'graph-edge-link',
+        onClick: () => selectGraphNode(otherId)
+      },
+        el('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+          (isOutgoing ? '→ ' : '← ') + otherLabel
+        ),
+        el('span', { className: 'text-muted text-mono', style: { fontSize: '12px', flexShrink: '0' } }, edge.type)
       );
+
+      if (isSynthetic) {
+        inspector.appendChild(navBtn);
+      } else {
+        const unlinkBtn = el('button', {
+          type: 'button',
+          className: 'btn btn-rose',
+          title: 'Unlink edge',
+          'aria-label': 'Unlink edge ' + edge.type,
+          style: { height: '28px', padding: '0 8px', fontSize: '12px' },
+          onClick: async (e) => {
+            e.stopPropagation();
+            try {
+              const resp = await apiFetch('/dashboard/api/graph/edges', {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  source_id: edge.source,
+                  target_id: edge.target,
+                  relation: edge.type
+                })
+              });
+              if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                throw new Error(err.error?.message || 'Unlink failed: ' + resp.status);
+              }
+              swrCache.graph.clear();
+              showToast('Edge unlinked.', 'emerald', 2500);
+              loadGraph();
+            } catch (err) {
+              showToast('Unlink error: ' + err.message, 'rose');
+            }
+          }
+        }, 'Unlink');
+        inspector.appendChild(el('div', { className: 'graph-edge-row' }, navBtn, unlinkBtn));
+      }
     });
     initBlurHashPlaceholders();
+  }
+
+  function openAddEntityModal() {
+    const graphProj = document.getElementById('graphFilterProject');
+    const initialProj = graphProj ? graphProj.value.trim() : '';
+
+    const scopeSelect = el('select', { id: 'entityModalScope', className: 'form-select', style: { width: '100%' } },
+      el('option', { value: 'project', selected: true }, 'project (requires project_id)'),
+      el('option', { value: 'global' }, 'global'),
+      el('option', { value: 'unknown' }, 'unknown')
+    );
+
+    const projWrapper = el('div', { className: 'searchable-dropdown flex-1', style: { width: '100%' } });
+    const projectInput = el('input', {
+      id: 'entityModalProject',
+      type: 'text',
+      className: 'form-input input-w-full-pr',
+      'aria-label': 'Entity Project ID',
+      value: initialProj.toLowerCase() === 'all projects' ? '' : initialProj,
+      placeholder: 'Project ID (e.g. acme/socials/calendar)...'
+    });
+    projWrapper.appendChild(projectInput);
+    attachSearchableProjectDropdown(projWrapper, projectInput, { includeAllOption: false });
+
+    scopeSelect.addEventListener('change', () => {
+      const isProj = scopeSelect.value === 'project';
+      projectInput.disabled = !isProj;
+      if (!isProj) projectInput.value = '';
+    });
+
+    const entityTypeSelect = el('select', { id: 'entityModalType', className: 'form-select', style: { width: '100%' } },
+      el('option', { value: 'brand' }, 'brand'),
+      el('option', { value: 'person' }, 'person'),
+      el('option', { value: 'asset' }, 'asset'),
+      el('option', { value: 'metric' }, 'metric'),
+      el('option', { value: 'document' }, 'document'),
+      el('option', { value: 'tool' }, 'tool')
+    );
+
+    const nameInput = el('input', {
+      id: 'entityModalName',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      placeholder: 'Entity name (e.g. Acme Calendar Service)...'
+    });
+
+    const descTextarea = el('textarea', {
+      id: 'entityModalDescription',
+      className: 'form-textarea',
+      placeholder: 'Optional description or role...'
+    });
+
+    const extRefInput = el('input', {
+      id: 'entityModalExternalRef',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      placeholder: 'Optional URL or ref (e.g. https://example.com/docs or doc:123)'
+    });
+
+    const userIdInput = el('input', {
+      id: 'entityModalUserId',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      placeholder: 'Optional user_id'
+    });
+
+    const bodyNodes = [
+      el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '8px' } },
+        el('div', {},
+          el('label', { for: 'entityModalScope', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'SCOPE *'),
+          scopeSelect
+        ),
+        el('div', {},
+          el('label', { for: 'entityModalProject', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'PROJECT ID'),
+          projWrapper
+        )
+      ),
+      el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '8px' } },
+        el('div', {},
+          el('label', { for: 'entityModalType', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'ENTITY TYPE *'),
+          entityTypeSelect
+        ),
+        el('div', {},
+          el('label', { for: 'entityModalUserId', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'USER ID (OPTIONAL)'),
+          userIdInput
+        )
+      ),
+      el('div', {},
+        el('label', { for: 'entityModalName', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'NAME *'),
+        nameInput
+      ),
+      el('div', {},
+        el('label', { for: 'entityModalExternalRef', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'EXTERNAL REF (OPTIONAL)'),
+        extRefInput
+      ),
+      el('div', {},
+        el('label', { for: 'entityModalDescription', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'DESCRIPTION (OPTIONAL)'),
+        descTextarea
+      )
+    ];
+
+    showModal('Add Knowledge Graph Entity', bodyNodes, [
+      {
+        label: 'Save Entity',
+        variant: 'primary',
+        onClick: async (_e, close) => {
+          const scope = scopeSelect.value;
+          const projectId = scope === 'project' ? projectInput.value.trim() : null;
+          const entityType = entityTypeSelect.value;
+          const name = nameInput.value.trim();
+          if (scope === 'project' && !projectId) {
+            showToast('project_id is required when scope is project', 'amber');
+            return;
+          }
+          if (!name) {
+            showToast('Entity name is required', 'amber');
+            return;
+          }
+
+          const submitBtn = _e && _e.currentTarget ? _e.currentTarget : null;
+          try {
+            if (submitBtn) {
+              submitBtn.disabled = true;
+              submitBtn.textContent = 'Saving...';
+            }
+            const resp = await apiFetch('/dashboard/api/graph/entities', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                scope,
+                project_id: projectId,
+                entity_type: entityType,
+                name,
+                description: descTextarea.value.trim() || undefined,
+                external_ref: extRefInput.value.trim() || undefined,
+                user_id: userIdInput.value.trim() || undefined
+              })
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              throw new Error(data.error?.message || 'Create entity failed: ' + resp.status);
+            }
+            swrCache.graph.clear();
+            showToast('Entity saved: ' + (data.entity?.id || name), 'emerald');
+            close();
+            fetchStats();
+            loadGraph();
+          } catch (err) {
+            if (submitBtn) {
+              submitBtn.disabled = false;
+              submitBtn.textContent = 'Save Entity';
+            }
+            showToast('Entity error: ' + err.message, 'rose');
+          }
+        }
+      }
+    ]);
+  }
+
+  function openLinkNodesModal(prefillSourceId = '', prefillSourceType = '') {
+    const loadedNodes = (graphData && Array.isArray(graphData.nodes)) ? graphData.nodes : [];
+    const buildNodeSelect = (selectId, targetInput) => {
+      const sel = el('select', { id: selectId, className: 'form-select', style: { width: '100%', marginBottom: '6px' } },
+        el('option', { value: '' }, 'Pick from loaded graph nodes (optional)...'),
+        ...loadedNodes.map((n) => el('option', { value: n.id }, '[' + n.type + '] ' + (n.label || n.id) + ' (' + n.id + ')'))
+      );
+      sel.addEventListener('change', () => {
+        if (sel.value) targetInput.value = sel.value;
+      });
+      return sel;
+    };
+
+    const sourceIdInput = el('input', {
+      id: 'edgeModalSourceId',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      value: prefillSourceId || '',
+      placeholder: 'Source node ID (e.g. ent_..., note_..., act_...)'
+    });
+    const sourceTypeSelect = el('select', { id: 'edgeModalSourceType', className: 'form-select', style: { width: '100%' } },
+      el('option', { value: '' }, 'auto-detect'),
+      ...['entity', 'note', 'lesson', 'action', 'session', 'summary', 'trajectory', 'observation'].map((t) =>
+        el('option', { value: t, selected: prefillSourceType === t }, t)
+      )
+    );
+
+    const relationSelect = el('select', { id: 'edgeModalRelation', className: 'form-select', style: { width: '100%' } },
+      el('option', { value: 'related_to' }, 'related_to'),
+      el('option', { value: 'part_of' }, 'part_of'),
+      el('option', { value: 'depends_on' }, 'depends_on'),
+      el('option', { value: 'references' }, 'references'),
+      el('option', { value: 'owns' }, 'owns'),
+      el('option', { value: 'produced_by' }, 'produced_by'),
+      el('option', { value: 'blocks' }, 'blocks')
+    );
+
+    const customRelationInput = el('input', {
+      id: 'edgeModalCustomRelation',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      placeholder: 'Optional custom relation (overrides dropdown)'
+    });
+
+    const targetIdInput = el('input', {
+      id: 'edgeModalTargetId',
+      type: 'text',
+      className: 'form-input',
+      style: { width: '100%' },
+      placeholder: 'Target node ID (supports cross-subproject links)'
+    });
+    const targetTypeSelect = el('select', { id: 'edgeModalTargetType', className: 'form-select', style: { width: '100%' } },
+      el('option', { value: '' }, 'auto-detect'),
+      ...['entity', 'note', 'lesson', 'action', 'session', 'summary', 'trajectory', 'observation'].map((t) =>
+        el('option', { value: t }, t)
+      )
+    );
+
+    const bodyNodes = [
+      el('div', {},
+        el('label', { for: 'edgeModalSourceId', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'SOURCE NODE *'),
+        loadedNodes.length > 0 ? buildNodeSelect('edgeModalSourcePick', sourceIdInput) : null,
+        el('div', { style: { display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '8px' } }, sourceIdInput, sourceTypeSelect)
+      ),
+      el('div', {},
+        el('label', { for: 'edgeModalRelation', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'RELATION *'),
+        el('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' } }, relationSelect, customRelationInput)
+      ),
+      el('div', {},
+        el('label', { for: 'edgeModalTargetId', className: 'text-muted', style: { fontSize: '12px', fontWeight: '600', display: 'block', marginBottom: '4px' } }, 'TARGET NODE *'),
+        loadedNodes.length > 0 ? buildNodeSelect('edgeModalTargetPick', targetIdInput) : null,
+        el('div', { style: { display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '8px' } }, targetIdInput, targetTypeSelect)
+      )
+    ];
+
+    showModal('Link Knowledge Graph Nodes', bodyNodes, [
+      {
+        label: 'Create Link',
+        variant: 'primary',
+        onClick: async (_e, close) => {
+          const sourceId = sourceIdInput.value.trim();
+          const targetId = targetIdInput.value.trim();
+          const relation = customRelationInput.value.trim() || relationSelect.value;
+          if (!sourceId || !targetId || !relation) {
+            showToast('source_id, target_id, and relation are required', 'amber');
+            return;
+          }
+
+          const submitBtn = _e && _e.currentTarget ? _e.currentTarget : null;
+          try {
+            if (submitBtn) {
+              submitBtn.disabled = true;
+              submitBtn.textContent = 'Linking...';
+            }
+            const resp = await apiFetch('/dashboard/api/graph/edges', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                source_id: sourceId,
+                source_type: sourceTypeSelect.value || undefined,
+                target_id: targetId,
+                target_type: targetTypeSelect.value || undefined,
+                relation
+              })
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              throw new Error(data.error?.message || 'Link nodes failed: ' + resp.status);
+            }
+            swrCache.graph.clear();
+            showToast('Nodes linked: ' + relation, 'emerald');
+            close();
+            loadGraph();
+          } catch (err) {
+            if (submitBtn) {
+              submitBtn.disabled = false;
+              submitBtn.textContent = 'Create Link';
+            }
+            showToast('Link error: ' + err.message, 'rose');
+          }
+        }
+      }
+    ]);
   }
 
   // =========================================================================

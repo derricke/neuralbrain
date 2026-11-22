@@ -10,6 +10,9 @@ import { verifyOrCreateStoreMeta } from '../../learning/storeMeta';
 import { createNote } from '../../memory/noteStore';
 import { captureObservations } from '../../memory/observationStore';
 import { captureTrajectories } from '../../memory/trajectoryStore';
+import { createAction } from '../../memory/actionStore';
+import { upsertEntity } from '../../memory/graphStore';
+import { startSession } from '../../memory/sessionStore';
 
 describe('Web Operator Dashboard & UI Route Tests', () => {
   const originalEnv = { ...process.env };
@@ -88,9 +91,45 @@ describe('Web Operator Dashboard & UI Route Tests', () => {
       expect(res.text).toContain('id="searchProjectDropdownWrapper"');
       expect(res.text).toContain('id="searchInputProject"');
       expect(res.text).toContain('id="searchNoteType"');
+      expect(res.text).toContain('id="searchCheckAncestors"');
+      expect(res.text).toContain('id="searchCheckChildren"');
+      expect(res.text).toContain('id="searchCheckHistory"');
+      expect(res.text).toContain('id="searchInputUserId"');
+      expect(res.text).toContain('id="searchInputAfter"');
+      expect(res.text).toContain('id="searchInputBefore"');
+      expect(res.text).toContain('id="searchSelectTemporalBias"');
+      expect(res.text).toContain('id="recordTypeCheckEntity"');
+      expect(res.text).toContain('id="recordTypeCheckAction"');
       expect(res.text).toContain('id="injectProjectDropdownWrapper"');
       expect(res.text).toContain('id="injectInputProject"');
       expect(res.text).toContain('id="injectInputTaskType"');
+      expect(res.text).toContain('id="injectCheckAncestors"');
+      expect(res.text).toContain('id="injectCheckChildren"');
+      expect(res.text).toContain('id="injectInputUserId"');
+
+      // Long Term Notes hierarchical & user controls
+      expect(res.text).toContain('id="notesCheckAncestors"');
+      expect(res.text).toContain('id="notesCheckChildren"');
+      expect(res.text).toContain('id="notesInputUserId"');
+
+      // Short Term Sessions & Actions hierarchical / reminder controls
+      expect(res.text).toContain('id="shortSessionsCheckAncestors"');
+      expect(res.text).toContain('id="shortSessionsCheckChildren"');
+      expect(res.text).toContain('id="shortSessionsInputUserId"');
+      expect(res.text).toContain('id="shortActionsCheckAncestors"');
+      expect(res.text).toContain('id="shortActionsCheckChildren"');
+      expect(res.text).toContain('id="shortActionsCheckDueOnly"');
+      expect(res.text).toContain('id="shortActionsInputUserId"');
+      expect(res.text).toContain('id="btnOpenCreateActionModal"');
+
+      // Graph hierarchical & entity/edge controls
+      expect(res.text).toContain('id="graphCheckAncestors"');
+      expect(res.text).toContain('id="graphCheckChildren"');
+      expect(res.text).toContain('id="graphCheckGlobal"');
+      expect(res.text).toContain('id="graphFilterDepth"');
+      expect(res.text).toContain('id="graphFilterEntityType"');
+      expect(res.text).toContain('id="btnOpenAddEntityModal"');
+      expect(res.text).toContain('id="btnOpenLinkNodesModal"');
 
       // API Key generation button, semantic form, and session management
       expect(res.text).toContain('id="formDashboardApiKey"');
@@ -127,6 +166,14 @@ describe('Web Operator Dashboard & UI Route Tests', () => {
       expect(res.text).toContain('.citation-badge');
       expect(res.text).toContain('tr.row-highlight');
       expect(res.text).toContain('.inspector-grid');
+      expect(res.text).toContain('.tier-exact');
+      expect(res.text).toContain('.tier-ancestor');
+      expect(res.text).toContain('.tier-child');
+      expect(res.text).toContain('.tier-global');
+      expect(res.text).toContain('.overdue-pill');
+      expect(res.text).toContain('.external-ref-link');
+      expect(res.text).toContain('.project-hierarchy-cell');
+      expect(res.text).toContain('.project-prefix-badge');
     });
 
     it('GET /dashboard/app.js serves JavaScript with security headers', async () => {
@@ -153,6 +200,18 @@ describe('Web Operator Dashboard & UI Route Tests', () => {
       expect(res.text).toContain('checkAuthStatus');
       expect(res.text).toContain('openApiKeyManagerModal');
       expect(res.text).toContain('Copy MCP JSON');
+
+      // Hierarchical memory, due actions, entities, and safe external_ref handling
+      expect(res.text).toContain('createMatchTierBadge');
+      expect(res.text).toContain('createSafeExternalRefNode');
+      expect(res.text).toContain('openActionModal');
+      expect(res.text).toContain('openAddEntityModal');
+      expect(res.text).toContain('openLinkNodesModal');
+      expect(res.text).toContain('openDueActionsView');
+      expect(res.text).toContain('/dashboard/api/actions/due');
+      expect(res.text).toContain('/dashboard/api/graph/entities');
+      expect(res.text).toContain('/dashboard/api/graph/edges');
+      expect(res.text).toContain('https?:\\/\\/');
 
       // Permanent check: Validate that app.js is syntactically valid JavaScript
       expect(() => {
@@ -303,6 +362,250 @@ describe('Web Operator Dashboard & UI Route Tests', () => {
       // Verify Spool Stats
       expect(res.body.spool).toBeDefined();
       expect(res.body.spool.maxBytes).toBeGreaterThan(0);
+
+      // Verify new top-level entity & due-action counts without mutating actions/sessions schemas
+      expect(res.body.entities_count).toBe(0);
+      expect(res.body.due_actions_count).toBe(0);
+      expect(exampleAppProj.entities_count).toBe(0);
+    });
+
+    it('GET /dashboard/api/stats reports entities_count, due_actions_count, and project entities_count while preserving actions/sessions schemas', async () => {
+      startSession({ id: 'sess-stat-1', scope: 'project', project_id: 'acme/socials/calendar' });
+      upsertEntity({
+        scope: 'project',
+        project_id: 'acme/socials/calendar',
+        entity_type: 'tool',
+        name: 'Calendar Sync',
+        external_ref: 'https://example.com/calendar',
+      });
+      upsertEntity({
+        scope: 'global',
+        entity_type: 'brand',
+        name: 'Acme Core',
+      });
+      createAction({
+        scope: 'project',
+        project_id: 'acme/socials/calendar',
+        title: 'Overdue action',
+        status: 'ready',
+        due_at: '2020-01-01T00:00:00Z',
+      });
+      createAction({
+        scope: 'project',
+        project_id: 'acme/socials/calendar',
+        title: 'Snoozed action',
+        status: 'ready',
+        due_at: '2020-01-01T00:00:00Z',
+        snooze_until: '2099-01-01T00:00:00Z',
+      });
+      createAction({
+        scope: 'project',
+        project_id: 'acme/socials/calendar',
+        title: 'Completed action',
+        status: 'done',
+        due_at: '2020-01-01T00:00:00Z',
+      });
+
+      const res = await request(app)
+        .get('/dashboard/api/stats')
+        .set('Authorization', `Bearer ${testApiKey}`);
+      expect(res.status).toBe(200);
+      expect(res.body.entities_count).toBe(2);
+      expect(res.body.due_actions_count).toBe(1);
+      expect(res.body.sessions).toEqual({
+        total: 1,
+        active: 1,
+        completed: 0,
+        abandoned: 0,
+      });
+      expect(res.body.actions).toEqual({
+        total: 3,
+        ready: 2,
+        blocked: 0,
+        in_progress: 0,
+        done: 1,
+      });
+
+      const calProj = res.body.projects.find((p: any) => p.project_id === 'acme/socials/calendar');
+      expect(calProj).toBeDefined();
+      expect(calProj.entities_count).toBe(1);
+    });
+
+    it('supports hierarchical entities, cross-subproject edges, and CSRF/auth protection on /dashboard/api/graph/*', async () => {
+      // Auth check
+      const unauthList = await request(app).get('/dashboard/api/graph/entities');
+      expect(unauthList.status).toBe(401);
+
+      const unauthCreate = await request(app)
+        .post('/dashboard/api/graph/entities')
+        .send({ scope: 'project', project_id: 'acme', entity_type: 'brand', name: 'Acme' });
+      expect(unauthCreate.status).toBe(401);
+
+      // CSRF check: cross-origin without X-Requested-With and non-JSON Content-Type
+      const csrfEntityRes = await request(app)
+        .post('/dashboard/api/graph/entities')
+        .set('Authorization', `Bearer ${testApiKey}`)
+        .set('Origin', 'https://evil.example')
+        .set('Host', '127.0.0.1:3737')
+        .set('Content-Type', 'text/plain')
+        .send('{"scope":"global","entity_type":"brand","name":"Evil"}');
+      expect(csrfEntityRes.status).toBe(403);
+      expect(csrfEntityRes.body.error.code).toBe('CSRF_REJECTED');
+
+      const csrfEdgeRes = await request(app)
+        .post('/dashboard/api/graph/edges')
+        .set('Authorization', `Bearer ${testApiKey}`)
+        .set('Origin', 'https://evil.example')
+        .set('Host', '127.0.0.1:3737')
+        .set('Content-Type', 'text/plain')
+        .send('{"source_id":"a","target_id":"b","relation":"related_to"}');
+      expect(csrfEdgeRes.status).toBe(403);
+      expect(csrfEdgeRes.body.error.code).toBe('CSRF_REJECTED');
+
+      const csrfDeleteRes = await request(app)
+        .delete('/dashboard/api/graph/edges?id=edge_fake')
+        .set('Authorization', `Bearer ${testApiKey}`)
+        .set('Origin', 'https://evil.example')
+        .set('Host', '127.0.0.1:3737');
+      expect(csrfDeleteRes.status).toBe(403);
+      expect(csrfDeleteRes.body.error.code).toBe('CSRF_REJECTED');
+
+      // Create entities in parent & child subprojects + global
+      const rootRes = await request(app)
+        .post('/dashboard/api/graph/entities')
+        .set('Authorization', `Bearer ${testApiKey}`)
+        .set('X-Requested-With', 'XMLHttpRequest')
+        .send({
+          scope: 'project',
+          project_id: 'acme',
+          entity_type: 'brand',
+          name: 'Acme Brand',
+          external_ref: 'https://example.com/acme',
+        });
+      expect(rootRes.status).toBe(201);
+      expect(rootRes.body.entity.project_id).toBe('acme');
+
+      const calRes = await request(app)
+        .post('/dashboard/api/graph/entities')
+        .set('Authorization', `Bearer ${testApiKey}`)
+        .set('X-Requested-With', 'XMLHttpRequest')
+        .send({
+          scope: 'project',
+          project_id: 'acme/socials/calendar',
+          entity_type: 'tool',
+          name: 'Scheduler',
+          user_id: 'user-1',
+        });
+      expect(calRes.status).toBe(201);
+
+      const noteInCogs = createNote({
+        scope: 'project',
+        projectId: 'acme/cogs',
+        type: 'architecture',
+        title: 'COGS calculation rule',
+        content: 'Compute unit margin before tax.',
+      });
+
+      // GET /dashboard/api/graph/entities with ancestors & user_id
+      const listRes = await request(app)
+        .get('/dashboard/api/graph/entities?project_id=acme/socials/calendar&include_ancestors=true&include_global=false')
+        .set('Authorization', `Bearer ${testApiKey}`);
+      expect(listRes.status).toBe(200);
+      expect(listRes.body.entities.map((e: any) => e.name)).toEqual(['Scheduler', 'Acme Brand']);
+      expect(listRes.body.entities[0].match_tier).toBe('exact');
+      expect(listRes.body.entities[1].match_tier).toBe('ancestor');
+
+      // Link cross-subproject nodes via POST /dashboard/api/graph/edges
+      const linkRes = await request(app)
+        .post('/dashboard/api/graph/edges')
+        .set('Authorization', `Bearer ${testApiKey}`)
+        .set('X-Requested-With', 'XMLHttpRequest')
+        .send({
+          source_id: calRes.body.entity.id,
+          target_id: noteInCogs.id,
+          relation: 'references',
+        });
+      expect(linkRes.status).toBe(201);
+      expect(linkRes.body.edge.source_id).toBe(calRes.body.entity.id);
+      expect(linkRes.body.edge.target_id).toBe(noteInCogs.id);
+      expect(linkRes.body.edge.relation).toBe('references');
+
+      // Multi-hop graph includes linked cross-subproject note
+      const graphRes = await request(app)
+        .get('/dashboard/api/graph?project_id=acme/socials/calendar&depth=2&entity_type=tool')
+        .set('Authorization', `Bearer ${testApiKey}`);
+      expect(graphRes.status).toBe(200);
+      expect(graphRes.body.nodes.some((n: any) => n.id === calRes.body.entity.id && n.type === 'entity')).toBe(true);
+      expect(graphRes.body.nodes.some((n: any) => n.id === noteInCogs.id)).toBe(true);
+      expect(graphRes.body.edges.some((e: any) => e.source === calRes.body.entity.id && e.target === noteInCogs.id && e.type === 'references')).toBe(true);
+
+      // Unlink via DELETE /dashboard/api/graph/edges
+      const unlinkRes = await request(app)
+        .delete('/dashboard/api/graph/edges')
+        .set('Authorization', `Bearer ${testApiKey}`)
+        .set('X-Requested-With', 'XMLHttpRequest')
+        .send({ id: linkRes.body.edge.id });
+      expect(unlinkRes.status).toBe(200);
+      expect(unlinkRes.body.deleted).toBe(1);
+    });
+
+    it('GET /dashboard/api/actions/due enforces auth and returns hierarchical due/overdue actions', async () => {
+      const unauth = await request(app).get('/dashboard/api/actions/due');
+      expect(unauth.status).toBe(401);
+
+      createAction({
+        scope: 'project',
+        project_id: 'acme',
+        title: 'Ancestor overdue action',
+        status: 'ready',
+        priority: 'urgent',
+        due_at: '2020-01-01T00:00:00Z',
+        user_id: 'user-1',
+      });
+      createAction({
+        scope: 'project',
+        project_id: 'acme/socials/calendar',
+        title: 'Exact reminded action',
+        status: 'in_progress',
+        remind_at: '2020-01-02T00:00:00Z',
+        user_id: 'user-1',
+      });
+      createAction({
+        scope: 'project',
+        project_id: 'acme/socials/calendar',
+        title: 'Snoozed future reminder',
+        status: 'ready',
+        due_at: '2020-01-01T00:00:00Z',
+        snooze_until: '2099-01-01T00:00:00Z',
+      });
+      createAction({
+        scope: 'global',
+        title: 'Global due action',
+        status: 'ready',
+        due_at: '2020-01-03T00:00:00Z',
+      });
+
+      const dueRes = await request(app)
+        .get('/dashboard/api/actions/due?project_id=acme/socials/calendar&include_ancestors=true&include_global=true')
+        .set('Authorization', `Bearer ${testApiKey}`);
+      expect(dueRes.status).toBe(200);
+      expect(dueRes.body.actions.map((a: any) => a.title)).toEqual([
+        'Ancestor overdue action',
+        'Exact reminded action',
+        'Global due action',
+      ]);
+      expect(dueRes.body.actions[0].match_tier).toBe('ancestor');
+      expect(dueRes.body.actions[0].overdue).toBe(true);
+      expect(dueRes.body.actions[1].match_tier).toBe('exact');
+      expect(dueRes.body.actions[1].overdue).toBe(false);
+      expect(dueRes.body.actions[2].match_tier).toBe('global');
+
+      // Filter by user_id
+      const userRes = await request(app)
+        .get('/dashboard/api/actions/due?project_id=acme/socials/calendar&include_global=false&user_id=user-1')
+        .set('Authorization', `Bearer ${testApiKey}`);
+      expect(userRes.status).toBe(200);
+      expect(userRes.body.actions).toHaveLength(2);
     });
 
     it('POST /dashboard/api/migrate runs migration successfully', async () => {
