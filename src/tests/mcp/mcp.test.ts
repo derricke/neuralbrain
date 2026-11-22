@@ -71,12 +71,13 @@ describe('MCP Server End-to-End Tests', () => {
     expect(content).not.toMatch(/from\s+['"]\.\.\/lib\/db['"]/);
   });
 
-  it('exposes ONLY the 11 sanctioned tools and no banned tools', async () => {
+  it('exposes ONLY the 12 sanctioned tools and no banned tools', async () => {
     const toolsResult = await mcpClient.listTools();
     const toolNames = toolsResult.tools.map((t) => t.name).sort();
 
     const expectedTools = [
       'brain_action_add',
+      'brain_action_due',
       'brain_action_list',
       'brain_action_update',
       'brain_consolidate_candidates',
@@ -438,7 +439,14 @@ describe('MCP Server End-to-End Tests', () => {
     expect(failRes.content[0].text).not.toContain('\n  ');
     const failures = JSON.parse(failRes.content[0].text);
     expect(failures.length).toBe(5);
-    expect(Object.keys(failures[0]).sort()).toEqual(['count', 'error_text', 'last_seen_at', 'task_type']);
+    expect(Object.keys(failures[0]).sort()).toEqual([
+      'count',
+      'error_text',
+      'last_seen_at',
+      'match_tier',
+      'project_id',
+      'task_type',
+    ]);
 
     const saveGlobal = await directHandlers.brainSave({
       type: 'fact',
@@ -452,5 +460,256 @@ describe('MCP Server End-to-End Tests', () => {
     expect(graphRes.isError).toBeFalsy();
     const graph = JSON.parse(graphRes.content[0].text);
     expect(graph.nodes.some((n: any) => n.label === 'Global Graph Fact')).toBe(true);
+  });
+
+  it('maintains 100% parity across stdio MCP and direct MCP for hierarchical search, temporal filters, user_id vs agent_id, entity graph CRUD, and brain_action_due', async () => {
+    const directHandlers = createDirectBrainMcpHandlers(undefined);
+
+    // 1. Hierarchical notes with temporal & user_id/agent_id fields
+    await mcpClient.callTool({
+      name: 'brain_save',
+      arguments: {
+        type: 'architecture',
+        title: 'Acme Platform Naming Standard',
+        content: 'All acme services share lowercase kebab slugs.',
+        scope: 'project',
+        project_id: 'acme',
+        user_id: 'alice',
+        agent_id: 'agent-one',
+        event_at: '2026-03-01T10:00:00Z',
+        valid_from: '2026-01-01T00:00:00Z',
+        valid_until: '2026-12-31T23:59:59Z',
+      },
+    });
+
+    await mcpClient.callTool({
+      name: 'brain_save',
+      arguments: {
+        type: 'fact',
+        title: 'Generator sibling note',
+        content: 'Internal generator details not for calendar.',
+        scope: 'project',
+        project_id: 'acme/socials/generator',
+        user_id: 'alice',
+      },
+    });
+
+    const noteLaunchRes = await mcpClient.callTool({
+      name: 'brain_save',
+      arguments: {
+        type: 'workflow',
+        title: 'Launch campaign publishing flow',
+        content: 'Coordinate hero media before release.',
+        scope: 'project',
+        project_id: 'acme/marketing/launch',
+        user_id: 'alice',
+        agent_id: 'agent-two',
+      },
+    });
+    const noteLaunch = JSON.parse((noteLaunchRes as any).content[0].text);
+
+    // Search via stdio MCP on child acme/socials/calendar -> inherits acme, isolates generator
+    const childSearchStdio = await mcpClient.callTool({
+      name: 'brain_search',
+      arguments: {
+        q: 'Acme Platform Naming Standard generator',
+        project_id: 'acme/socials/calendar',
+        include_global: false,
+        user_id: 'alice',
+        as_of: '2026-06-01T00:00:00Z',
+        memory_layer: 'semantic',
+      },
+    });
+    expect(childSearchStdio.isError).toBeFalsy();
+    const childSearchDirect = await directHandlers.brainSearch({
+      q: 'Acme Platform Naming Standard generator',
+      project_id: 'acme/socials/calendar',
+      include_global: false,
+      user_id: 'alice',
+      as_of: '2026-06-01T00:00:00Z',
+      memory_layer: 'semantic',
+    });
+    expect(childSearchDirect.isError).toBeFalsy();
+
+    const stdioResults = JSON.parse((childSearchStdio as any).content[0].text).results;
+    const directResults = JSON.parse(childSearchDirect.content[0].text).results;
+    expect(stdioResults.map((r: any) => r.record.title)).toEqual([
+      'Acme Platform Naming Standard',
+    ]);
+    expect(directResults.map((r: any) => r.record.title)).toEqual([
+      'Acme Platform Naming Standard',
+    ]);
+    expect(stdioResults[0].match_tier).toBe('ancestor');
+
+    // 2. brain_graph upsert_entity requires explicit scope; link across subprojects; query BFS; unlink
+    const badEntityStdio = await mcpClient.callTool({
+      name: 'brain_graph',
+      arguments: {
+        mode: 'upsert_entity',
+        entity_type: 'asset',
+        name: 'Unscoped asset',
+      },
+    });
+    expect(badEntityStdio.isError).toBe(true);
+
+    const badEntityDirect = await directHandlers.brainGraph({
+      mode: 'upsert_entity',
+      entity_type: 'asset',
+      name: 'Unscoped asset',
+    });
+    expect(badEntityDirect.isError).toBe(true);
+    expect(JSON.parse(badEntityDirect.content[0].text).error.code).toBe('SCOPE_REQUIRED');
+
+    const upsertRes = await mcpClient.callTool({
+      name: 'brain_graph',
+      arguments: {
+        mode: 'upsert_entity',
+        scope: 'project',
+        project_id: 'acme/socials/generator',
+        entity_type: 'asset',
+        name: 'Q3 Teaser Video',
+        description: 'Social teaser video asset',
+        external_ref: 's3://acme-assets/q3-teaser.mp4',
+        user_id: 'alice',
+        agent_id: 'agent-one',
+      },
+    });
+    expect(upsertRes.isError).toBeFalsy();
+    const entity = JSON.parse((upsertRes as any).content[0].text).entity;
+    expect(entity.id).toBeDefined();
+
+    const linkRes = await directHandlers.brainGraph({
+      mode: 'link',
+      source_id: noteLaunch.id,
+      target_id: entity.id,
+      relation: 'references',
+    });
+    expect(linkRes.isError).toBeFalsy();
+    const edge = JSON.parse(linkRes.content[0].text).edge;
+    expect(edge.relation).toBe('references');
+
+    // Query multi-hop graph from noteLaunch -> finds cross-subproject entity
+    const graphQueryStdio = await mcpClient.callTool({
+      name: 'brain_graph',
+      arguments: {
+        mode: 'query',
+        project_id: 'acme/marketing/launch',
+        node_id: noteLaunch.id,
+        depth: 2,
+      },
+    });
+    const graphQueryDirect = await directHandlers.brainGraph({
+      mode: 'query',
+      project_id: 'acme/marketing/launch',
+      node_id: noteLaunch.id,
+      depth: 2,
+    });
+    expect(JSON.parse((graphQueryStdio as any).content[0].text)).toEqual(
+      JSON.parse(graphQueryDirect.content[0].text)
+    );
+    expect(
+      JSON.parse(graphQueryDirect.content[0].text).nodes.some((n: any) => n.id === entity.id)
+    ).toBe(true);
+
+    // Search entity name under parent 'acme' with include_children -> surfaces linked note with matched_entities
+    const entitySearchRes = await mcpClient.callTool({
+      name: 'brain_search',
+      arguments: {
+        q: 'Q3 Teaser Video',
+        project_id: 'acme',
+        include_children: true,
+        record_types: ['note', 'entity'],
+      },
+    });
+    const entitySearchData = JSON.parse((entitySearchRes as any).content[0].text);
+    const linkedHit = entitySearchData.results.find((r: any) => r.id === noteLaunch.id);
+    expect(linkedHit).toBeDefined();
+    expect(linkedHit.matched_entities).toContain('Q3 Teaser Video');
+
+    // Unlink via stdio MCP
+    const unlinkRes = await mcpClient.callTool({
+      name: 'brain_graph',
+      arguments: {
+        mode: 'unlink',
+        id: edge.id,
+      },
+    });
+    expect(JSON.parse((unlinkRes as any).content[0].text).deleted).toBe(1);
+
+    // 3. brain_action_add, brain_action_due (12th tool), brain_action_list(due_only), brain_action_update(recurring)
+    const pastIso = new Date(Date.now() - 3600_000).toISOString();
+    const futureIso = new Date(Date.now() + 86_400_000).toISOString();
+
+    const actAddRes = await mcpClient.callTool({
+      name: 'brain_action_add',
+      arguments: {
+        scope: 'project',
+        project_id: 'acme',
+        user_id: 'alice',
+        agent_id: 'agent-alpha',
+        title: 'Daily metrics check',
+        priority: 'urgent',
+        due_at: pastIso,
+        remind_at: pastIso,
+        recurrence: '@daily',
+      },
+    });
+    expect(actAddRes.isError).toBeFalsy();
+    const act1 = JSON.parse((actAddRes as any).content[0].text).action;
+
+    await mcpClient.callTool({
+      name: 'brain_action_add',
+      arguments: {
+        scope: 'project',
+        project_id: 'acme',
+        user_id: 'alice',
+        title: 'Snoozed metrics check',
+        due_at: pastIso,
+        snooze_until: futureIso,
+      },
+    });
+
+    // Both stdio brain_action_due and direct brainActionDue return act1 from ancestor 'acme'
+    const dueStdio = await mcpClient.callTool({
+      name: 'brain_action_due',
+      arguments: {
+        project_id: 'acme/socials/calendar',
+        user_id: 'alice',
+        include_global: false,
+      },
+    });
+    const dueDirect = await directHandlers.brainActionDue({
+      project_id: 'acme/socials/calendar',
+      user_id: 'alice',
+      include_global: false,
+    });
+    const dueStdioActions = JSON.parse((dueStdio as any).content[0].text).actions;
+    const dueDirectActions = JSON.parse(dueDirect.content[0].text).actions;
+    expect(dueStdioActions.map((a: any) => a.id)).toEqual([act1.id]);
+    expect(dueDirectActions.map((a: any) => a.id)).toEqual([act1.id]);
+    expect(dueStdioActions[0].overdue).toBe(true);
+    expect(dueStdioActions[0].match_tier).toBe('ancestor');
+
+    // brain_action_list with due_only: true
+    const listDueRes = await directHandlers.brainActionList({
+      project_id: 'acme/socials/calendar',
+      due_only: true,
+      include_global: false,
+    });
+    expect(JSON.parse(listDueRes.content[0].text).actions.map((a: any) => a.id)).toEqual([act1.id]);
+
+    // Completing recurring action spawns next_occurrence
+    const updateDoneRes = await mcpClient.callTool({
+      name: 'brain_action_update',
+      arguments: {
+        id: act1.id,
+        status: 'done',
+      },
+    });
+    const updatedAct = JSON.parse((updateDoneRes as any).content[0].text).action;
+    expect(updatedAct.status).toBe('done');
+    expect(updatedAct.next_occurrence).toBeDefined();
+    expect(updatedAct.next_occurrence.parent_action_id).toBe(act1.id);
+    expect(updatedAct.next_occurrence.recurrence).toBe('0 0 * * *');
   });
 });

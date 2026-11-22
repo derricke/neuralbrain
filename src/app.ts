@@ -2,6 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { getDb, isDatabaseUnavailableError } from './lib/db';
 import { logger } from './lib/logger';
+import { parseDurationMs } from './lib/recurrence';
 import { getCorrelationId, requestTracing } from './middleware/tracing';
 import { createRateLimiter } from './middleware/rateLimiter';
 import { apiKeyAuth, hashApiKey, setDashboardSessionCookie } from './middleware/auth';
@@ -31,10 +32,21 @@ import {
   listSessions,
   startSession,
 } from './memory/sessionStore';
-import { getKnowledgeGraph, parseGraphQuery } from './memory/graphStore';
+import {
+  getEntity,
+  getKnowledgeGraph,
+  linkEntities,
+  listEntities,
+  parseGraphQuery,
+  unlinkEntities,
+  upsertEntity,
+} from './memory/graphStore';
 import { renameProject } from './memory/projectRename';
 import {
+  ackReminders,
+  checkReminders,
   createAction,
+  getDueActions,
   getReadyActions,
   listActions,
   updateAction,
@@ -77,6 +89,17 @@ function parseBoundedOffset(raw: unknown, defaultOffset = 0): number {
   const parsed = parseInt(String(raw), 10);
   if (!Number.isFinite(parsed) || parsed < 0) return defaultOffset;
   return parsed;
+}
+
+export function parseOptionalBoolQuery(raw: unknown): boolean | undefined {
+  if (raw === true) return true;
+  if (raw === false) return false;
+  if (typeof raw === 'string') {
+    const norm = raw.trim().toLowerCase();
+    if (norm === 'true' || norm === '1') return true;
+    if (norm === 'false' || norm === '0') return false;
+  }
+  return undefined;
 }
 
 export function createApp(): express.Application {
@@ -263,7 +286,13 @@ export function createApp(): express.Application {
   app.get('/notes', (req: Request, res: Response) => {
     const scope = req.query.scope as string | undefined;
     const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
-    const includeGlobal = req.query.include_global !== 'false';
+    const includeAncestors =
+      parseOptionalBoolQuery(req.query.include_ancestors ?? req.query.includeAncestors) ?? true;
+    const includeChildren =
+      parseOptionalBoolQuery(req.query.include_children ?? req.query.includeChildren) ?? false;
+    const includeGlobal =
+      parseOptionalBoolQuery(req.query.include_global ?? req.query.includeGlobal) ?? true;
+    const userId = (req.query.user_id || req.query.userId) as string | undefined;
     const concept = req.query.concept as string | undefined;
     const filePath = (req.query.file_path || req.query.filePath) as string | undefined;
     const limit = parseBoundedLimit(req.query.limit, 50, 200);
@@ -279,7 +308,10 @@ export function createApp(): express.Application {
     const notes = listNotes({
       scope,
       projectId,
+      includeAncestors,
+      includeChildren,
       includeGlobal,
+      userId,
       type,
       concept,
       filePath,
@@ -306,8 +338,20 @@ export function createApp(): express.Application {
       return;
     }
     const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
+    const includeAncestors =
+      parseOptionalBoolQuery(req.query.include_ancestors ?? req.query.includeAncestors) ?? true;
+    const includeChildren =
+      parseOptionalBoolQuery(req.query.include_children ?? req.query.includeChildren) ?? false;
+    const includeGlobal =
+      parseOptionalBoolQuery(req.query.include_global ?? req.query.includeGlobal) ?? true;
+    const userId = (req.query.user_id || req.query.userId) as string | undefined;
     const limit = parseBoundedLimit(req.query.limit, 50, 200);
-    const notes = getNotesByFile(decodedPath, projectId, limit);
+    const notes = getNotesByFile(decodedPath, projectId, limit, {
+      includeAncestors,
+      includeChildren,
+      includeGlobal,
+      userId,
+    });
     res.json(notes);
   });
 
@@ -333,6 +377,13 @@ export function createApp(): express.Application {
   app.get('/trajectories', (req: Request, res: Response) => {
     const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
     const scope = req.query.scope as string | undefined;
+    const includeAncestors =
+      parseOptionalBoolQuery(req.query.include_ancestors ?? req.query.includeAncestors) ?? true;
+    const includeChildren =
+      parseOptionalBoolQuery(req.query.include_children ?? req.query.includeChildren) ?? false;
+    const includeGlobal =
+      parseOptionalBoolQuery(req.query.include_global ?? req.query.includeGlobal) ?? false;
+    const userId = (req.query.user_id || req.query.userId) as string | undefined;
     const taskType = (req.query.task_type || req.query.taskType) as string | undefined;
     // 'unknown' is a third answer here, not a missing one: a swept rollup has
     // no outcome, and folding it into either branch would invent one.
@@ -355,6 +406,10 @@ export function createApp(): express.Application {
     const list = listTrajectories({
       projectId,
       scope,
+      includeAncestors,
+      includeChildren,
+      includeGlobal,
+      userId,
       taskType,
       success,
       successUnknown,
@@ -387,6 +442,13 @@ export function createApp(): express.Application {
   app.get('/observations', (req: Request, res: Response) => {
     const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
     const scope = req.query.scope as string | undefined;
+    const includeAncestors =
+      parseOptionalBoolQuery(req.query.include_ancestors ?? req.query.includeAncestors) ?? true;
+    const includeChildren =
+      parseOptionalBoolQuery(req.query.include_children ?? req.query.includeChildren) ?? false;
+    const includeGlobal =
+      parseOptionalBoolQuery(req.query.include_global ?? req.query.includeGlobal) ?? false;
+    const userId = (req.query.user_id || req.query.userId) as string | undefined;
     const sessionId = (req.query.session_id || req.query.sessionId) as string | undefined;
     const failed =
       req.query.failed !== undefined ? parseInt(String(req.query.failed), 10) : undefined;
@@ -396,6 +458,10 @@ export function createApp(): express.Application {
     const list = listObservations({
       projectId,
       scope,
+      includeAncestors,
+      includeChildren,
+      includeGlobal,
+      userId,
       sessionId,
       failed,
       limit,
@@ -546,11 +612,29 @@ export function createApp(): express.Application {
 
   app.get('/sessions', (req: Request, res: Response) => {
     const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
+    const includeAncestors =
+      parseOptionalBoolQuery(req.query.include_ancestors ?? req.query.includeAncestors) ?? true;
+    const includeChildren =
+      parseOptionalBoolQuery(req.query.include_children ?? req.query.includeChildren) ?? false;
+    const rawIncludeGlobal = parseOptionalBoolQuery(
+      req.query.include_global ?? req.query.includeGlobal
+    );
+    const includeGlobal = projectId ? (rawIncludeGlobal ?? false) : rawIncludeGlobal;
+    const userId = (req.query.user_id || req.query.userId) as string | undefined;
     const status = req.query.status as string | undefined;
     const agentName = (req.query.agent_name || req.query.agentName) as string | undefined;
     const limit = parseBoundedLimit(req.query.limit, 50, 200);
 
-    const sessions = listSessions({ projectId, status, agentName, limit });
+    const sessions = listSessions({
+      projectId,
+      includeAncestors,
+      includeChildren,
+      includeGlobal,
+      userId,
+      status,
+      agentName,
+      limit,
+    });
     res.json({ sessions });
   });
 
@@ -598,6 +682,131 @@ export function createApp(): express.Application {
     res.json(graph);
   });
 
+  app.post('/graph/entities', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+        res.status(400).json({
+          error: {
+            code: 'SCHEMA_INVALID',
+            message: 'Request body must be a JSON object',
+            trace_id: getCorrelationId(req),
+          },
+        });
+        return;
+      }
+      const entity = upsertEntity(req.body);
+      res.status(201).json({ entity });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/graph/entities', (req: Request, res: Response) => {
+    const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
+    const scope = req.query.scope as string | undefined;
+    const includeAncestors =
+      parseOptionalBoolQuery(req.query.include_ancestors ?? req.query.includeAncestors) ?? true;
+    const includeChildren =
+      parseOptionalBoolQuery(req.query.include_children ?? req.query.includeChildren) ?? false;
+    const includeGlobal = parseOptionalBoolQuery(
+      req.query.include_global ?? req.query.includeGlobal
+    );
+    const entityType = (req.query.entity_type || req.query.entityType) as string | undefined;
+    const externalRef = (req.query.external_ref || req.query.externalRef) as string | undefined;
+    const userId = (req.query.user_id || req.query.userId) as string | undefined;
+    const limit = parseBoundedLimit(req.query.limit, 50, 200);
+
+    const entities = listEntities({
+      projectId,
+      scope,
+      includeAncestors,
+      includeChildren,
+      includeGlobal,
+      entityType,
+      externalRef,
+      userId,
+      limit,
+    });
+    res.json({ entities });
+  });
+
+  app.get('/graph/entities/:id', (req: Request, res: Response) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const entity = getEntity(id);
+    if (!entity) {
+      res.status(404).json({
+        error: {
+          code: 'NOT_FOUND',
+          message: `Entity '${id}' not found`,
+          trace_id: getCorrelationId(req),
+        },
+      });
+      return;
+    }
+    res.json({ entity });
+  });
+
+  app.post('/graph/edges', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+        res.status(400).json({
+          error: {
+            code: 'SCHEMA_INVALID',
+            message: 'Request body must be a JSON object',
+            trace_id: getCorrelationId(req),
+          },
+        });
+        return;
+      }
+      const edge = linkEntities(req.body);
+      res.status(201).json({ edge });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.delete('/graph/edges', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const body =
+        req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+      const result = unlinkEntities({
+        id: (body.id ?? req.query.id) as string | undefined,
+        source_id: (body.source_id ??
+          body.sourceId ??
+          req.query.source_id ??
+          req.query.sourceId) as string | undefined,
+        target_id: (body.target_id ??
+          body.targetId ??
+          req.query.target_id ??
+          req.query.targetId) as string | undefined,
+        relation: (body.relation ?? req.query.relation) as string | undefined,
+      });
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.delete('/graph/edges/:id', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+      const result = unlinkEntities({ id });
+      if (result.deleted === 0) {
+        res.status(404).json({
+          error: {
+            code: 'NOT_FOUND',
+            message: `Edge '${id}' not found`,
+            trace_id: getCorrelationId(req),
+          },
+        });
+        return;
+      }
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // -------------------------------------------------------------------------
   // Actions
   // -------------------------------------------------------------------------
@@ -610,27 +819,166 @@ export function createApp(): express.Application {
     }
   });
 
-  app.get('/actions', (req: Request, res: Response) => {
-    const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
-    const includeGlobal = req.query.include_global !== 'false';
-    const sessionId = (req.query.session_id || req.query.sessionId) as string | undefined;
-    const limit = parseBoundedLimit(req.query.limit, 50, 200);
+  app.get('/actions/due', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
+      const includeAncestors =
+        parseOptionalBoolQuery(req.query.include_ancestors ?? req.query.includeAncestors) ?? true;
+      const includeChildren =
+        parseOptionalBoolQuery(req.query.include_children ?? req.query.includeChildren) ?? false;
+      const includeGlobal =
+        parseOptionalBoolQuery(req.query.include_global ?? req.query.includeGlobal) ?? true;
+      const userId = (req.query.user_id || req.query.userId) as string | undefined;
+      const before = req.query.before as string | undefined;
+      const unremindedOnly = parseOptionalBoolQuery(
+        req.query.unreminded_only ?? req.query.unremindedOnly
+      );
+      const rawCooldownMs = req.query.cooldown_ms ?? req.query.cooldownMs;
+      let cooldownMs: number | undefined;
+      if (rawCooldownMs !== undefined && rawCooldownMs !== '') {
+        cooldownMs = Number(rawCooldownMs);
+      } else if (typeof req.query.cooldown === 'string' && req.query.cooldown.trim() !== '') {
+        const parsedMs = parseDurationMs(req.query.cooldown);
+        if (parsedMs === null) {
+          const err = new Error(`Invalid cooldown duration '${req.query.cooldown}'`);
+          (err as any).code = 'SCHEMA_INVALID';
+          throw err;
+        }
+        cooldownMs = parsedMs;
+      }
+      const limit = parseBoundedLimit(req.query.limit, 50, 200);
 
-    let status: string | string[] | undefined;
-    if (req.query.status) {
-      status = Array.isArray(req.query.status)
-        ? (req.query.status as string[])
-        : String(req.query.status);
+      const actions = getDueActions({
+        projectId,
+        includeAncestors,
+        includeChildren,
+        includeGlobal,
+        userId,
+        before,
+        unremindedOnly,
+        cooldownMs,
+        limit,
+      });
+      res.json({ actions });
+    } catch (err) {
+      next(err);
     }
+  });
 
-    const actions = listActions({
-      projectId,
-      includeGlobal,
-      status,
-      sessionId,
-      limit,
-    });
-    res.json({ actions });
+  app.post('/actions/reminders/check', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const body =
+        req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+      const projectId = (body.project_id ?? body.projectId) as string | undefined;
+      const includeAncestors =
+        parseOptionalBoolQuery(body.include_ancestors ?? body.includeAncestors) ?? true;
+      const includeChildren =
+        parseOptionalBoolQuery(body.include_children ?? body.includeChildren) ?? false;
+      const includeGlobal =
+        parseOptionalBoolQuery(body.include_global ?? body.includeGlobal) ?? true;
+      const userId = (body.user_id ?? body.userId) as string | undefined;
+      const before = body.before as string | undefined;
+      const rawCooldownMs = body.cooldown_ms ?? body.cooldownMs;
+      let cooldownMs: number | undefined;
+      if (rawCooldownMs !== undefined && rawCooldownMs !== null && rawCooldownMs !== '') {
+        cooldownMs = typeof rawCooldownMs === 'boolean' ? Number.NaN : Number(rawCooldownMs);
+      } else if (typeof body.cooldown === 'string' && body.cooldown.trim() !== '') {
+        const parsedMs = parseDurationMs(body.cooldown);
+        if (parsedMs === null) {
+          const err = new Error(`Invalid cooldown duration '${body.cooldown}'`);
+          (err as any).code = 'SCHEMA_INVALID';
+          throw err;
+        }
+        cooldownMs = parsedMs;
+      }
+      const dryRun = parseOptionalBoolQuery(body.dry_run ?? body.dryRun) ?? false;
+      const limit =
+        body.limit !== undefined && body.limit !== null && body.limit !== ''
+          ? parseBoundedLimit(body.limit, 50, 200)
+          : undefined;
+
+      const result = checkReminders({
+        projectId,
+        includeAncestors,
+        includeChildren,
+        includeGlobal,
+        userId,
+        before,
+        cooldownMs,
+        dryRun,
+        limit,
+      });
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/actions/reminders/ack', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      if (
+        !req.body ||
+        typeof req.body !== 'object' ||
+        Array.isArray(req.body) ||
+        !Array.isArray(req.body.ids)
+      ) {
+        res.status(400).json({
+          error: {
+            code: 'SCHEMA_INVALID',
+            message: 'ids must be an array of action IDs',
+            trace_id: getCorrelationId(req),
+          },
+        });
+        return;
+      }
+      const result = ackReminders(
+        req.body.ids,
+        req.body.reminded_at ?? req.body.remindedAt
+      );
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/actions', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
+      const includeAncestors =
+        parseOptionalBoolQuery(req.query.include_ancestors ?? req.query.includeAncestors) ?? true;
+      const includeChildren =
+        parseOptionalBoolQuery(req.query.include_children ?? req.query.includeChildren) ?? false;
+      const includeGlobal =
+        parseOptionalBoolQuery(req.query.include_global ?? req.query.includeGlobal) ?? true;
+      const userId = (req.query.user_id || req.query.userId) as string | undefined;
+      const sessionId = (req.query.session_id || req.query.sessionId) as string | undefined;
+      const dueOnly = parseOptionalBoolQuery(req.query.due_only ?? req.query.dueOnly) ?? false;
+      const before = req.query.before as string | undefined;
+      const limit = parseBoundedLimit(req.query.limit, 50, 200);
+
+      let status: string | string[] | undefined;
+      if (req.query.status) {
+        status = Array.isArray(req.query.status)
+          ? (req.query.status as string[])
+          : String(req.query.status);
+      }
+
+      const actions = listActions({
+        projectId,
+        includeAncestors,
+        includeChildren,
+        includeGlobal,
+        userId,
+        status,
+        sessionId,
+        dueOnly,
+        before,
+        limit,
+      });
+      res.json({ actions });
+    } catch (err) {
+      next(err);
+    }
   });
 
   app.patch('/actions/:id', (req: Request, res: Response, next: NextFunction) => {
@@ -659,23 +1007,39 @@ export function createApp(): express.Application {
   app.get('/inject', (req: Request, res: Response) => {
     const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
     const taskType = (req.query.task_type || req.query.taskType) as string | undefined;
+    const userId = (req.query.user_id || req.query.userId) as string | undefined;
     const limit = parseBoundedLimit(req.query.limit, 5, 200);
 
     const failure_patterns = getFailurePatterns({
       projectId,
       taskType,
+      includeAncestors: true,
       includeGlobal: true,
+      userId,
       limit,
     });
 
     const prior_outcomes = listTrajectories({
       projectId,
       taskType,
+      includeAncestors: true,
+      userId,
       limit,
     });
 
     const ready_actions = getReadyActions({
       projectId,
+      includeAncestors: true,
+      includeGlobal: true,
+      userId,
+      limit,
+    });
+
+    const due_actions = getDueActions({
+      projectId,
+      includeAncestors: true,
+      includeGlobal: true,
+      userId,
       limit,
     });
 
@@ -683,14 +1047,18 @@ export function createApp(): express.Application {
 
     const lessons = listNotes({
       projectId,
+      includeAncestors: true,
       includeGlobal: true,
+      userId,
       type: ['lesson', 'bug', 'pattern'],
       limit,
     });
 
     const notes = listNotes({
       projectId,
+      includeAncestors: true,
       includeGlobal: true,
+      userId,
       type: ['architecture', 'workflow', 'preference', 'fact'],
       limit,
     });
@@ -705,6 +1073,7 @@ export function createApp(): express.Application {
       failure_patterns,
       prior_outcomes,
       ready_actions,
+      due_actions,
       latest_session_summary,
       lessons,
       notes,
@@ -1044,12 +1413,22 @@ export function createApp(): express.Application {
   app.get('/failure-patterns', (req: Request, res: Response) => {
     const projectId = (req.query.project_id || req.query.projectId) as string | undefined;
     const taskType = (req.query.task_type || req.query.taskType) as string | undefined;
+    const includeAncestors =
+      parseOptionalBoolQuery(req.query.include_ancestors ?? req.query.includeAncestors) ?? true;
+    const includeChildren =
+      parseOptionalBoolQuery(req.query.include_children ?? req.query.includeChildren) ?? false;
+    const includeGlobal =
+      parseOptionalBoolQuery(req.query.include_global ?? req.query.includeGlobal) ?? true;
+    const userId = (req.query.user_id || req.query.userId) as string | undefined;
     const limit = parseBoundedLimit(req.query.limit, 50, 200);
 
     const patterns = getFailurePatterns({
       projectId,
       taskType,
-      includeGlobal: true,
+      includeAncestors,
+      includeChildren,
+      includeGlobal,
+      userId,
       limit,
     });
     res.json(patterns);

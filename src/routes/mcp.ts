@@ -8,9 +8,15 @@ import { createNote } from '../memory/noteStore';
 import { getFailurePatterns } from '../memory/failurePatternStore';
 import { getConsolidationCandidates } from '../consolidation/candidates';
 import { verifyAndStoreSummary } from '../consolidation/gate';
-import { createAction, listActions, updateAction } from '../memory/actionStore';
+import { createAction, getDueActions, listActions, updateAction } from '../memory/actionStore';
 import { endSession, getSessionDetails, getSessionReplay, listSessions } from '../memory/sessionStore';
-import { getKnowledgeGraph, parseGraphQuery } from '../memory/graphStore';
+import {
+  getKnowledgeGraph,
+  linkEntities,
+  parseGraphQuery,
+  unlinkEntities,
+  upsertEntity,
+} from '../memory/graphStore';
 
 export const mcpRouter = Router();
 
@@ -82,6 +88,9 @@ export function createDirectBrainMcpHandlers(
         const filters: Record<string, any> = {};
         if (args.type && args.type.length > 0) filters.type = args.type;
         if (args.file_path) filters.file_path = args.file_path;
+        if (args.entity_type) filters.entity_type = args.entity_type;
+        if (args.memory_layer) filters.memory_layer = args.memory_layer;
+        if (args.user_id) filters.user_id = args.user_id;
 
         const requestedTypes =
           args.record_types && args.record_types.length > 0 ? args.record_types : args.grains;
@@ -90,8 +99,16 @@ export function createDirectBrainMcpHandlers(
           record_types: (requestedTypes && requestedTypes.length > 0
             ? requestedTypes
             : ['note', 'trajectory']) as any,
+          include_ancestors: args.include_ancestors !== false,
+          include_children: Boolean(args.include_children),
           include_global: args.include_global !== false,
+          include_history: Boolean(args.include_history),
           include_sources: Boolean(args.include_sources),
+          ...(args.user_id !== undefined ? { user_id: args.user_id } : {}),
+          ...(args.after !== undefined ? { after: args.after } : {}),
+          ...(args.before !== undefined ? { before: args.before } : {}),
+          ...(args.as_of !== undefined ? { as_of: args.as_of } : {}),
+          ...(args.temporal_bias !== undefined ? { temporal_bias: args.temporal_bias } : {}),
           ...(args.sources_limit !== undefined ? { sources_limit: clampLimit(args.sources_limit, 20, 100) } : {}),
           ...(args.sources_offset !== undefined ? { sources_offset: Math.max(0, Math.trunc(args.sources_offset)) } : {}),
           limit: clampLimit(args.limit, 10, 100),
@@ -122,6 +139,11 @@ export function createDirectBrainMcpHandlers(
           files: args.files || [],
           supersedes: args.supersedes || null,
           ...(args.session_id !== undefined ? { session_id: args.session_id } : {}),
+          ...(args.user_id !== undefined ? { user_id: args.user_id } : {}),
+          ...(args.agent_id !== undefined ? { agent_id: args.agent_id } : {}),
+          ...(args.event_at !== undefined ? { event_at: args.event_at } : {}),
+          ...(args.valid_from !== undefined ? { valid_from: args.valid_from } : {}),
+          ...(args.valid_until !== undefined ? { valid_until: args.valid_until } : {}),
         });
         return jsonText(created);
       } catch (err) {
@@ -135,7 +157,10 @@ export function createDirectBrainMcpHandlers(
         const patterns = getFailurePatterns({
           projectId: targetProjectId,
           taskType: args?.task_type,
-          includeGlobal: true,
+          includeAncestors: args?.include_ancestors !== false,
+          includeChildren: Boolean(args?.include_children),
+          includeGlobal: args?.include_global !== false,
+          userId: args?.user_id,
           limit: clampLimit(args?.limit, 5, 200),
         });
         const result = patterns.map((p) => ({
@@ -143,6 +168,8 @@ export function createDirectBrainMcpHandlers(
           error_text: p.error_text,
           count: p.count,
           last_seen_at: p.last_seen_at,
+          project_id: p.project_id ?? null,
+          match_tier: p.match_tier ?? null,
         }));
         return jsonText(result);
       } catch (err) {
@@ -201,11 +228,17 @@ export function createDirectBrainMcpHandlers(
           scope: args.scope as 'project' | 'global' | 'unknown',
           ...(args.description !== undefined ? { description: args.description } : {}),
           ...(effectiveProjectId ? { project_id: effectiveProjectId } : {}),
+          ...(args.user_id !== undefined ? { user_id: args.user_id } : {}),
+          ...(args.agent_id !== undefined ? { agent_id: args.agent_id } : {}),
           ...(args.session_id !== undefined ? { session_id: args.session_id } : {}),
           ...(args.status !== undefined ? { status: args.status } : {}),
           ...(args.priority !== undefined ? { priority: args.priority } : {}),
           ...(args.blocked_reason !== undefined ? { blocked_reason: args.blocked_reason } : {}),
           ...(args.files !== undefined ? { files: args.files } : {}),
+          ...(args.due_at !== undefined ? { due_at: args.due_at } : {}),
+          ...(args.remind_at !== undefined ? { remind_at: args.remind_at } : {}),
+          ...(args.recurrence !== undefined ? { recurrence: args.recurrence } : {}),
+          ...(args.snooze_until !== undefined ? { snooze_until: args.snooze_until } : {}),
         });
         return jsonText({ action });
       } catch (err) {
@@ -218,7 +251,12 @@ export function createDirectBrainMcpHandlers(
         const targetProjectId = args.project_id || defaultProjectId;
         const actions = listActions({
           projectId: targetProjectId,
+          includeAncestors: args.include_ancestors !== false,
+          includeChildren: Boolean(args.include_children),
           includeGlobal: args.include_global !== false,
+          dueOnly: Boolean(args.due_only),
+          before: args.before,
+          userId: args.user_id,
           status: args.status,
           limit: args.limit !== undefined ? clampLimit(args.limit, 50, 200) : undefined,
         });
@@ -239,6 +277,12 @@ export function createDirectBrainMcpHandlers(
           ...(args.resolved_by_session_id !== undefined
             ? { resolved_by_session_id: args.resolved_by_session_id }
             : {}),
+          ...(args.due_at !== undefined ? { due_at: args.due_at } : {}),
+          ...(args.remind_at !== undefined ? { remind_at: args.remind_at } : {}),
+          ...(args.recurrence !== undefined ? { recurrence: args.recurrence } : {}),
+          ...(args.snooze_until !== undefined ? { snooze_until: args.snooze_until } : {}),
+          ...(args.user_id !== undefined ? { user_id: args.user_id } : {}),
+          ...(args.agent_id !== undefined ? { agent_id: args.agent_id } : {}),
         });
         if (!action) {
           return jsonText(
@@ -252,6 +296,24 @@ export function createDirectBrainMcpHandlers(
           );
         }
         return jsonText({ action });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+
+    brainActionDue: async (args = {}) => {
+      try {
+        const targetProjectId = args.project_id || defaultProjectId;
+        const actions = getDueActions({
+          projectId: targetProjectId,
+          includeAncestors: args.include_ancestors !== false,
+          includeChildren: Boolean(args.include_children),
+          includeGlobal: args.include_global !== false,
+          before: args.before,
+          userId: args.user_id,
+          limit: args.limit !== undefined ? clampLimit(args.limit, 50, 200) : undefined,
+        });
+        return jsonText({ actions });
       } catch (err) {
         return errorResult(err);
       }
@@ -288,8 +350,15 @@ export function createDirectBrainMcpHandlers(
         }
 
         const targetProjectId = args.project_id || defaultProjectId;
+        const includeGlobal = targetProjectId
+          ? (args.include_global === true)
+          : args.include_global;
         const sessions = listSessions({
           projectId: targetProjectId,
+          includeAncestors: args.include_ancestors !== false,
+          includeChildren: Boolean(args.include_children),
+          includeGlobal,
+          userId: args.user_id,
           status: args.status,
           agentName: args.agent_name,
           limit: args.limit !== undefined ? clampLimit(args.limit, 50, 200) : undefined,
@@ -327,12 +396,64 @@ export function createDirectBrainMcpHandlers(
 
     brainGraph: async (args = {}) => {
       try {
+        const mode = args.mode || 'query';
+
+        if (mode === 'upsert_entity') {
+          const check = validateScopeAndProject(args.scope, args.project_id, defaultProjectId);
+          if (check.error) {
+            return jsonText({ error: check.error }, true);
+          }
+          const entity = upsertEntity({
+            id: args.entity_id ?? args.id,
+            scope: args.scope,
+            project_id: check.effectiveProjectId ?? null,
+            entity_type: args.entity_type,
+            name: args.name ?? '',
+            description: args.description,
+            external_ref: args.external_ref,
+            metadata: args.metadata,
+            user_id: args.user_id,
+            agent_id: args.agent_id,
+          });
+          return jsonText({ entity });
+        }
+
+        if (mode === 'link') {
+          const edge = linkEntities({
+            source_type: args.source_type,
+            source_id: args.source_id,
+            target_type: args.target_type,
+            target_id: args.target_id,
+            relation: args.relation ?? '',
+            metadata: args.metadata,
+          });
+          return jsonText({ edge });
+        }
+
+        if (mode === 'unlink') {
+          const result = unlinkEntities({
+            id: args.id,
+            source_id: args.source_id,
+            target_id: args.target_id,
+            relation: args.relation,
+          });
+          return jsonText(result);
+        }
+
         const targetProjectId =
           args.project_id || (args.scope === 'global' || args.scope === 'unknown' ? undefined : defaultProjectId);
         const graph = getKnowledgeGraph(
           parseGraphQuery({
             ...(targetProjectId ? { project_id: targetProjectId } : {}),
             ...(args.scope ? { scope: args.scope } : {}),
+            ...(args.include_ancestors !== undefined ? { include_ancestors: args.include_ancestors } : {}),
+            ...(args.include_children !== undefined ? { include_children: args.include_children } : {}),
+            ...(args.include_global !== undefined ? { include_global: args.include_global } : {}),
+            ...(args.depth !== undefined ? { depth: args.depth } : {}),
+            ...(args.node_id ? { node_id: args.node_id } : {}),
+            ...(args.entity_type ? { entity_type: args.entity_type } : {}),
+            ...(args.relation ? { relation: args.relation } : {}),
+            ...(args.user_id ? { user_id: args.user_id } : {}),
             ...(args.limit !== undefined ? { limit: clampLimit(args.limit, 50, 200) } : {}),
           })
         );

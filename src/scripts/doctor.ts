@@ -136,6 +136,56 @@ export async function runDoctor(options: {
         else if (projCol.notnull !== 0) issues.push('observations_archive.project_id is not nullable (notnull=1)');
       }
 
+      // entities & entity_edges tables check
+      const entitiesCols = getTableColumns('entities');
+      if (entitiesCols.size === 0) {
+        issues.push('table entities does not exist');
+      }
+      const entityEdgesCols = getTableColumns('entity_edges');
+      if (entityEdgesCols.size === 0) {
+        issues.push('table entity_edges does not exist');
+      }
+
+      // FTS5 virtual tables check
+      const ftsRows = db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('fts_notes', 'fts_entities', 'fts_actions')"
+        )
+        .all() as Array<{ name: string }>;
+      const ftsSet = new Set(ftsRows.map((r) => r.name));
+      for (const ftsName of ['fts_notes', 'fts_entities', 'fts_actions']) {
+        if (!ftsSet.has(ftsName)) {
+          issues.push(`FTS5 table ${ftsName} does not exist`);
+        }
+      }
+
+      // actions reminder/recurrence/user columns check
+      const actionCols = getTableColumns('actions');
+      if (actionCols.size === 0) {
+        issues.push('table actions does not exist');
+      } else {
+        for (const col of [
+          'due_at',
+          'remind_at',
+          'recurrence',
+          'last_reminded_at',
+          'snooze_until',
+          'user_id',
+        ]) {
+          if (!actionCols.has(col)) issues.push(`actions.${col} missing`);
+        }
+      }
+
+      // notes temporal/user columns check
+      const noteCols = getTableColumns('notes');
+      if (noteCols.size === 0) {
+        issues.push('table notes does not exist');
+      } else {
+        for (const col of ['event_at', 'valid_from', 'valid_until', 'user_id']) {
+          if (!noteCols.has(col)) issues.push(`notes.${col} missing`);
+        }
+      }
+
       if (issues.length === 0) {
         schemaAligned = true;
         checks.push({
