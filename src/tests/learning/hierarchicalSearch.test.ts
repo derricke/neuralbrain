@@ -587,4 +587,79 @@ describe('hierarchical multi-memory search', () => {
     });
     expect(resFilterUser.results.map((r) => r.id)).toEqual(['ent_bob']);
   });
+
+  it('ignores low-similarity dense entity noise (< 0.55) when seeding entity-graph RRF', async () => {
+    const db = getDb();
+    // Query vector is [1, 0, 0, 0]
+    setCustomEmbedder(async () => [1, 0, 0, 0]);
+
+    // Noise entity has cosine similarity ~0.30 with [1, 0, 0, 0] and no lexical overlap
+    const lowSimVec = serializeEmbedding([0.3, 0.9539, 0, 0]);
+    db.prepare(`
+      INSERT INTO entities (id, scope, project_id, entity_type, name, description, embedding)
+      VALUES ('ent_noise', 'project', 'acme/socials', 'brand', 'Unrelated Zebra', 'Completely different topic', ?)
+    `).run(lowSimVec);
+
+    const linkedNote = createNote({
+      scope: 'project',
+      projectId: 'acme/socials',
+      type: 'fact',
+      title: 'Zebra logistics',
+      content: 'Completely unrelated content',
+    });
+    db.prepare(`
+      INSERT INTO entity_edges (id, source_type, source_id, target_type, target_id, relation)
+      VALUES ('edge_noise', 'entity', 'ent_noise', 'note', ?, 'references')
+    `).run(linkedNote.id);
+
+    const res = await hybridSearch({
+      q: 'quarterly billing audit',
+      project_id: 'acme/socials',
+      record_types: ['note'],
+    });
+
+    // Neither lexical nor high-sim dense match -> must NOT be pulled in by noise entity
+    expect(res.results.find((r) => r.id === linkedNote.id)).toBeUndefined();
+  });
+
+  it('scopes FTS5 AFTER UPDATE triggers to indexed text columns so embedding writes do not re-index', () => {
+    const db = getDb();
+    const n1 = createNote({
+      scope: 'project',
+      projectId: 'acme/socials',
+      type: 'fact',
+      title: 'First indexed note',
+      content: 'Original body text',
+    });
+    createNote({
+      scope: 'project',
+      projectId: 'acme/socials',
+      type: 'fact',
+      title: 'Second indexed note',
+      content: 'Keeps max rowid ahead of n1',
+    });
+
+    const rowidBefore = (
+      db.prepare('SELECT rowid FROM fts_notes WHERE record_id = ?').get(n1.id) as { rowid: number }
+    ).rowid;
+
+    // Non-text update (embedding BLOB) must NOT fire trg_fts_notes_au
+    db.prepare('UPDATE notes SET embedding = ? WHERE id = ?').run(serializeEmbedding([1, 0, 0, 0]), n1.id);
+    const rowidAfterEmbed = (
+      db.prepare('SELECT rowid FROM fts_notes WHERE record_id = ?').get(n1.id) as { rowid: number }
+    ).rowid;
+    expect(rowidAfterEmbed).toBe(rowidBefore);
+
+    // Text update (title) MUST fire trg_fts_notes_au and update searchable content
+    db.prepare('UPDATE notes SET title = ? WHERE id = ?').run('Renamed phoenix protocol', n1.id);
+    const rowidAfterTitle = (
+      db.prepare('SELECT rowid FROM fts_notes WHERE record_id = ?').get(n1.id) as { rowid: number }
+    ).rowid;
+    expect(rowidAfterTitle).toBeGreaterThan(rowidAfterEmbed);
+
+    const ftsHit = db
+      .prepare(`SELECT record_id FROM fts_notes WHERE fts_notes MATCH '"phoenix"'`)
+      .all() as Array<{ record_id: string }>;
+    expect(ftsHit.map((r) => r.record_id)).toEqual([n1.id]);
+  });
 });

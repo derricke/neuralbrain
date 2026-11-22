@@ -785,18 +785,19 @@ describe('Build Order Acceptance & Standing Invariants Suite (Steps 1–10 & Inv
       }
     });
 
-    it('verifies all 11 tools work over HTTP and src/mcp/ has zero DB imports', async () => {
+    it('verifies all 12 tools work over HTTP and src/mcp/ has zero DB imports', async () => {
       // 1. Verify zero DB imports in src/mcp/server.ts
       const mcpSource = fs.readFileSync(path.resolve(__dirname, '../../mcp/server.ts'), 'utf-8');
       expect(mcpSource).not.toMatch(/getDb/);
       expect(mcpSource).not.toMatch(/better-sqlite3|node:sqlite|lib\/sqlite/);
       expect(mcpSource).not.toMatch(/from\s+['"]\.\.\/lib\/db['"]/);
 
-      // 2. Verify list of tools is exactly the 11 sanctioned tools
+      // 2. Verify list of tools is exactly the 12 sanctioned tools
       const toolList = await mcpClient.listTools();
       const names = toolList.tools.map((t) => t.name).sort();
       expect(names).toEqual([
         'brain_action_add',
+        'brain_action_due',
         'brain_action_list',
         'brain_action_update',
         'brain_consolidate_candidates',

@@ -591,6 +591,16 @@ function alignFtsSchema(db: Database): void {
       record_id UNINDEXED, title, description, blocked_reason, tokenize='porter unicode61'
     );
 
+    -- Drop legacy unscoped AFTER UPDATE triggers so existing databases upgrade
+    -- to column-scoped triggers (avoiding FTS5 re-indexing on embedding/status/last_reminded_at writes).
+    DROP TRIGGER IF EXISTS trg_fts_notes_au;
+    DROP TRIGGER IF EXISTS trg_fts_trajectories_au;
+    DROP TRIGGER IF EXISTS trg_fts_observations_au;
+    DROP TRIGGER IF EXISTS trg_fts_summaries_au;
+    DROP TRIGGER IF EXISTS trg_fts_summary_claims_au;
+    DROP TRIGGER IF EXISTS trg_fts_entities_au;
+    DROP TRIGGER IF EXISTS trg_fts_actions_au;
+
     -- notes triggers
     CREATE TRIGGER IF NOT EXISTS trg_fts_notes_ai AFTER INSERT ON notes BEGIN
       DELETE FROM fts_notes WHERE record_id = new.id;
@@ -598,7 +608,7 @@ function alignFtsSchema(db: Database): void {
       SELECT n.id, COALESCE(n.title, ''), COALESCE(n.content, ''), ${NOTES_EXTRA_EXPR}
       FROM notes n WHERE n.id = new.id;
     END;
-    CREATE TRIGGER IF NOT EXISTS trg_fts_notes_au AFTER UPDATE ON notes BEGIN
+    CREATE TRIGGER trg_fts_notes_au AFTER UPDATE OF id, title, content, type, author ON notes BEGIN
       DELETE FROM fts_notes WHERE record_id = old.id;
       INSERT INTO fts_notes(record_id, title, content, extra)
       SELECT n.id, COALESCE(n.title, ''), COALESCE(n.content, ''), ${NOTES_EXTRA_EXPR}
@@ -642,7 +652,7 @@ function alignFtsSchema(db: Database): void {
       INSERT INTO fts_trajectories(record_id, description, result, task_type)
       VALUES (new.id, COALESCE(new.description, ''), COALESCE(new.result, ''), COALESCE(new.task_type, ''));
     END;
-    CREATE TRIGGER IF NOT EXISTS trg_fts_trajectories_au AFTER UPDATE ON trajectories BEGIN
+    CREATE TRIGGER trg_fts_trajectories_au AFTER UPDATE OF id, description, result, task_type ON trajectories BEGIN
       DELETE FROM fts_trajectories WHERE record_id = old.id;
       INSERT INTO fts_trajectories(record_id, description, result, task_type)
       VALUES (new.id, COALESCE(new.description, ''), COALESCE(new.result, ''), COALESCE(new.task_type, ''));
@@ -657,7 +667,7 @@ function alignFtsSchema(db: Database): void {
       INSERT INTO fts_observations(record_id, tool_name, file_path, input, output)
       VALUES (new.id, COALESCE(new.tool_name, ''), COALESCE(new.file_path, ''), COALESCE(new.input, ''), COALESCE(new.output, ''));
     END;
-    CREATE TRIGGER IF NOT EXISTS trg_fts_observations_au AFTER UPDATE ON observations BEGIN
+    CREATE TRIGGER trg_fts_observations_au AFTER UPDATE OF id, tool_name, file_path, input, output ON observations BEGIN
       DELETE FROM fts_observations WHERE record_id = old.id;
       INSERT INTO fts_observations(record_id, tool_name, file_path, input, output)
       VALUES (new.id, COALESCE(new.tool_name, ''), COALESCE(new.file_path, ''), COALESCE(new.input, ''), COALESCE(new.output, ''));
@@ -673,7 +683,7 @@ function alignFtsSchema(db: Database): void {
       SELECT s.id, ${SUMMARIES_TEXT_EXPR}
       FROM summaries s WHERE s.id = new.id;
     END;
-    CREATE TRIGGER IF NOT EXISTS trg_fts_summaries_au AFTER UPDATE ON summaries BEGIN
+    CREATE TRIGGER trg_fts_summaries_au AFTER UPDATE OF id, kind, outcome, files_touched, error_verbatim ON summaries BEGIN
       DELETE FROM fts_summaries WHERE record_id = old.id;
       INSERT INTO fts_summaries(record_id, text)
       SELECT s.id, ${SUMMARIES_TEXT_EXPR}
@@ -690,7 +700,7 @@ function alignFtsSchema(db: Database): void {
       SELECT s.id, ${SUMMARIES_TEXT_EXPR}
       FROM summaries s WHERE s.id = new.summary_id;
     END;
-    CREATE TRIGGER IF NOT EXISTS trg_fts_summary_claims_au AFTER UPDATE ON summary_claims BEGIN
+    CREATE TRIGGER trg_fts_summary_claims_au AFTER UPDATE OF summary_id, text ON summary_claims BEGIN
       DELETE FROM fts_summaries WHERE record_id IN (old.summary_id, new.summary_id);
       INSERT INTO fts_summaries(record_id, text)
       SELECT s.id, ${SUMMARIES_TEXT_EXPR}
@@ -709,7 +719,7 @@ function alignFtsSchema(db: Database): void {
       INSERT INTO fts_entities(record_id, name, entity_type, description, external_ref)
       VALUES (new.id, COALESCE(new.name, ''), COALESCE(new.entity_type, ''), COALESCE(new.description, ''), COALESCE(new.external_ref, ''));
     END;
-    CREATE TRIGGER IF NOT EXISTS trg_fts_entities_au AFTER UPDATE ON entities BEGIN
+    CREATE TRIGGER trg_fts_entities_au AFTER UPDATE OF id, name, entity_type, description, external_ref ON entities BEGIN
       DELETE FROM fts_entities WHERE record_id = old.id;
       INSERT INTO fts_entities(record_id, name, entity_type, description, external_ref)
       VALUES (new.id, COALESCE(new.name, ''), COALESCE(new.entity_type, ''), COALESCE(new.description, ''), COALESCE(new.external_ref, ''));
@@ -724,7 +734,7 @@ function alignFtsSchema(db: Database): void {
       INSERT INTO fts_actions(record_id, title, description, blocked_reason)
       VALUES (new.id, COALESCE(new.title, ''), COALESCE(new.description, ''), COALESCE(new.blocked_reason, ''));
     END;
-    CREATE TRIGGER IF NOT EXISTS trg_fts_actions_au AFTER UPDATE ON actions BEGIN
+    CREATE TRIGGER trg_fts_actions_au AFTER UPDATE OF id, title, description, blocked_reason ON actions BEGIN
       DELETE FROM fts_actions WHERE record_id = old.id;
       INSERT INTO fts_actions(record_id, title, description, blocked_reason)
       VALUES (new.id, COALESCE(new.title, ''), COALESCE(new.description, ''), COALESCE(new.blocked_reason, ''));

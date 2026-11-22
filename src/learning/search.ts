@@ -23,6 +23,7 @@ import type {
 const MAX_OBS_RECORD_CHARS = 2000;
 const MAX_SOURCE_PREVIEW_CHARS = 160;
 const MAX_ENTITY_SEEDS = 15;
+const MIN_ENTITY_DENSE_SIM = 0.55;
 const RRF_K = 60;
 
 const SEMANTIC_NOTE_TYPES = ['fact', 'architecture', 'preference'] as const;
@@ -804,12 +805,12 @@ function findEntitySeeds(
       .all(...queryParams) as Array<{ id: string; name: string; embedding: Buffer }>;
 
     for (const r of embRows) {
-      nameById.set(r.id, r.name);
       const qdrantScore = denseScoresMap.get(docKey('entity', r.id));
       const sim = qdrantScore !== undefined
         ? qdrantScore
         : cosineSimilarity(queryVec, deserializeEmbedding(r.embedding));
-      if (sim > 0) {
+      if (sim >= MIN_ENTITY_DENSE_SIM) {
+        nameById.set(r.id, r.name);
         denseHitsMap.set(r.id, sim);
       }
     }

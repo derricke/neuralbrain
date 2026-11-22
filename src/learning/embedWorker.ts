@@ -231,7 +231,7 @@ export async function drainEmbedQueue(
               continue;
             }
             text = [
-              obs.kind === 'prompt' ? 'prompt: ' : 'tool: ',
+              obs.kind === 'prompt' ? 'prompt: ' : obs.kind === 'response' ? 'response: ' : 'tool: ',
               obs.tool_name || '',
               obs.file_path ? ` file: ${obs.file_path}` : '',
               obs.input ? `\ninput: ${obs.input}` : '',
