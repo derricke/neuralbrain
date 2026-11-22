@@ -123,9 +123,9 @@ export async function migrateAgentMemoryNotes(
   `);
 
   const enqueueStmt = db.prepare(`
-    INSERT INTO embed_queue (record_id, grain, status, attempts, last_error, target, queued_at)
+    INSERT INTO embed_queue (record_id, record_type, status, attempts, last_error, target, queued_at)
     VALUES (?, 'note', 'pending', 0, NULL, 'live', unixepoch())
-    ON CONFLICT(record_id, grain, target) DO UPDATE SET
+    ON CONFLICT(record_id, record_type, target) DO UPDATE SET
       status = 'pending',
       attempts = 0,
       last_error = NULL,

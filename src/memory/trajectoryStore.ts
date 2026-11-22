@@ -639,7 +639,7 @@ export function runCleanup(): CleanupResult {
         FROM observations_archive
         WHERE archived_at < ?
           AND original_observation_id NOT IN (
-            SELECT record_id FROM summary_sources WHERE grain = 'observation'
+            SELECT record_id FROM summary_sources WHERE record_type = 'observation'
           )
         LIMIT ?
       `)
@@ -666,7 +666,7 @@ export function runCleanup(): CleanupResult {
       if (!keepSummarized) {
         const summarizedToExpire = db
           .prepare(
-            `SELECT DISTINCT summary_id FROM summary_sources WHERE grain = 'observation' AND record_id IN (${origPlaceholders})`
+            `SELECT DISTINCT summary_id FROM summary_sources WHERE record_type = 'observation' AND record_id IN (${origPlaceholders})`
           )
           .all(...origObsIds) as Array<{ summary_id: string }>;
 
@@ -682,7 +682,7 @@ export function runCleanup(): CleanupResult {
         ...archiveRowIds
       );
       db.prepare(
-        `DELETE FROM embed_queue WHERE grain = 'observation' AND record_id IN (${origPlaceholders})`
+        `DELETE FROM embed_queue WHERE record_type = 'observation' AND record_id IN (${origPlaceholders})`
       ).run(...origObsIds);
 
       return origObsIds;
@@ -795,7 +795,7 @@ export function runCleanup(): CleanupResult {
           ...archiveRowIds
         );
         db.prepare(
-          `DELETE FROM embed_queue WHERE grain = 'trajectory' AND record_id IN (${origPlaceholders})`
+          `DELETE FROM embed_queue WHERE record_type = 'trajectory' AND record_id IN (${origPlaceholders})`
         ).run(...origTrajIds);
 
         return origTrajIds;

@@ -88,6 +88,9 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
     include_global?: boolean;
     type?: string[];
     file_path?: string;
+    include_sources?: boolean;
+    sources_limit?: number;
+    sources_offset?: number;
     limit?: number;
   }) => {
     const targetProjectId = args.project_id || defaultProjectId;
@@ -98,6 +101,9 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
       record_types:
         requestedTypes && requestedTypes.length > 0 ? requestedTypes : ['note', 'trajectory'],
       include_global: args.include_global !== false,
+      include_sources: Boolean(args.include_sources),
+      ...(args.sources_limit !== undefined ? { sources_limit: args.sources_limit } : {}),
+      ...(args.sources_offset !== undefined ? { sources_offset: args.sources_offset } : {}),
       limit: args.limit ?? 10,
     };
     if (targetProjectId) {
@@ -573,6 +579,23 @@ export function createBrainMcpServer(options: BrainMcpServerOptions = {}): McpSe
       include_global: z.boolean().default(true).describe('Whether to include global records when project_id is specified'),
       type: z.array(z.string()).optional().describe('Note type filter (fact, architecture, pattern, workflow, bug, preference, lesson)'),
       file_path: z.string().optional().describe('File path filter ("what do we know about this file?")'),
+      include_sources: z
+        .boolean()
+        .default(false)
+        .describe('Include paginated source provenance entries (with observation titles) on summary results (default false)'),
+      sources_limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .default(20)
+        .describe('Maximum number of source entries per summary when include_sources is true (default 20)'),
+      sources_offset: z
+        .number()
+        .int()
+        .min(0)
+        .default(0)
+        .describe('Offset into summary sources for pagination when include_sources is true (default 0)'),
       limit: z.number().int().min(1).max(100).default(10).describe('Maximum number of results to return'),
     },
     async (args) => {

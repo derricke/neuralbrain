@@ -177,7 +177,7 @@ describe('HTTP API routes', () => {
       .set('Authorization', `Bearer ${testApiKey}`)
       .send({
         q: 'typescript strict mode',
-        grains: ['note'],
+        record_types: ['note'],
       });
 
     expect(searchRes.status).toBe(200);

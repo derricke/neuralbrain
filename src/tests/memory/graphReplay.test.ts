@@ -102,7 +102,7 @@ describe('Phase 3+4: Knowledge Graph, Session Replay, and Dashboard Alignment', 
 
       db.prepare(
         `
-        INSERT INTO summary_sources (summary_id, claim_id, record_id, grain)
+        INSERT INTO summary_sources (summary_id, claim_id, record_id, record_type)
         VALUES ('sum-graph-1', 'claim-graph-1', ?, 'note')
         `
       ).run(baseNote.id);
@@ -221,7 +221,7 @@ describe('Phase 3+4: Knowledge Graph, Session Replay, and Dashboard Alignment', 
       ).run();
       db.prepare(
         `
-        INSERT INTO summary_sources (summary_id, claim_id, record_id, grain)
+        INSERT INTO summary_sources (summary_id, claim_id, record_id, record_type)
         VALUES ('sum-obs-1', NULL, 'obs-graph-cited', 'observation')
         `
       ).run();

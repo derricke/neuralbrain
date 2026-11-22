@@ -163,7 +163,7 @@ describe('vendor-driven consolidation run', () => {
       .prepare('SELECT * FROM summary_sources WHERE summary_id = ?')
       .all(report.stored[0].summary_id) as any[];
     expect(sources).toHaveLength(2);
-    expect(sources.every((s) => s.grain === 'observation')).toBe(true);
+    expect(sources.every((s) => s.record_type === 'observation')).toBe(true);
   }, 15000);
 
   it('applies the verification gate to a vendor producer with no bypass', async () => {

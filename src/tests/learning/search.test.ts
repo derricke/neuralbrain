@@ -76,7 +76,7 @@ describe('hybridSearch', () => {
     const searchRes = await hybridSearch({
       q: 'foreign key constraint failed',
       project_id: 'p1',
-      grains: ['note'],
+      record_types: ['note'],
     });
 
     expect(searchRes.mode).toBe('hybrid');
@@ -126,7 +126,7 @@ describe('hybridSearch', () => {
       q: 'architecture',
       project_id: 'alpha',
       include_global: true,
-      grains: ['note'],
+      record_types: ['note'],
     });
 
     const projectResultIds = resProject.results.map((r) => r.id);
@@ -140,7 +140,7 @@ describe('hybridSearch', () => {
       q: 'architecture',
       project_id: 'alpha',
       include_global: false,
-      grains: ['note'],
+      record_types: ['note'],
     });
     const noGlobalIds = resNoGlobal.results.map((r) => r.id);
     expect(noGlobalIds).toContain(noteProj.id);
@@ -151,7 +151,7 @@ describe('hybridSearch', () => {
     const resUnknown = await hybridSearch({
       q: 'architecture',
       scope: 'unknown',
-      grains: ['note'],
+      record_types: ['note'],
     });
     const unknownIds = resUnknown.results.map((r) => r.id);
     expect(unknownIds).toContain(noteUnknown.id);
@@ -178,15 +178,15 @@ describe('hybridSearch', () => {
 
     const noteOnlyRes = await hybridSearch({
       q: 'refactor memory',
-      grains: ['note'],
+      record_types: ['note'],
     });
-    expect(noteOnlyRes.results.every((r) => r.grain === 'note')).toBe(true);
+    expect(noteOnlyRes.results.every((r) => r.record_type === 'note')).toBe(true);
 
     const trajOnlyRes = await hybridSearch({
       q: 'refactor memory',
-      grains: ['trajectory'],
+      record_types: ['trajectory'],
     });
-    expect(trajOnlyRes.results.every((r) => r.grain === 'trajectory')).toBe(true);
+    expect(trajOnlyRes.results.every((r) => r.record_type === 'trajectory')).toBe(true);
   });
 
   it('returns degraded mode with BM25 when store_meta mismatches', async () => {
@@ -210,7 +210,7 @@ describe('hybridSearch', () => {
 
     const res = await hybridSearch({
       q: 'migration checklist',
-      grains: ['note'],
+      record_types: ['note'],
     });
 
     expect(res.mode).toBe('bm25');
@@ -274,7 +274,7 @@ describe('hybridSearch', () => {
       VALUES ('clm_compact_1', 'sum_compact_1', 'Acme Alpha summary claim', 0)
     `).run();
     db.prepare(`
-      INSERT INTO summary_sources (summary_id, claim_id, record_id, grain)
+      INSERT INTO summary_sources (summary_id, claim_id, record_id, record_type)
       VALUES ('sum_compact_1', 'clm_compact_1', 'obs_compact_1', 'observation')
     `).run();
 
@@ -290,12 +290,58 @@ describe('hybridSearch', () => {
       expect(item.record).not.toHaveProperty('embedding');
     }
 
-    const summaryItem = res.results.find((r) => r.grain === 'summary');
+    const summaryItem = res.results.find((r) => r.record_type === 'summary');
     expect(summaryItem).toBeDefined();
     expect(summaryItem!.claims).toHaveLength(1);
-    expect(summaryItem!.sources).toHaveLength(1);
+    expect(summaryItem!.sources).toBeUndefined();
+    expect(summaryItem!.sources_total).toBeUndefined();
     expect(summaryItem!.record).not.toHaveProperty('claims');
     expect(summaryItem!.record).not.toHaveProperty('sources');
+
+    // Opt-in include_sources returns enriched observation titles and pagination metadata
+    db.prepare(`
+      INSERT INTO observations (id, scope, project_id, kind, tool_name, file_path, input, failed)
+      VALUES ('obs_compact_1', 'project', 'p-compact', 'tool_call', 'read_file', 'src/a.ts', 'read src/a.ts', 0)
+    `).run();
+    db.prepare(`
+      INSERT INTO observations (id, scope, project_id, kind, tool_name, file_path, input, failed)
+      VALUES ('obs_compact_2', 'project', 'p-compact', 'tool_call', 'run_command', NULL, 'npm test', 1)
+    `).run();
+    db.prepare(`
+      INSERT INTO summary_sources (summary_id, claim_id, record_id, record_type)
+      VALUES ('sum_compact_1', 'clm_compact_1', 'obs_compact_2', 'observation')
+    `).run();
+
+    const page1 = await hybridSearch({
+      q: 'acme alpha',
+      project_id: 'p-compact',
+      record_types: ['summary'],
+      include_sources: true,
+      sources_limit: 1,
+      sources_offset: 0,
+    });
+    const p1Summary = page1.results.find((r) => r.record_type === 'summary')!;
+    expect(p1Summary.sources).toHaveLength(1);
+    expect(p1Summary.sources_total).toBe(2);
+    expect(p1Summary.sources_has_more).toBe(true);
+    expect(p1Summary.sources![0].title).toBe('read_file: src/a.ts');
+    expect(p1Summary.sources![0].failed).toBe(false);
+
+    const page2 = await hybridSearch({
+      q: 'acme alpha',
+      project_id: 'p-compact',
+      record_types: ['summary'],
+      include_sources: true,
+      sources_limit: 1,
+      sources_offset: 1,
+    });
+    const p2Summary = page2.results.find((r) => r.record_type === 'summary')!;
+    expect(p2Summary.sources).toHaveLength(1);
+    expect(p2Summary.sources_total).toBe(2);
+    expect(p2Summary.sources_has_more).toBe(false);
+    expect(p2Summary.sources![0].title).toBe('run_command');
+    expect(p2Summary.sources![0].failed).toBe(true);
+    expect(p2Summary.sources![0].preview).toBe('npm test');
   });
 
   it('handles unaligned Buffer.byteOffset in deserializeEmbedding and bounds embed text', () => {
@@ -360,7 +406,7 @@ describe('hybridSearch', () => {
 
     const qdrantSpy = jest.spyOn(embedWorker, 'getQdrantClient').mockReturnValue({
       search: jest.fn().mockResolvedValue([
-        { id: oldNote.id, score: 0.99, payload: { grain: 'note' } },
+        { id: oldNote.id, score: 0.99, payload: { record_type: 'note' } },
       ]),
     } as any);
 

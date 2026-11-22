@@ -11,7 +11,7 @@ import {
   markEmbedFailed,
   recoverStaleRunningEmbeds,
   releaseEmbedClaim,
-  type EmbedGrain,
+  type EmbedRecordType,
 } from '../memory/embedQueueStore';
 import {
   EmbeddingConfigurationError,
@@ -29,7 +29,7 @@ export interface DrainOptions {
   maxBatches?: number;
   client?: QdrantClient;
   skipSqliteBlobUpdate?: boolean;
-  onVectorsComputed?: (vectors: Array<{ id: string; grain: EmbedGrain; blob: Buffer }>) => void;
+  onVectorsComputed?: (vectors: Array<{ id: string; record_type: EmbedRecordType; blob: Buffer }>) => void;
 }
 
 export interface ReembedStatus {
@@ -183,8 +183,8 @@ export async function drainEmbedQueue(
     }
 
     const qdrantPointsToUpsert: Array<{ id: string; vector: number[]; payload: Record<string, any> }> = [];
-    const pendingQdrantDone: Array<{ record_id: string; grain: EmbedGrain }> = [];
-    const computedBlobs: Array<{ id: string; grain: EmbedGrain; blob: Buffer }> = [];
+    const pendingQdrantDone: Array<{ record_id: string; record_type: EmbedRecordType }> = [];
+    const computedBlobs: Array<{ id: string; record_type: EmbedRecordType; blob: Buffer }> = [];
 
     for (let itemIdx = 0; itemIdx < items.length; itemIdx++) {
       const item = items[itemIdx];
@@ -192,13 +192,13 @@ export async function drainEmbedQueue(
         let text = '';
         let payload: Record<string, any> = {};
 
-        switch (item.grain) {
+        switch (item.record_type) {
           case 'observation': {
             const obs = db
               .prepare('SELECT * FROM observations WHERE id = ?')
               .get(item.record_id) as any;
             if (!obs) {
-              markEmbedDone(item.record_id, item.grain, target);
+              markEmbedDone(item.record_id, item.record_type, target);
               totalProcessed++;
               continue;
             }
@@ -210,7 +210,7 @@ export async function drainEmbedQueue(
               obs.output ? `\noutput: ${obs.output}` : '',
             ].join('');
             payload = {
-              grain: 'observation',
+              record_type: 'observation',
               scope: obs.scope,
               project_id: obs.project_id,
               kind: obs.kind,
@@ -231,7 +231,7 @@ export async function drainEmbedQueue(
               .prepare('SELECT * FROM trajectories WHERE id = ?')
               .get(item.record_id) as any;
             if (!traj) {
-              markEmbedDone(item.record_id, item.grain, target);
+              markEmbedDone(item.record_id, item.record_type, target);
               totalProcessed++;
               continue;
             }
@@ -244,7 +244,7 @@ export async function drainEmbedQueue(
               success: traj.success === null || traj.success === undefined ? null : traj.success === 1,
             });
             payload = {
-              grain: 'trajectory',
+              record_type: 'trajectory',
               scope: traj.scope,
               project_id: traj.project_id,
               kind: null,
@@ -265,13 +265,13 @@ export async function drainEmbedQueue(
               .prepare('SELECT * FROM notes WHERE id = ?')
               .get(item.record_id) as any;
             if (!note) {
-              markEmbedDone(item.record_id, item.grain, target);
+              markEmbedDone(item.record_id, item.record_type, target);
               totalProcessed++;
               continue;
             }
             text = `${note.title}\n\n${note.content}`;
             payload = {
-              grain: 'note',
+              record_type: 'note',
               scope: note.scope,
               project_id: note.project_id,
               kind: null,
@@ -292,7 +292,7 @@ export async function drainEmbedQueue(
               .prepare('SELECT * FROM summaries WHERE id = ?')
               .get(item.record_id) as any;
             if (!summary) {
-              markEmbedDone(item.record_id, item.grain, target);
+              markEmbedDone(item.record_id, item.record_type, target);
               totalProcessed++;
               continue;
             }
@@ -301,7 +301,7 @@ export async function drainEmbedQueue(
               .all(item.record_id) as Array<{ text: string }>;
             text = claims.map((c) => c.text).join('\n');
             payload = {
-              grain: 'summary',
+              record_type: 'summary',
               scope: summary.scope,
               project_id: summary.project_id,
               kind: summary.kind,
@@ -324,12 +324,12 @@ export async function drainEmbedQueue(
           const vector = await embedDocument(text);
           const blob = serializeEmbedding(vector);
 
-          if (item.grain === 'trajectory' || item.grain === 'note' || item.grain === 'summary') {
+          if (item.record_type === 'trajectory' || item.record_type === 'note' || item.record_type === 'summary') {
             if (!skipSqliteBlobUpdate) {
               const table =
-                item.grain === 'trajectory'
+                item.record_type === 'trajectory'
                   ? 'trajectories'
-                  : item.grain === 'note'
+                  : item.record_type === 'note'
                     ? 'notes'
                     : 'summaries';
               db.prepare(`UPDATE ${table} SET embedding = ? WHERE id = ?`).run(
@@ -337,7 +337,7 @@ export async function drainEmbedQueue(
                 item.record_id
               );
             } else if (options?.onVectorsComputed) {
-              computedBlobs.push({ id: item.record_id, grain: item.grain, blob });
+              computedBlobs.push({ id: item.record_id, record_type: item.record_type, blob });
             }
           }
 
@@ -347,13 +347,13 @@ export async function drainEmbedQueue(
               vector,
               payload: { ...payload, record_id: item.record_id },
             });
-            pendingQdrantDone.push({ record_id: item.record_id, grain: item.grain });
+            pendingQdrantDone.push({ record_id: item.record_id, record_type: item.record_type });
             queuedForQdrant = true;
           }
         }
 
         if (!queuedForQdrant) {
-          markEmbedDone(item.record_id, item.grain, target);
+          markEmbedDone(item.record_id, item.record_type, target);
           totalProcessed++;
         }
       } catch (err) {
@@ -363,7 +363,7 @@ export async function drainEmbedQueue(
           // is not installed). No record is at fault: put this item and the rest
           // of the batch back to pending and stop until it is fixed.
           for (const pending of items.slice(itemIdx)) {
-            releaseEmbedClaim(pending.record_id, pending.grain, target, errorMsg);
+            releaseEmbedClaim(pending.record_id, pending.record_type, target, errorMsg);
           }
           logger.error({ target, error: errorMsg }, 'embedder unavailable; queue left pending');
           embedderUnavailable = true;
@@ -372,13 +372,13 @@ export async function drainEmbedQueue(
         logger.error(
           {
             recordId: item.record_id,
-            grain: item.grain,
+            record_type: item.record_type,
             target,
             error: errorMsg,
           },
           'error embedding record'
         );
-        markEmbedFailed(item.record_id, item.grain, target, errorMsg);
+        markEmbedFailed(item.record_id, item.record_type, target, errorMsg);
         totalFailed++;
       }
 
@@ -432,7 +432,7 @@ export async function drainEmbedQueue(
 
       if (upsertSucceeded || !qdrantConfigured) {
         for (const p of pendingQdrantDone) {
-          markEmbedDone(p.record_id, p.grain, target);
+          markEmbedDone(p.record_id, p.record_type, target);
           totalProcessed++;
         }
         if (options?.onVectorsComputed && computedBlobs.length > 0) {
@@ -440,7 +440,7 @@ export async function drainEmbedQueue(
         }
       } else {
         for (const p of pendingQdrantDone) {
-          markEmbedFailed(p.record_id, p.grain, target, upsertErrMsg || 'Qdrant upsert failed');
+          markEmbedFailed(p.record_id, p.record_type, target, upsertErrMsg || 'Qdrant upsert failed');
           totalFailed++;
         }
       }
@@ -532,7 +532,7 @@ export async function createQdrantCollectionWithIndexes(
   const keywordFields = [
     'scope',
     'project_id',
-    'grain',
+    'record_type',
     'kind',
     'type',
     'task_type',
@@ -645,7 +645,7 @@ export async function startReembed(options?: {
     // Drain queue for new collection until empty
     let processedTotal = 0;
     let failedTotal = 0;
-    const deferredBlobs: Array<{ id: string; grain: EmbedGrain; blob: Buffer }> = [];
+    const deferredBlobs: Array<{ id: string; record_type: EmbedRecordType; blob: Buffer }> = [];
 
     while (true) {
       const { processed, failed, remaining } = await drainEmbedQueue({
@@ -714,9 +714,9 @@ export async function startReembed(options?: {
     transaction(db, () => {
       for (const item of deferredBlobs) {
         const table =
-          item.grain === 'trajectory'
+          item.record_type === 'trajectory'
             ? 'trajectories'
-            : item.grain === 'note'
+            : item.record_type === 'note'
               ? 'notes'
               : 'summaries';
         db.prepare(`UPDATE ${table} SET embedding = ? WHERE id = ?`).run(item.blob, item.id);

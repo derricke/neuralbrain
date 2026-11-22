@@ -2115,7 +2115,7 @@ tr.row-highlight {
 .input-w-130 { width: 130px; }
 .input-w-150 { width: 150px; }
 .input-w-170-pr { width: 190px; padding-right: 34px; }
-.grains-selection-bar { margin-bottom: var(--space-3); display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap; }
+.record-types-selection-bar { margin-bottom: var(--space-3); display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap; }
 .search-meta-bar { margin-bottom: var(--space-3); display: none; gap: var(--space-2); align-items: center; flex-wrap: wrap; }
 .subtabs-bar { display: flex; gap: var(--space-2); margin-bottom: var(--space-4); flex-wrap: wrap; }
 .dead-letters-breakdown { margin-bottom: var(--space-4); }

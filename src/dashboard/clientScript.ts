@@ -1895,11 +1895,11 @@ export const dashboardJs = `
     const fileInput = document.getElementById('searchInputFilePath');
     const noteTypeSelect = document.getElementById('searchNoteType');
 
-    const grains = [];
-    if (document.getElementById('grainCheckNote')?.checked) grains.push('note');
-    if (document.getElementById('grainCheckTrajectory')?.checked) grains.push('trajectory');
-    if (document.getElementById('grainCheckObservation')?.checked) grains.push('observation');
-    if (document.getElementById('grainCheckSummary')?.checked) grains.push('summary');
+    const recordTypes = [];
+    if (document.getElementById('recordTypeCheckNote')?.checked) recordTypes.push('note');
+    if (document.getElementById('recordTypeCheckTrajectory')?.checked) recordTypes.push('trajectory');
+    if (document.getElementById('recordTypeCheckObservation')?.checked) recordTypes.push('observation');
+    if (document.getElementById('recordTypeCheckSummary')?.checked) recordTypes.push('summary');
 
     let proj = projectInput ? projectInput.value.trim() : '';
     if (proj.toLowerCase() === 'all projects (global)' || proj.toLowerCase() === 'all projects') {
@@ -1917,7 +1917,7 @@ export const dashboardJs = `
 
     const payload = {
       q,
-      grains: grains.length > 0 ? grains : undefined,
+      record_types: recordTypes.length > 0 ? recordTypes : undefined,
       scope: scopeSelect && scopeSelect.value ? scopeSelect.value : undefined,
       project_id: proj || undefined,
       include_global: checkGlobal ? checkGlobal.checked : true,
@@ -1997,8 +1997,9 @@ export const dashboardJs = `
       const card = el('div', { className: 'result-card' });
 
       // Header row
-      const grainVariant = item.grain === 'note' ? 'emerald' : item.grain === 'summary' ? 'emerald' : item.grain === 'trajectory' ? 'subtle' : 'amber';
-      const grainBadge = createBadge((item.grain || 'record').toUpperCase(), grainVariant, true);
+      const recordType = item.record_type || item.grain || 'record';
+      const typeVariant = recordType === 'note' ? 'emerald' : recordType === 'summary' ? 'emerald' : recordType === 'trajectory' ? 'subtle' : 'amber';
+      const typeBadge = createBadge(recordType.toUpperCase(), typeVariant, true);
 
       const scopeVal = rec.scope || item.scope;
       const projectVal = rec.project_id || item.project_id;
@@ -2010,7 +2011,7 @@ export const dashboardJs = `
       const header = el('div', { className: 'result-header' },
         el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
           el('span', { className: 'code-pill' }, '#' + (index + 1)),
-          grainBadge,
+          typeBadge,
           scopeVal ? createBadge(scopeVal + (projectVal ? ': ' + projectVal : ''), scopeVariant, true) : null
         ),
         scoreSpan
@@ -2044,7 +2045,7 @@ export const dashboardJs = `
         card.appendChild(tagList);
       }
       card.appendChild(createProvenanceLine(
-        'source: ' + (item.grain || 'record') + ' · ' + item.id + ' · ' + formatTimestamp(tsVal)
+        'source: ' + recordType + ' · ' + item.id + ' · ' + formatTimestamp(tsVal)
       ));
 
       resultsContainer.appendChild(card);
@@ -2846,7 +2847,7 @@ export const dashboardJs = `
     showModal('Observation Inspector · ' + obs.id, bodyNodes);
   }
 
-  function showObservationNotFoundModal(recordId, grain = 'observation') {
+  function showObservationNotFoundModal(recordId, recordType = 'observation') {
     const alertIcon = createSvgIcon('alert');
     alertIcon.style.color = 'var(--accent-rose)';
     const bodyNodes = [
@@ -2877,9 +2878,9 @@ export const dashboardJs = `
           el('div', { className: 'inspector-value text-mono', style: { color: 'var(--accent-rose)' } }, recordId)
         ),
         el('div', { className: 'inspector-field' },
-          el('div', { className: 'inspector-label' }, 'GRAIN'),
+          el('div', { className: 'inspector-label' }, 'RECORD TYPE'),
           el('div', { className: 'inspector-value' },
-            createBadge((grain || 'observation').toUpperCase(), 'subtle', true)
+            createBadge((recordType || 'observation').toUpperCase(), 'subtle', true)
           )
         ),
         el('div', { className: 'inspector-field' },
@@ -2917,18 +2918,18 @@ export const dashboardJs = `
     showModal('Citation Inspector · ' + recordId, bodyNodes);
   }
 
-  async function inspectCitation(recordId, grain = 'observation') {
-    showToast('Fetching cited ' + (grain || 'observation') + ': ' + recordId + '...', 'emerald', 2500);
+  async function inspectCitation(recordId, recordType = 'observation') {
+    showToast('Fetching cited ' + (recordType || 'observation') + ': ' + recordId + '...', 'emerald', 2500);
 
     // 1. Switch to Trajectories tab & Observations subtab
     switchTab('trajectories');
 
-    if (grain === 'trajectory') {
+    if (recordType === 'trajectory') {
       switchSubTab('trajectories', recordId);
       try {
         const resp = await apiFetch('/trajectories/' + encodeURIComponent(recordId));
         if (resp.status === 404) {
-          showObservationNotFoundModal(recordId, grain);
+          showObservationNotFoundModal(recordId, recordType);
           return;
         }
         if (!resp.ok) {
@@ -2948,7 +2949,7 @@ export const dashboardJs = `
     try {
       const resp = await apiFetch('/observations/' + encodeURIComponent(recordId));
       if (resp.status === 404) {
-        showObservationNotFoundModal(recordId, grain);
+        showObservationNotFoundModal(recordId, recordType);
         return;
       }
       if (!resp.ok) {
@@ -3268,17 +3269,17 @@ export const dashboardJs = `
           className: 'code-pill citation-badge',
           role: 'button',
           tabindex: '0',
-          'aria-label': 'Inspect cited ' + s.grain + ' ' + s.record_id,
-          title: prefixLabel + s.grain + ' -> ' + s.record_id + ' (Click to inspect observation)',
+          'aria-label': 'Inspect cited ' + (s.record_type || s.grain) + ' ' + s.record_id,
+          title: prefixLabel + (s.record_type || s.grain) + ' -> ' + s.record_id + ' (Click to inspect observation)',
           onClick: (e) => {
             e.stopPropagation();
-            inspectCitation(s.record_id, s.grain);
+            inspectCitation(s.record_id, s.record_type || s.grain);
           },
           onKeydown: (e) => {
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
               e.stopPropagation();
-              inspectCitation(s.record_id, s.grain);
+              inspectCitation(s.record_id, s.record_type || s.grain);
             }
           }
         }, icon, el('span', { textContent: s.record_id }));

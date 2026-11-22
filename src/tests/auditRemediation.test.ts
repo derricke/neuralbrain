@@ -373,7 +373,7 @@ describe('Audit Remediation Comprehensive Regression Tests', () => {
       const postDeadLetters = db.prepare("SELECT COUNT(*) as c FROM dead_letters WHERE source = 'consolidate' AND (payload LIKE '%sess-fx%' OR payload LIKE '%fixture-test%')").get() as { c: number };
       expect(postDeadLetters.c).toBe(0);
 
-      const postQueue = db.prepare("SELECT COUNT(*) as c FROM embed_queue WHERE grain = 'summary'").get() as { c: number };
+      const postQueue = db.prepare("SELECT COUNT(*) as c FROM embed_queue WHERE record_type = 'summary'").get() as { c: number };
       expect(postQueue.c).toBe(0);
     });
   });
@@ -495,7 +495,7 @@ describe('Audit Remediation Comprehensive Regression Tests', () => {
       });
 
       // Clear queue
-      db.prepare("DELETE FROM embed_queue WHERE grain = 'note' AND record_id = ?").run(note.id);
+      db.prepare("DELETE FROM embed_queue WHERE record_type = 'note' AND record_id = ?").run(note.id);
 
       // Update scope to project
       const updated = updateNoteScope(note.id, 'project', 'backend-core');
@@ -503,10 +503,10 @@ describe('Audit Remediation Comprehensive Regression Tests', () => {
       expect(updated.project_id).toBe('backend-core');
 
       // Verify that updateNoteScope enqueued the note into embed_queue
-      const queueItem = db.prepare("SELECT * FROM embed_queue WHERE grain = 'note' AND record_id = ?").get(note.id) as { record_id: string; grain: string } | undefined;
+      const queueItem = db.prepare("SELECT * FROM embed_queue WHERE record_type = 'note' AND record_id = ?").get(note.id) as { record_id: string; record_type: string } | undefined;
       expect(queueItem).toBeDefined();
       expect(queueItem?.record_id).toBe(note.id);
-      expect(queueItem?.grain).toBe('note');
+      expect(queueItem?.record_type).toBe('note');
     });
   });
 
@@ -518,7 +518,7 @@ describe('Audit Remediation Comprehensive Regression Tests', () => {
       const singleGrain = buildQdrantFilter({ q: 'test' }, ['note'], true);
       expect(singleGrain).toEqual({
         must: [
-          { key: 'grain', match: { value: 'note' } },
+          { key: 'record_type', match: { value: 'note' } },
           { key: 'scope', match: { value: 'global' } },
         ],
       });
@@ -526,7 +526,7 @@ describe('Audit Remediation Comprehensive Regression Tests', () => {
       const multiGrain = buildQdrantFilter({ q: 'test' }, ['note', 'trajectory'], true);
       expect(multiGrain).toEqual({
         must: [
-          { key: 'grain', match: { any: ['note', 'trajectory'] } },
+          { key: 'record_type', match: { any: ['note', 'trajectory'] } },
           { key: 'scope', match: { value: 'global' } },
         ],
       });
@@ -540,7 +540,7 @@ describe('Audit Remediation Comprehensive Regression Tests', () => {
       );
 
       expect(filter).toBeDefined();
-      expect(filter?.must).toContainEqual({ key: 'grain', match: { value: 'note' } });
+      expect(filter?.must).toContainEqual({ key: 'record_type', match: { value: 'note' } });
       expect(filter?.must).toContainEqual({
         should: [
           {

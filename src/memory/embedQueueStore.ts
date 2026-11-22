@@ -2,13 +2,14 @@ import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
 import { Database, Statement, transaction } from '../lib/sqlite';
 
-export type EmbedGrain = 'observation' | 'trajectory' | 'note' | 'summary';
+export type EmbedRecordType = 'observation' | 'trajectory' | 'note' | 'summary';
+export type EmbedGrain = EmbedRecordType;
 export type EmbedStatus = 'pending' | 'running' | 'done' | 'failed';
 export const MAX_EMBED_ATTEMPTS = 3;
 
 export interface EmbedQueueItem {
   record_id: string;
-  grain: EmbedGrain;
+  record_type: EmbedRecordType;
   status: EmbedStatus;
   attempts: number;
   last_error: string | null;
@@ -22,9 +23,9 @@ function getEnqueueStatement(db: Database): Statement {
   let stmt = insertStmtCache.get(db);
   if (!stmt) {
     stmt = db.prepare(`
-      INSERT INTO embed_queue (record_id, grain, status, attempts, last_error, target, queued_at)
+      INSERT INTO embed_queue (record_id, record_type, status, attempts, last_error, target, queued_at)
       VALUES (?, ?, 'pending', 0, NULL, ?, unixepoch())
-      ON CONFLICT(record_id, grain, target) DO UPDATE SET
+      ON CONFLICT(record_id, record_type, target) DO UPDATE SET
         status = 'pending',
         attempts = 0,
         last_error = NULL,
@@ -37,15 +38,15 @@ function getEnqueueStatement(db: Database): Statement {
 
 export function enqueueForEmbedding(
   recordId: string,
-  grain: EmbedGrain,
+  recordType: EmbedRecordType,
   target = 'live'
 ): void {
   const db = getDb();
   try {
-    getEnqueueStatement(db).run(recordId, grain, target);
+    getEnqueueStatement(db).run(recordId, recordType, target);
   } catch (error) {
     logger.error(
-      { recordId, grain, target, error: error instanceof Error ? error.message : String(error) },
+      { recordId, record_type: recordType, target, error: error instanceof Error ? error.message : String(error) },
       'failed to enqueue record for embedding'
     );
     throw error;
@@ -54,7 +55,7 @@ export function enqueueForEmbedding(
 
 export function batchEnqueueForEmbedding(
   ids: string[],
-  grain: EmbedGrain,
+  recordType: EmbedRecordType,
   targetCollection = 'live'
 ): void {
   if (!ids || ids.length === 0) return;
@@ -62,7 +63,7 @@ export function batchEnqueueForEmbedding(
   const stmt = getEnqueueStatement(db);
   const tx = transaction(db, () => {
     for (const id of ids) {
-      stmt.run(id, grain, targetCollection);
+      stmt.run(id, recordType, targetCollection);
     }
   });
   try {
@@ -71,7 +72,7 @@ export function batchEnqueueForEmbedding(
     logger.error(
       {
         count: ids.length,
-        grain,
+        record_type: recordType,
         target: targetCollection,
         error: error instanceof Error ? error.message : String(error),
       },
@@ -94,7 +95,7 @@ export function claimEmbedQueue(target = 'live', limit = 32): EmbedQueueItem[] {
   const tx = transaction(db, () => {
     const rows = db
       .prepare(`
-        SELECT record_id, grain, status, attempts, last_error, target, queued_at
+        SELECT record_id, record_type, status, attempts, last_error, target, queued_at
         FROM embed_queue
         WHERE target = ? AND status = 'pending'
         ORDER BY queued_at ASC
@@ -109,11 +110,11 @@ export function claimEmbedQueue(target = 'live', limit = 32): EmbedQueueItem[] {
     const updateStmt = db.prepare(`
       UPDATE embed_queue
       SET status = 'running', attempts = attempts + 1, queued_at = unixepoch()
-      WHERE record_id = ? AND grain = ? AND target = ?
+      WHERE record_id = ? AND record_type = ? AND target = ?
     `);
 
     for (const row of rows) {
-      updateStmt.run(row.record_id, row.grain, row.target);
+      updateStmt.run(row.record_id, row.record_type, row.target);
       row.status = 'running';
       row.attempts += 1;
     }
@@ -124,13 +125,13 @@ export function claimEmbedQueue(target = 'live', limit = 32): EmbedQueueItem[] {
   return tx();
 }
 
-export function markEmbedDone(recordId: string, grain: EmbedGrain, target = 'live'): void {
+export function markEmbedDone(recordId: string, recordType: EmbedRecordType, target = 'live'): void {
   const db = getDb();
   db.prepare(`
     UPDATE embed_queue
     SET status = 'done', last_error = NULL
-    WHERE record_id = ? AND grain = ? AND target = ?
-  `).run(recordId, grain, target);
+    WHERE record_id = ? AND record_type = ? AND target = ?
+  `).run(recordId, recordType, target);
 }
 
 /**
@@ -139,11 +140,11 @@ export function markEmbedDone(recordId: string, grain: EmbedGrain, target = 'liv
  * Only for a record the service has deleted: leaving the entry behind means
  * the worker keeps claiming a row that no longer exists.
  */
-export function dequeueRecord(recordId: string, grain: EmbedGrain): number {
+export function dequeueRecord(recordId: string, recordType: EmbedRecordType): number {
   const db = getDb();
   const result = db
-    .prepare('DELETE FROM embed_queue WHERE record_id = ? AND grain = ?')
-    .run(recordId, grain);
+    .prepare('DELETE FROM embed_queue WHERE record_id = ? AND record_type = ?')
+    .run(recordId, recordType);
   return result.changes;
 }
 
@@ -153,13 +154,13 @@ export function dequeueRecord(recordId: string, grain: EmbedGrain): number {
  * installed or not configured): that is a dependency outage, not a bad record,
  * so the record waits for the embedder instead of being marked failed (rule 3).
  */
-export function releaseEmbedClaim(recordId: string, grain: EmbedGrain, target = 'live', reason?: string): void {
+export function releaseEmbedClaim(recordId: string, recordType: EmbedRecordType, target = 'live', reason?: string): void {
   const db = getDb();
   db.prepare(`
     UPDATE embed_queue
     SET status = 'pending', last_error = ?
-    WHERE record_id = ? AND grain = ? AND target = ? AND status = 'running'
-  `).run(reason ?? null, recordId, grain, target);
+    WHERE record_id = ? AND record_type = ? AND target = ? AND status = 'running'
+  `).run(reason ?? null, recordId, recordType, target);
 }
 
 /**
@@ -191,7 +192,7 @@ export function clearEmbedQueueTarget(target: string): number {
 
 export function markEmbedFailed(
   recordId: string,
-  grain: EmbedGrain,
+  recordType: EmbedRecordType,
   target = 'live',
   error?: string
 ): void {
@@ -200,6 +201,6 @@ export function markEmbedFailed(
     UPDATE embed_queue
     SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
         last_error = ?
-    WHERE record_id = ? AND grain = ? AND target = ?
-  `).run(MAX_EMBED_ATTEMPTS, error ?? 'Unknown embedding error', recordId, grain, target);
+    WHERE record_id = ? AND record_type = ? AND target = ?
+  `).run(MAX_EMBED_ATTEMPTS, error ?? 'Unknown embedding error', recordId, recordType, target);
 }

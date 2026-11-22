@@ -91,6 +91,9 @@ export function createDirectBrainMcpHandlers(
             ? requestedTypes
             : ['note', 'trajectory']) as any,
           include_global: args.include_global !== false,
+          include_sources: Boolean(args.include_sources),
+          ...(args.sources_limit !== undefined ? { sources_limit: clampLimit(args.sources_limit, 20, 100) } : {}),
+          ...(args.sources_offset !== undefined ? { sources_offset: Math.max(0, Math.trunc(args.sources_offset)) } : {}),
           limit: clampLimit(args.limit, 10, 100),
           ...(targetProjectId ? { project_id: targetProjectId, scope: 'project' as const } : {}),
           ...(Object.keys(filters).length > 0 ? { filters } : {}),

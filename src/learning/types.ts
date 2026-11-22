@@ -49,20 +49,36 @@ export interface SearchRequest {
     note_ref?: string;
     task_ref?: string;
   };
+  /** Include summary_sources provenance entries on summary results (default false). */
+  include_sources?: boolean;
+  /** Maximum number of source entries to return per summary when include_sources is true (default 20). */
+  sources_limit?: number;
+  /** Offset into summary sources for pagination when include_sources is true (default 0). */
+  sources_offset?: number;
   limit?: number;
+}
+
+export interface SearchSummarySource {
+  summary_id?: string;
+  claim_id?: string | null;
+  record_id: string;
+  record_type: string;
+  title?: string;
+  kind?: string;
+  tool_name?: string | null;
+  file_path?: string | null;
+  failed?: boolean;
+  preview?: string | null;
 }
 
 export interface SearchResultItem {
   id: string;
-  grain: 'note' | 'trajectory' | 'observation' | 'summary';
+  record_type: 'note' | 'trajectory' | 'observation' | 'summary';
   score: number;
   record: Record<string, any>;
-  sources?: Array<{
-    summary_id?: string;
-    claim_id?: string | null;
-    record_id: string;
-    grain: string;
-  }>;
+  sources?: SearchSummarySource[];
+  sources_total?: number;
+  sources_has_more?: boolean;
   claims?: Array<{
     id: string;
     summary_id?: string;

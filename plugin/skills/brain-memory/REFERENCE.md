@@ -6,7 +6,7 @@
 2. **SQLite is source of truth; Qdrant is an index**: Hybrid retrieval fuses Qdrant dense vectors and in-process BM25 via Reciprocal Rank Fusion (`1 / (60 + rank)`).
 3. **Never reject writes for capacity**: No per-session caps; capture endpoints are rate-limit exempt.
 4. **Explicit scope, never inferred**: Every `brain_save` and `brain_action_add` requires `scope`: `'project'` (with `project_id`), `'global'` (universal truth), or `'unknown'`.
-5. **Three grains**: `observations` (raw tool calls/prompts), `trajectories` (session outcome rollups), `notes` (curated knowledge, never auto-deleted, edited via `supersedes`).
+5. **Three core record types**: `observations` (raw tool calls/prompts), `trajectories` (session outcome rollups), `notes` (curated knowledge, never auto-deleted, edited via `supersedes`).
 6. **Derived records are additive and disposable**: Summaries cite source `observations` and never mutate them.
 
 ## Canonical `project_id` Resolution
@@ -23,7 +23,7 @@
 
 | Tool | Purpose | Parameters |
 |---|---|---|
-| `brain_search` | Hybrid dense + BM25 search across grains | `q` (req), `record_types` (default `['note', 'trajectory']`; options `'note'`, `'trajectory'`, `'summary'`, `'observation'`), `project_id`, `include_global` (default `true`), `type` (`fact`, `architecture`, `pattern`, `workflow`, `bug`, `preference`, `lesson`), `file_path`, `limit` (default `10`) |
+| `brain_search` | Hybrid dense + BM25 search across record types | `q` (req), `record_types` (default `['note', 'trajectory']`; options `'note'`, `'trajectory'`, `'summary'`, `'observation'`), `project_id`, `include_global` (default `true`), `type` (`fact`, `architecture`, `pattern`, `workflow`, `bug`, `preference`, `lesson`), `file_path`, `include_sources` (default `false`), `sources_limit` (default `20`), `sources_offset` (default `0`), `limit` (default `10`) |
 | `brain_recent_failures` | SQL-counted recent failure patterns | `project_id`, `task_type`, `limit` (default `5`) |
 | `brain_graph` | Relational graph across notes, lessons, concepts, files, sessions, actions, summaries | `project_id`, `scope` (`'project' \| 'global' \| 'unknown'`), `limit` |
 

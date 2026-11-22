@@ -423,7 +423,7 @@ export function runAiConformanceDiagnostics(): AiDiagnosticsReport {
       const db = getDb();
       if (allSummaryIds.length > 0) {
         const placeholders = allSummaryIds.map(() => '?').join(',');
-        db.prepare(`DELETE FROM embed_queue WHERE grain = 'summary' AND record_id IN (${placeholders})`).run(...allSummaryIds);
+        db.prepare(`DELETE FROM embed_queue WHERE record_type = 'summary' AND record_id IN (${placeholders})`).run(...allSummaryIds);
         db.prepare(`DELETE FROM summary_claims WHERE summary_id IN (${placeholders})`).run(...allSummaryIds);
         db.prepare(`DELETE FROM summary_sources WHERE summary_id IN (${placeholders})`).run(...allSummaryIds);
         db.prepare(`DELETE FROM summaries WHERE id IN (${placeholders})`).run(...allSummaryIds);

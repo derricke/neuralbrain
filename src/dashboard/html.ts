@@ -401,12 +401,12 @@ export function getDashboardHtml(): string {
               </div>
             </div>
 
-            <div class="grains-selection-bar">
+            <div class="record-types-selection-bar">
               <span class="text-muted form-label-inline">RECORD TYPES:</span>
-              <label class="checkbox-label"><input type="checkbox" id="grainCheckNote" checked> note</label>
-              <label class="checkbox-label"><input type="checkbox" id="grainCheckTrajectory" checked> trajectory</label>
-              <label class="checkbox-label"><input type="checkbox" id="grainCheckObservation" checked> observation</label>
-              <label class="checkbox-label"><input type="checkbox" id="grainCheckSummary" checked> summary</label>
+              <label class="checkbox-label"><input type="checkbox" id="recordTypeCheckNote" checked> note</label>
+              <label class="checkbox-label"><input type="checkbox" id="recordTypeCheckTrajectory" checked> trajectory</label>
+              <label class="checkbox-label"><input type="checkbox" id="recordTypeCheckObservation" checked> observation</label>
+              <label class="checkbox-label"><input type="checkbox" id="recordTypeCheckSummary" checked> summary</label>
             </div>
           </form>
 

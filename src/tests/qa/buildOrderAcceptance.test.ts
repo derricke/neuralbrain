@@ -550,7 +550,7 @@ describe('Build Order Acceptance & Standing Invariants Suite (Steps 1–10 & Inv
       const searchRes = await hybridSearch({
         q: 'unhandled transaction rollback exception',
         project_id: 'rrf-proj',
-        grains: ['note'],
+        record_types: ['note'],
       });
 
       expect(searchRes.mode).toBe('hybrid');
@@ -593,7 +593,7 @@ describe('Build Order Acceptance & Standing Invariants Suite (Steps 1–10 & Inv
       const bugRes = await hybridSearch({
         q: 'Filter Note',
         project_id: 'filter-proj',
-        grains: ['note'],
+        record_types: ['note'],
         filters: { type: ['bug'] },
       });
       expect(bugRes.results.every((r) => r.record.type === 'bug')).toBe(true);
@@ -602,7 +602,7 @@ describe('Build Order Acceptance & Standing Invariants Suite (Steps 1–10 & Inv
       const fileRes = await hybridSearch({
         q: 'Filter Note',
         project_id: 'filter-proj',
-        grains: ['note'],
+        record_types: ['note'],
         filters: { file_path: 'src/core/router.ts' },
       });
       expect(fileRes.results.length).toBe(2);
@@ -612,7 +612,7 @@ describe('Build Order Acceptance & Standing Invariants Suite (Steps 1–10 & Inv
         q: 'Global Fact',
         project_id: 'filter-proj',
         include_global: false,
-        grains: ['note'],
+        record_types: ['note'],
       });
       expect(noGlobalRes.results.length).toBe(0);
 
@@ -620,9 +620,9 @@ describe('Build Order Acceptance & Standing Invariants Suite (Steps 1–10 & Inv
       const notesOnly = await hybridSearch({
         q: 'Note',
         project_id: 'filter-proj',
-        grains: ['note'],
+        record_types: ['note'],
       });
-      expect(notesOnly.results.every((r) => r.grain === 'note')).toBe(true);
+      expect(notesOnly.results.every((r) => r.record_type === 'note')).toBe(true);
     });
 
     it('GET /files/:path/notes returns notes associated with target file path', async () => {
@@ -1095,7 +1095,7 @@ describe('Build Order Acceptance & Standing Invariants Suite (Steps 1–10 & Inv
       `).run(sumId);
 
       db.prepare(`
-        INSERT INTO summary_sources (summary_id, record_id, grain)
+        INSERT INTO summary_sources (summary_id, record_id, record_type)
         VALUES (?, ?, 'observation')
       `).run(sumId, obs2Id);
 

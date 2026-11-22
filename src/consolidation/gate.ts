@@ -393,7 +393,7 @@ export function verifyAndStoreSummary(
       `);
 
       const sourceStmt = db.prepare(`
-        INSERT INTO summary_sources (summary_id, claim_id, record_id, grain)
+        INSERT INTO summary_sources (summary_id, claim_id, record_id, record_type)
         VALUES (?, ?, ?, 'observation')
       `);
 

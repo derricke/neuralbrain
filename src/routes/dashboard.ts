@@ -378,7 +378,7 @@ dashboardRouter.get('/api/stats', async (_req: Request, res: Response, next: Nex
         .all(...summaryIds) as any[];
       const allSources = db
         .prepare(
-          `SELECT summary_id, claim_id, record_id, grain FROM summary_sources WHERE summary_id IN (${placeholders})`
+          `SELECT summary_id, claim_id, record_id, record_type FROM summary_sources WHERE summary_id IN (${placeholders})`
         )
         .all(...summaryIds) as any[];
 

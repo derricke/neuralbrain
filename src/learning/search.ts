@@ -3,12 +3,13 @@ import { logger } from '../lib/logger';
 import { deserializeEmbedding, embedQuery, resolveEmbedderRecipe } from './embedding';
 import { verifyOrCreateStoreMeta } from './storeMeta';
 import { getQdrantClient } from './embedWorker';
-import type { SearchRequest, SearchResponse, SearchResultItem } from './types';
+import type { SearchRequest, SearchResponse, SearchResultItem, SearchSummarySource } from './types';
 
 const MAX_OBS_RECORD_CHARS = 2000;
+const MAX_SOURCE_PREVIEW_CHARS = 160;
 
-function docKey(grain: string, id: string): string {
-  return `${grain}:${id}`;
+function docKey(recordType: string, id: string): string {
+  return `${recordType}:${id}`;
 }
 
 function truncateObsField(value: string | null): string | null {
@@ -38,12 +39,11 @@ function cosineSimilarity(a: number[], b: number[]): number {
 
 interface CandidateDoc {
   id: string;
-  grain: 'note' | 'trajectory' | 'observation' | 'summary';
+  record_type: 'note' | 'trajectory' | 'observation' | 'summary';
   record: Record<string, any>;
   text: string;
   embedding: Buffer | null;
   claims?: Array<{ id: string; summary_id: string; text: string; ordinal: number }>;
-  sources?: Array<{ summary_id: string; claim_id: string; record_id: string; grain: string }>;
   bm25Score?: number;
   denseScore?: number;
   rrfScore?: number;
@@ -51,16 +51,16 @@ interface CandidateDoc {
 
 export function buildQdrantFilter(
   params: SearchRequest,
-  grains: string[],
+  recordTypes: string[],
   includeGlobal: boolean
 ): Record<string, any> | undefined {
   const must: any[] = [];
 
-  // Grains filter
-  if (grains.length === 1) {
-    must.push({ key: 'grain', match: { value: grains[0] } });
-  } else if (grains.length > 1) {
-    must.push({ key: 'grain', match: { any: grains } });
+  // Record type filter
+  if (recordTypes.length === 1) {
+    must.push({ key: 'record_type', match: { value: recordTypes[0] } });
+  } else if (recordTypes.length > 1) {
+    must.push({ key: 'record_type', match: { any: recordTypes } });
   }
 
   // Scope filter
@@ -130,7 +130,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     params.record_types && params.record_types.length > 0
       ? params.record_types
       : params.grains;
-  const grains =
+  const recordTypes =
     requestedTypes && requestedTypes.length > 0 ? requestedTypes : ['note', 'trajectory'];
   const limit = Math.min(Math.max(params.limit ?? 10, 1), 100);
   const includeGlobal = params.include_global !== false;
@@ -236,7 +236,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
       const { embedding, ...rowWithoutEmbedding } = row;
       const record = { ...rowWithoutEmbedding, concepts, files };
       const text = `${row.title}\n\n${row.content}\n${concepts.join(' ')}\n${files.join(' ')}`;
-      return { id: row.id, grain: 'note', record, text, embedding };
+      return { id: row.id, record_type: 'note', record, text, embedding };
     });
   };
 
@@ -279,7 +279,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     return rows.map((row) => {
       const { embedding, ...rowWithoutEmbedding } = row;
       const text = `${row.description || ''}\n${row.result || ''}\n${row.task_type || ''}`;
-      return { id: row.id, grain: 'trajectory', record: rowWithoutEmbedding, text, embedding };
+      return { id: row.id, record_type: 'trajectory', record: rowWithoutEmbedding, text, embedding };
     });
   };
 
@@ -330,7 +330,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
         input: truncateObsField(row.input),
         output: truncateObsField(row.output),
       };
-      return { id: row.id, grain: 'observation', record, text, embedding: null };
+      return { id: row.id, record_type: 'observation', record, text, embedding: null };
     });
   };
 
@@ -379,40 +379,25 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
       list.push(c);
     }
 
-    const allSources = db
-      .prepare(`SELECT summary_id, claim_id, record_id, grain FROM summary_sources WHERE summary_id IN (${placeholders})`)
-      .all(...summaryIds) as Array<{ summary_id: string; claim_id: string; record_id: string; grain: string }>;
-    const sourcesBySummaryId = new Map<string, Array<{ summary_id: string; claim_id: string; record_id: string; grain: string }>>();
-    for (const s of allSources) {
-      let list = sourcesBySummaryId.get(s.summary_id);
-      if (!list) {
-        list = [];
-        sourcesBySummaryId.set(s.summary_id, list);
-      }
-      list.push(s);
-    }
-
     return rows.map((row) => {
       const claims = claimsBySummaryId.get(row.id) || [];
-      const sources = sourcesBySummaryId.get(row.id) || [];
       const { embedding, ...rowWithoutEmbedding } = row;
       const text = claims.map((c) => c.text).join('\n');
       return {
         id: row.id,
-        grain: 'summary',
+        record_type: 'summary',
         record: rowWithoutEmbedding,
         text,
         embedding,
         claims,
-        sources,
       };
     });
   };
 
-  if (grains.includes('note')) candidates.push(...fetchNotes());
-  if (grains.includes('trajectory')) candidates.push(...fetchTrajectories());
-  if (grains.includes('observation')) candidates.push(...fetchObservations());
-  if (grains.includes('summary')) candidates.push(...fetchSummaries());
+  if (recordTypes.includes('note')) candidates.push(...fetchNotes());
+  if (recordTypes.includes('trajectory')) candidates.push(...fetchTrajectories());
+  if (recordTypes.includes('observation')) candidates.push(...fetchObservations());
+  if (recordTypes.includes('summary')) candidates.push(...fetchSummaries());
 
   // 2. Dense retrieval (run Qdrant first so hits outside the newest 500 SQLite rows can be hydrated)
   const recipe = resolveEmbedderRecipe();
@@ -440,7 +425,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
         if (qdrant) {
           const alias = verification.meta?.qdrant_alias || 'brain';
           try {
-            const filter = buildQdrantFilter(params, grains, includeGlobal);
+            const filter = buildQdrantFilter(params, recordTypes, includeGlobal);
             const searchRes = await qdrant.search(alias, {
               vector: queryVec,
               limit: Math.max(limit * 2, 50),
@@ -448,33 +433,38 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
               ...(filter ? { filter } : {}),
             });
 
-            const existingKeys = new Set(candidates.map((c) => docKey(c.grain, c.id)));
-            const missingByGrain = new Map<string, string[]>();
+            const existingKeys = new Set(candidates.map((c) => docKey(c.record_type, c.id)));
+            const missingByType = new Map<string, string[]>();
 
             for (const pt of searchRes) {
               const ptId =
                 typeof pt.payload?.record_id === 'string' ? pt.payload.record_id : String(pt.id);
-              const ptGrain = typeof pt.payload?.grain === 'string' ? pt.payload.grain : undefined;
-              if (ptGrain) {
-                const key = docKey(ptGrain, ptId);
+              const ptType =
+                typeof pt.payload?.record_type === 'string'
+                  ? pt.payload.record_type
+                  : typeof pt.payload?.grain === 'string'
+                    ? pt.payload.grain
+                    : undefined;
+              if (ptType) {
+                const key = docKey(ptType, ptId);
                 denseScoresMap.set(key, pt.score);
-                if (grains.includes(ptGrain as any) && !existingKeys.has(key)) {
-                  let list = missingByGrain.get(ptGrain);
+                if (recordTypes.includes(ptType as any) && !existingKeys.has(key)) {
+                  let list = missingByType.get(ptType);
                   if (!list) {
                     list = [];
-                    missingByGrain.set(ptGrain, list);
+                    missingByType.set(ptType, list);
                   }
                   list.push(ptId);
                 }
               } else {
-                for (const g of grains) {
+                for (const g of recordTypes) {
                   const key = docKey(g, ptId);
                   denseScoresMap.set(key, pt.score);
                   if (!existingKeys.has(key)) {
-                    let list = missingByGrain.get(g);
+                    let list = missingByType.get(g);
                     if (!list) {
                       list = [];
-                      missingByGrain.set(g, list);
+                      missingByType.set(g, list);
                     }
                     list.push(ptId);
                   }
@@ -483,14 +473,14 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
             }
 
             // Hydrate Qdrant hits that fell outside the newest 500 SQLite rows
-            for (const [grain, ids] of missingByGrain.entries()) {
+            for (const [recordType, ids] of missingByType.entries()) {
               let hydrated: CandidateDoc[] = [];
-              if (grain === 'note') hydrated = fetchNotes(ids);
-              else if (grain === 'trajectory') hydrated = fetchTrajectories(ids);
-              else if (grain === 'observation') hydrated = fetchObservations(ids);
-              else if (grain === 'summary') hydrated = fetchSummaries(ids);
+              if (recordType === 'note') hydrated = fetchNotes(ids);
+              else if (recordType === 'trajectory') hydrated = fetchTrajectories(ids);
+              else if (recordType === 'observation') hydrated = fetchObservations(ids);
+              else if (recordType === 'summary') hydrated = fetchSummaries(ids);
               for (const doc of hydrated) {
-                const key = docKey(doc.grain, doc.id);
+                const key = docKey(doc.record_type, doc.id);
                 if (!existingKeys.has(key)) {
                   existingKeys.add(key);
                   candidates.push(doc);
@@ -516,14 +506,14 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     };
   }
 
-  // 3. BM25 scoring over candidates (keyed by grain:id)
+  // 3. BM25 scoring over candidates (keyed by record_type:id)
   const queryTokens = tokenize(q);
   const docTokensMap = new Map<string, string[]>();
   const docLengths: number[] = [];
 
   for (const c of candidates) {
     const tokens = tokenize(c.text);
-    docTokensMap.set(docKey(c.grain, c.id), tokens);
+    docTokensMap.set(docKey(c.record_type, c.id), tokens);
     docLengths.push(tokens.length);
   }
 
@@ -537,7 +527,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
   for (const token of queryTokens) {
     let df = 0;
     for (const c of candidates) {
-      const tokens = docTokensMap.get(docKey(c.grain, c.id))!;
+      const tokens = docTokensMap.get(docKey(c.record_type, c.id))!;
       if (tokens.includes(token)) df++;
     }
     const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5));
@@ -545,7 +535,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
   }
 
   for (const c of candidates) {
-    const tokens = docTokensMap.get(docKey(c.grain, c.id))!;
+    const tokens = docTokensMap.get(docKey(c.record_type, c.id))!;
     const tfMap = new Map<string, number>();
     for (const t of tokens) {
       tfMap.set(t, (tfMap.get(t) || 0) + 1);
@@ -566,7 +556,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
   // Dense scoring fallback from SQLite embedding blobs for candidates not scored by Qdrant
   if (mode === 'hybrid' && queryVec.length > 0) {
     for (const c of candidates) {
-      const key = docKey(c.grain, c.id);
+      const key = docKey(c.record_type, c.id);
       if (!denseScoresMap.has(key) && c.embedding) {
         const vec = deserializeEmbedding(c.embedding);
         if (vec.length === queryVec.length) {
@@ -584,7 +574,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     .sort((a, b) => (b.bm25Score ?? 0) - (a.bm25Score ?? 0));
   const bm25RankMap = new Map<string, number>();
   bm25Sorted.forEach((c, idx) => {
-    bm25RankMap.set(docKey(c.grain, c.id), idx + 1);
+    bm25RankMap.set(docKey(c.record_type, c.id), idx + 1);
   });
 
   // Rank Dense
@@ -592,22 +582,22 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
   if (mode === 'hybrid') {
     const denseSorted = candidates
       .filter((c) => {
-        const key = docKey(c.grain, c.id);
+        const key = docKey(c.record_type, c.id);
         return denseScoresMap.has(key) && (denseScoresMap.get(key) ?? 0) > 0;
       })
       .sort(
         (a, b) =>
-          (denseScoresMap.get(docKey(b.grain, b.id)) ?? 0) -
-          (denseScoresMap.get(docKey(a.grain, a.id)) ?? 0)
+          (denseScoresMap.get(docKey(b.record_type, b.id)) ?? 0) -
+          (denseScoresMap.get(docKey(a.record_type, a.id)) ?? 0)
       );
     denseSorted.forEach((c, idx) => {
-      denseRankMap.set(docKey(c.grain, c.id), idx + 1);
+      denseRankMap.set(docKey(c.record_type, c.id), idx + 1);
     });
   }
 
   const k_rrf = 60;
   for (const c of candidates) {
-    const key = docKey(c.grain, c.id);
+    const key = docKey(c.record_type, c.id);
     if (mode === 'hybrid') {
       const rankDense = denseRankMap.get(key);
       const rankBm25 = bm25RankMap.get(key);
@@ -634,20 +624,196 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
   const results: SearchResultItem[] = sliced.map((c) => {
     const item: SearchResultItem = {
       id: c.id,
-      grain: c.grain,
+      record_type: c.record_type,
       score: c.rrfScore ?? 0,
       record: c.record,
     };
-    if (c.grain === 'summary') {
+    if (c.record_type === 'summary') {
       item.claims = c.claims;
-      item.sources = c.sources;
     }
     return item;
   });
+
+  if (params.include_sources === true) {
+    const rawLimit = params.sources_limit;
+    const sourcesLimit =
+      typeof rawLimit === 'number' && Number.isFinite(rawLimit)
+        ? Math.max(1, Math.min(Math.trunc(rawLimit), 100))
+        : 20;
+    const rawOffset = params.sources_offset;
+    const sourcesOffset =
+      typeof rawOffset === 'number' && Number.isFinite(rawOffset)
+        ? Math.max(0, Math.trunc(rawOffset))
+        : 0;
+    attachPaginatedSummarySources(db, results, sourcesLimit, sourcesOffset);
+  }
 
   return {
     results,
     mode,
     degraded: degradedMessage,
   };
+}
+
+function truncateSourcePreview(value: string | null | undefined, maxChars = MAX_SOURCE_PREVIEW_CHARS): string | null {
+  if (!value) return null;
+  const compact = value.replace(/\s+/g, ' ').trim();
+  if (!compact) return null;
+  return compact.length <= maxChars ? compact : `${compact.slice(0, maxChars)}...`;
+}
+
+function attachPaginatedSummarySources(
+  db: ReturnType<typeof getDb>,
+  results: SearchResultItem[],
+  sourcesLimit: number,
+  sourcesOffset: number
+): void {
+  const summaryItems = results.filter((r) => r.record_type === 'summary');
+  if (summaryItems.length === 0) return;
+
+  const summaryIds = summaryItems.map((r) => r.id);
+  const placeholders = summaryIds.map(() => '?').join(',');
+  const allSources = db
+    .prepare(
+      `SELECT summary_id, claim_id, record_id, record_type FROM summary_sources WHERE summary_id IN (${placeholders}) ORDER BY rowid ASC`
+    )
+    .all(...summaryIds) as Array<{ summary_id: string; claim_id: string | null; record_id: string; record_type: string }>;
+
+  const sourcesBySummaryId = new Map<string, typeof allSources>();
+  for (const s of allSources) {
+    let list = sourcesBySummaryId.get(s.summary_id);
+    if (!list) {
+      list = [];
+      sourcesBySummaryId.set(s.summary_id, list);
+    }
+    list.push(s);
+  }
+
+  const pagedBySummaryId = new Map<string, { page: typeof allSources; total: number }>();
+  const idsByType = new Map<string, Set<string>>();
+
+  for (const item of summaryItems) {
+    const all = sourcesBySummaryId.get(item.id) || [];
+    const page = all.slice(sourcesOffset, sourcesOffset + sourcesLimit);
+    pagedBySummaryId.set(item.id, { page, total: all.length });
+    for (const s of page) {
+      let set = idsByType.get(s.record_type);
+      if (!set) {
+        set = new Set<string>();
+        idsByType.set(s.record_type, set);
+      }
+      set.add(s.record_id);
+    }
+  }
+
+  const metaByKey = new Map<string, Partial<SearchSummarySource>>();
+
+  const obsIds = Array.from(idsByType.get('observation') ?? []);
+  if (obsIds.length > 0) {
+    const obsPlaceholders = obsIds.map(() => '?').join(',');
+    const obsRows = db
+      .prepare(
+        `SELECT id, kind, tool_name, file_path, input, output, failed FROM observations WHERE id IN (${obsPlaceholders})`
+      )
+      .all(...obsIds) as Array<{
+      id: string;
+      kind: string;
+      tool_name: string | null;
+      file_path: string | null;
+      input: string | null;
+      output: string | null;
+      failed: number;
+    }>;
+
+    const foundObsIds = new Set<string>();
+    const mapObsRow = (row: (typeof obsRows)[number]) => {
+      const title =
+        row.kind === 'prompt'
+          ? 'prompt'
+          : row.tool_name
+            ? row.file_path
+              ? `${row.tool_name}: ${row.file_path}`
+              : row.tool_name
+            : row.kind || 'observation';
+      metaByKey.set(docKey('observation', row.id), {
+        title,
+        kind: row.kind,
+        tool_name: row.tool_name,
+        file_path: row.file_path,
+        failed: Boolean(row.failed),
+        preview: truncateSourcePreview(row.input) ?? truncateSourcePreview(row.output),
+      });
+    };
+
+    for (const row of obsRows) {
+      foundObsIds.add(row.id);
+      mapObsRow(row);
+    }
+
+    const missingObsIds = obsIds.filter((id) => !foundObsIds.has(id));
+    if (missingObsIds.length > 0) {
+      const arcPlaceholders = missingObsIds.map(() => '?').join(',');
+      const arcRows = db
+        .prepare(
+          `SELECT original_observation_id as id, kind, tool_name, file_path, input, output, failed FROM observations_archive WHERE original_observation_id IN (${arcPlaceholders})`
+        )
+        .all(...missingObsIds) as typeof obsRows;
+      for (const row of arcRows) {
+        mapObsRow(row);
+      }
+    }
+  }
+
+  const noteIds = Array.from(idsByType.get('note') ?? []);
+  if (noteIds.length > 0) {
+    const notePlaceholders = noteIds.map(() => '?').join(',');
+    const noteRows = db
+      .prepare(`SELECT id, title, type FROM notes WHERE id IN (${notePlaceholders})`)
+      .all(...noteIds) as Array<{ id: string; title: string; type: string }>;
+    for (const row of noteRows) {
+      metaByKey.set(docKey('note', row.id), { title: row.title, kind: row.type });
+    }
+  }
+
+  const trajIds = Array.from(idsByType.get('trajectory') ?? []);
+  if (trajIds.length > 0) {
+    const trajPlaceholders = trajIds.map(() => '?').join(',');
+    const trajRows = db
+      .prepare(`SELECT id, task_type, description FROM trajectories WHERE id IN (${trajPlaceholders})`)
+      .all(...trajIds) as Array<{ id: string; task_type: string | null; description: string }>;
+    for (const row of trajRows) {
+      metaByKey.set(docKey('trajectory', row.id), {
+        title: truncateSourcePreview(row.description) ?? row.task_type ?? 'trajectory',
+        ...(row.task_type ? { kind: row.task_type } : {}),
+      });
+    }
+  }
+
+  const sumIds = Array.from(idsByType.get('summary') ?? []);
+  if (sumIds.length > 0) {
+    const sumPlaceholders = sumIds.map(() => '?').join(',');
+    const sumRows = db
+      .prepare(
+        `SELECT s.id, s.kind, (SELECT c.text FROM summary_claims c WHERE c.summary_id = s.id ORDER BY c.ordinal ASC LIMIT 1) as first_claim
+         FROM summaries s WHERE s.id IN (${sumPlaceholders})`
+      )
+      .all(...sumIds) as Array<{ id: string; kind: string; first_claim: string | null }>;
+    for (const row of sumRows) {
+      metaByKey.set(docKey('summary', row.id), {
+        title: truncateSourcePreview(row.first_claim) ?? row.kind,
+        kind: row.kind,
+      });
+    }
+  }
+
+  for (const item of summaryItems) {
+    const paged = pagedBySummaryId.get(item.id);
+    if (!paged) continue;
+    item.sources = paged.page.map((s) => ({
+      ...s,
+      ...metaByKey.get(docKey(s.record_type, s.record_id)),
+    }));
+    item.sources_total = paged.total;
+    item.sources_has_more = sourcesOffset + paged.page.length < paged.total;
+  }
 }

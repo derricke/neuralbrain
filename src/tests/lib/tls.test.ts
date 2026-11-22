@@ -222,7 +222,7 @@ describe('local TLS certificate generation and HTTPS server', () => {
       const searchRes = await tlsFetch(`${baseUrl}/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ q: 'test', grains: ['note'] }),
+        body: JSON.stringify({ q: 'test', record_types: ['note'] }),
         signal: AbortSignal.timeout(5000),
       });
       expect(searchRes.ok).toBe(true);

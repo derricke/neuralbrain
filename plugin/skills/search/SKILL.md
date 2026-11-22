@@ -34,7 +34,7 @@ Only report what the tools actually returned. An empty result, timeout, or `"deg
 3. Pass `file_path` when the user asks about a specific file, or `type` (`["lesson", "bug"]`, etc.) when filtering note types.
 4. Check for `"degraded"` in the response. If present, state clearly that vector search was unavailable and results came from BM25 lexical ranking.
 5. For error investigations or relationship tracing, pair with `brain_recent_failures` or `brain_graph`.
-6. Present matching records with their grain/type, title, scope, and cited `sources`. If nothing matched, suggest 2–3 alternative search terms and stop.
+6. Present matching records with their `record_type`, title, scope, and cited `sources` (pass `include_sources: true` with `sources_limit`/`sources_offset` if you need source provenance). If nothing matched, suggest 2–3 alternative search terms and stop.
 
 ## Anti-patterns
 

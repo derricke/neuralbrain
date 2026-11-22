@@ -339,9 +339,9 @@ export function getKnowledgeGraph(options: KnowledgeGraphOptions = {}): Knowledg
     const placeholders = summaryIds.map(() => '?').join(',');
     const sourceRows = db
       .prepare(
-        `SELECT DISTINCT summary_id, record_id, grain FROM summary_sources WHERE summary_id IN (${placeholders}) LIMIT ?`
+        `SELECT DISTINCT summary_id, record_id, record_type FROM summary_sources WHERE summary_id IN (${placeholders}) LIMIT ?`
       )
-      .all(...summaryIds, maxNodes) as Array<{ summary_id: string; record_id: string; grain: string }>;
+      .all(...summaryIds, maxNodes) as Array<{ summary_id: string; record_id: string; record_type: string }>;
 
     // Load cited observation nodes within the remaining node budget so cites_source edges resolve cleanly
     const remainingBudget = maxNodes - nodeMap.size;
@@ -349,7 +349,7 @@ export function getKnowledgeGraph(options: KnowledgeGraphOptions = {}): Knowledg
       const citedObsIds = Array.from(
         new Set(
           sourceRows
-            .filter((r) => r.grain === 'observation' && !nodeMap.has(r.record_id))
+            .filter((r) => r.record_type === 'observation' && !nodeMap.has(r.record_id))
             .map((r) => r.record_id)
         )
       ).slice(0, remainingBudget);

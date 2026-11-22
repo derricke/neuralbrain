@@ -52,7 +52,7 @@ export class LearningEngine {
   ): Promise<AgentRecommendation[]> {
     const searchRes = await hybridSearch({
       q: task,
-      grains: ['trajectory'],
+      record_types: ['trajectory'],
       project_id: projectIdOrSwarmId,
       filters: {
         success: onlySuccess ? true : undefined,

@@ -429,7 +429,7 @@ export function createApp(): express.Application {
       .prepare('SELECT id, summary_id, text, ordinal FROM summary_claims WHERE summary_id = ? ORDER BY ordinal ASC')
       .all(summary.id);
     const sources = db
-      .prepare('SELECT summary_id, claim_id, record_id, grain FROM summary_sources WHERE summary_id = ?')
+      .prepare('SELECT summary_id, claim_id, record_id, record_type FROM summary_sources WHERE summary_id = ?')
       .all(summary.id);
 
     res.json({
@@ -485,7 +485,7 @@ export function createApp(): express.Application {
 
     const allSources = db
       .prepare(
-        `SELECT summary_id, claim_id, record_id, grain FROM summary_sources WHERE summary_id IN (${placeholders})`
+        `SELECT summary_id, claim_id, record_id, record_type FROM summary_sources WHERE summary_id IN (${placeholders})`
       )
       .all(...summaryIds) as any[];
 

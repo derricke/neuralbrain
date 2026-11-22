@@ -275,7 +275,7 @@ describe('trajectoryStore', () => {
     `).run(summaryId, obsOldTimestamp);
 
     db.prepare(`
-      INSERT INTO summary_sources (summary_id, claim_id, record_id, grain)
+      INSERT INTO summary_sources (summary_id, claim_id, record_id, record_type)
       VALUES (?, NULL, ?, 'observation')
     `).run(summaryId, obsId1);
 
@@ -398,7 +398,7 @@ describe('trajectoryStore', () => {
     `).run(randomUUID(), trajId, oldTs, oldTs);
 
     db.prepare(`
-      INSERT INTO embed_queue (record_id, grain, status, target)
+      INSERT INTO embed_queue (record_id, record_type, status, target)
       VALUES (?, 'observation', 'pending', 'live'), (?, 'trajectory', 'pending', 'live')
     `).run(obsId, trajId);
 

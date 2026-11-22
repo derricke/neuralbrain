@@ -144,7 +144,7 @@ export async function runLiveSmokeTest(): Promise<SmokeTestReport> {
       },
       body: JSON.stringify({
         q: 'local transformer embedding test',
-        grains: ['note'],
+        record_types: ['note'],
         project_id: 'smoke-test-project',
         limit: 5,
       }),

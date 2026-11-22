@@ -543,7 +543,7 @@ function runMigrations(db: Database): void {
       summary_id  TEXT NOT NULL REFERENCES summaries(id) ON DELETE CASCADE,
       claim_id    TEXT REFERENCES summary_claims(id) ON DELETE CASCADE,
       record_id   TEXT NOT NULL,
-      grain       TEXT NOT NULL CHECK (grain IN ('observation','trajectory','note')),
+      record_type TEXT NOT NULL CHECK (record_type IN ('observation','trajectory','note')),
       PRIMARY KEY (summary_id, claim_id, record_id)
     );
 
@@ -572,14 +572,14 @@ function runMigrations(db: Database): void {
     -- embed_queue
     CREATE TABLE IF NOT EXISTS embed_queue (
       record_id   TEXT NOT NULL,
-      grain       TEXT NOT NULL CHECK (grain IN ('observation','trajectory','note','summary')),
+      record_type TEXT NOT NULL CHECK (record_type IN ('observation','trajectory','note','summary')),
       status      TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending','running','done','failed')),
       attempts    INTEGER NOT NULL DEFAULT 0,
       last_error  TEXT,
       target      TEXT NOT NULL DEFAULT 'live',   -- 'live' or a re-embed collection name
       queued_at   INTEGER NOT NULL DEFAULT (unixepoch()),
-      PRIMARY KEY (record_id, grain, target)
+      PRIMARY KEY (record_id, record_type, target)
     );
 
     CREATE INDEX IF NOT EXISTS idx_eq_claim ON embed_queue(target, status, queued_at);
@@ -624,4 +624,12 @@ function runMigrations(db: Database): void {
   );
   alignNotesSchema(db);
   alignFailurePatternsSchema(db);
+  for (const table of ['summary_sources', 'embed_queue'] as const) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    const hasGrain = cols.some((c) => c.name === 'grain');
+    const hasRecordType = cols.some((c) => c.name === 'record_type');
+    if (hasGrain && !hasRecordType) {
+      db.exec(`ALTER TABLE ${table} RENAME COLUMN grain TO record_type`);
+    }
+  }
 }
