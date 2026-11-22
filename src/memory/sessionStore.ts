@@ -1,13 +1,19 @@
 import { randomUUID } from 'crypto';
 import { getDb } from '../lib/db';
 import { redactSecrets } from '../lib/redactSecrets';
-import { resolveScope, ScopeValue } from '../lib/scope';
+import {
+  buildHierarchicalScopeSql,
+  classifyMatchTier,
+  getProjectAncestors,
+  MatchTier,
+  normalizeProjectId,
+  resolveScope,
+  ScopeValue,
+} from '../lib/scope';
 import type { ObservationRecord } from './observationStore';
-import type { NoteRecord } from './noteStore';
-import type { ActionRecord } from './actionStore';
+import { NOTE_COLUMNS, type NoteRecord } from './noteStore';
+import { ACTION_COLUMNS, type ActionRecord } from './actionStore';
 
-const NOTE_COLUMNS =
-  'id, scope, project_id, session_id, type, title, content, author, author_kind, version, supersedes, is_latest, created_at, updated_at';
 const DEFAULT_DETAIL_LIMIT = 200;
 const MAX_DETAIL_LIMIT = 500;
 const MAX_PREVIEW_CHARS = 2000;
@@ -26,6 +32,8 @@ export interface SessionRecord {
   id: string;
   scope: ScopeValue;
   project_id: string | null;
+  user_id?: string | null;
+  agent_id?: string | null;
   agent_name: string | null;
   cwd: string | null;
   status: SessionStatus;
@@ -34,6 +42,7 @@ export interface SessionRecord {
   summary: string | null;
   files_touched_json: string | null;
   handoff_summary_id: string | null;
+  match_tier?: MatchTier;
 }
 
 export interface StartSessionInput {
@@ -41,6 +50,10 @@ export interface StartSessionInput {
   scope?: ScopeValue;
   project_id?: string | null;
   projectId?: string | null;
+  user_id?: string | null;
+  userId?: string | null;
+  agent_id?: string | null;
+  agentId?: string | null;
   agent_name?: string | null;
   agentName?: string | null;
   cwd?: string | null;
@@ -108,6 +121,10 @@ export function startSession(input: StartSessionInput = {}): SessionRecord {
   const db = getDb();
   const customId = optionalString(input.id, 'id');
   const id = customId || `sess_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+  const rawUser = input.userId !== undefined ? input.userId : input.user_id;
+  const userId = optionalString(rawUser, 'user_id');
+  const rawAgentId = input.agentId !== undefined ? input.agentId : input.agent_id;
+  const agentId = optionalString(rawAgentId, 'agent_id');
   const rawAgent = input.agentName !== undefined ? input.agentName : input.agent_name;
   const agentName = optionalString(rawAgent, 'agent_name');
   const cwd = optionalString(input.cwd, 'cwd');
@@ -139,21 +156,23 @@ export function startSession(input: StartSessionInput = {}): SessionRecord {
           ended_at = NULL,
           scope = ?,
           project_id = ?,
+          user_id = COALESCE(?, user_id),
+          agent_id = COALESCE(?, agent_id),
           agent_name = COALESCE(?, agent_name),
           cwd = COALESCE(?, cwd)
       WHERE id = ?
       `
-    ).run(nextScope, nextProjectId, agentName, cwd, id);
+    ).run(nextScope, nextProjectId, userId, agentId, agentName, cwd, id);
 
     return getSession(id)!;
   }
 
   db.prepare(
     `
-    INSERT INTO sessions (id, scope, project_id, agent_name, cwd, status)
-    VALUES (?, ?, ?, ?, ?, 'active')
+    INSERT INTO sessions (id, scope, project_id, user_id, agent_id, agent_name, cwd, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
     `
-  ).run(id, scoped.scope, scoped.projectId, agentName, cwd);
+  ).run(id, scoped.scope, scoped.projectId, userId, agentId, agentName, cwd);
 
   return getSession(id)!;
 }
@@ -273,6 +292,10 @@ export function getSession(id: string): SessionRecord | undefined {
 
 export function listSessions(filters?: {
   projectId?: string;
+  includeAncestors?: boolean;
+  includeChildren?: boolean;
+  includeGlobal?: boolean;
+  userId?: string;
   status?: string;
   agentName?: string;
   limit?: number;
@@ -281,9 +304,46 @@ export function listSessions(filters?: {
   const conditions: string[] = [];
   const params: unknown[] = [];
 
-  if (typeof filters?.projectId === 'string' && filters.projectId.trim()) {
-    conditions.push('project_id = ?');
-    params.push(filters.projectId.trim());
+  const cleanProjectId =
+    typeof filters?.projectId === 'string' && filters.projectId.trim()
+      ? filters.projectId.trim()
+      : undefined;
+  const cleanUserId =
+    typeof filters?.userId === 'string' && filters.userId.trim() ? filters.userId.trim() : undefined;
+  const hasIncludeGlobal = filters?.includeGlobal !== undefined;
+
+  let queryProjectId: string | null = null;
+  const shouldAttachTier = Boolean(cleanProjectId || hasIncludeGlobal || cleanUserId);
+
+  if (cleanProjectId) {
+    const scopeSql = buildHierarchicalScopeSql({
+      projectId: cleanProjectId,
+      includeAncestors: filters?.includeAncestors ?? true,
+      includeChildren: filters?.includeChildren ?? false,
+      includeGlobal: filters?.includeGlobal === true,
+      userId: cleanUserId,
+    });
+    conditions.push(scopeSql.clause);
+    params.push(...scopeSql.params);
+    queryProjectId = scopeSql.normalizedProjectId;
+  } else if (hasIncludeGlobal) {
+    if (filters!.includeGlobal === true) {
+      const scopeSql = buildHierarchicalScopeSql({
+        includeGlobal: true,
+        userId: cleanUserId,
+      });
+      conditions.push(scopeSql.clause);
+      params.push(...scopeSql.params);
+    } else {
+      conditions.push("scope != 'global'");
+      if (cleanUserId) {
+        conditions.push('user_id = ?');
+        params.push(cleanUserId);
+      }
+    }
+  } else if (cleanUserId) {
+    conditions.push('user_id = ?');
+    params.push(cleanUserId);
   }
 
   if (typeof filters?.status === 'string' && filters.status.trim()) {
@@ -300,7 +360,7 @@ export function listSessions(filters?: {
   const limit = filters?.limit ?? 50;
   params.push(limit);
 
-  return db
+  const rows = db
     .prepare(
       `
       SELECT * FROM sessions
@@ -310,6 +370,15 @@ export function listSessions(filters?: {
       `
     )
     .all(...params) as SessionRecord[];
+
+  if (!shouldAttachTier) {
+    return rows;
+  }
+
+  return rows.map((row) => ({
+    ...row,
+    match_tier: classifyMatchTier(row.scope, row.project_id, queryProjectId).match_tier,
+  }));
 }
 
 function clampDetailLimit(raw?: number): number {
@@ -357,7 +426,7 @@ export function getSessionDetails(
     .all(id, limit, offset) as NoteRecord[];
 
   const actions = db
-    .prepare('SELECT * FROM actions WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?')
+    .prepare(`SELECT ${ACTION_COLUMNS} FROM actions WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?`)
     .all(id, limit, offset) as ActionRecord[];
 
   return { session, observations, notes, actions };
@@ -436,26 +505,52 @@ export function getSessionReplay(
 
 /**
  * Return the most recent ended session with a non-empty summary for a project
- * (or global if no projectId is given), or null if none exists.
+ * (falling back through ancestor projects when includeAncestors !== false, or
+ * global if no projectId is given), or null if none exists.
  */
-export function getLatestSessionSummary(projectId?: string): SessionRecord | null {
+export function getLatestSessionSummary(
+  projectId?: string,
+  options?: { includeAncestors?: boolean }
+): SessionRecord | null {
   const db = getDb();
   const cleanProject = typeof projectId === 'string' ? projectId.trim() || null : null;
 
   if (cleanProject) {
-    const row = db
-      .prepare(
-        `
-        SELECT * FROM sessions
-        WHERE project_id = ? AND scope = 'project'
-          AND ended_at IS NOT NULL
-          AND summary IS NOT NULL AND summary != ''
-        ORDER BY ended_at DESC, rowid DESC
-        LIMIT 1
-        `
-      )
-      .get(cleanProject) as SessionRecord | undefined;
-    return row ?? null;
+    const norm = normalizeProjectId(cleanProject);
+    const targetProject = norm.ok ? norm.projectId : cleanProject;
+    const stmt = db.prepare(
+      `
+      SELECT * FROM sessions
+      WHERE project_id = ? AND scope = 'project'
+        AND ended_at IS NOT NULL
+        AND summary IS NOT NULL AND summary != ''
+      ORDER BY ended_at DESC, rowid DESC
+      LIMIT 1
+      `
+    );
+
+    const exactRow = stmt.get(targetProject) as SessionRecord | undefined;
+    if (exactRow) {
+      return {
+        ...exactRow,
+        match_tier: 'exact',
+      };
+    }
+
+    if (options?.includeAncestors !== false) {
+      const ancestors = getProjectAncestors(targetProject).slice(0, -1).reverse();
+      for (const ancestor of ancestors) {
+        const ancestorRow = stmt.get(ancestor) as SessionRecord | undefined;
+        if (ancestorRow) {
+          return {
+            ...ancestorRow,
+            match_tier: classifyMatchTier(ancestorRow.scope, ancestorRow.project_id, targetProject).match_tier,
+          };
+        }
+      }
+    }
+
+    return null;
   }
 
   const row = db
@@ -470,5 +565,5 @@ export function getLatestSessionSummary(projectId?: string): SessionRecord | nul
       `
     )
     .get() as SessionRecord | undefined;
-  return row ?? null;
+  return row ? { ...row, match_tier: 'global' } : null;
 }

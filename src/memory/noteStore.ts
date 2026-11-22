@@ -1,7 +1,12 @@
 import { randomUUID } from 'crypto';
 import { getDb } from '../lib/db';
-import { logger } from '../lib/logger';
-import { resolveScope } from '../lib/scope';
+import { normalizeUtcIso } from '../lib/recurrence';
+import {
+  buildHierarchicalScopeSql,
+  classifyMatchTier,
+  MatchTier,
+  resolveScope,
+} from '../lib/scope';
 import { redactSecrets } from '../lib/redactSecrets';
 import { enqueueForEmbedding } from './embedQueueStore';
 import { transaction } from '../lib/sqlite';
@@ -14,6 +19,8 @@ export interface NoteRecord {
   id: string;
   scope: NoteScope;
   project_id: string | null;
+  user_id: string | null;
+  agent_id: string | null;
   session_id: string | null;
   type: NoteType;
   title: string;
@@ -23,12 +30,16 @@ export interface NoteRecord {
   version: number;
   supersedes: string | null;
   is_latest: number;
+  event_at: string | null;
+  valid_from: string | null;
+  valid_until: string | null;
   created_at: number;
   updated_at: number;
+  match_tier?: MatchTier;
 }
 
-const NOTE_COLUMNS =
-  'id, scope, project_id, session_id, type, title, content, author, author_kind, version, supersedes, is_latest, created_at, updated_at';
+export const NOTE_COLUMNS =
+  'id, scope, project_id, user_id, agent_id, session_id, type, title, content, author, author_kind, version, supersedes, is_latest, event_at, valid_from, valid_until, created_at, updated_at';
 const NOTE_COLUMNS_ALIASED = NOTE_COLUMNS.split(', ')
   .map((c) => `n.${c}`)
   .join(', ');
@@ -43,6 +54,10 @@ export interface CreateNoteInput {
   scope: NoteScope;
   projectId?: string | null;
   project_id?: string | null;
+  userId?: string | null;
+  user_id?: string | null;
+  agentId?: string | null;
+  agent_id?: string | null;
   sessionId?: string | null;
   session_id?: string | null;
   type: NoteType;
@@ -53,6 +68,12 @@ export interface CreateNoteInput {
   concepts?: string[];
   files?: string[];
   supersedes?: string | null;
+  eventAt?: string | Date | null;
+  event_at?: string | Date | null;
+  validFrom?: string | Date | null;
+  valid_from?: string | Date | null;
+  validUntil?: string | Date | null;
+  valid_until?: string | Date | null;
   createdAt?: number;
   updatedAt?: number;
 }
@@ -66,6 +87,16 @@ const VALID_TYPES = new Set<NoteType>([
   'preference',
   'lesson',
 ]);
+
+function optionalString(value: unknown, field: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') {
+    const err = new Error(`${field} must be a string`);
+    (err as any).code = 'SCHEMA_INVALID';
+    throw err;
+  }
+  return value.trim() || null;
+}
 
 export function createNote(input: CreateNoteInput): NoteWithRelations {
   if (!input.scope) {
@@ -110,6 +141,24 @@ export function createNote(input: CreateNoteInput): NoteWithRelations {
     throw err;
   }
 
+  const userId = optionalString(input.userId !== undefined ? input.userId : input.user_id, 'user_id');
+  const agentId = optionalString(
+    input.agentId !== undefined ? input.agentId : input.agent_id,
+    'agent_id'
+  );
+  const eventAt = normalizeUtcIso(
+    input.eventAt !== undefined ? input.eventAt : input.event_at,
+    'event_at'
+  );
+  const validFrom = normalizeUtcIso(
+    input.validFrom !== undefined ? input.validFrom : input.valid_from,
+    'valid_from'
+  );
+  const validUntil = normalizeUtcIso(
+    input.validUntil !== undefined ? input.validUntil : input.valid_until,
+    'valid_until'
+  );
+
   const db = getDb();
   const id = input.id?.trim() || `note_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
   const sessionId = (input.sessionId ?? input.session_id)?.trim() || null;
@@ -144,13 +193,15 @@ export function createNote(input: CreateNoteInput): NoteWithRelations {
 
     db.prepare(`
       INSERT INTO notes (
-        id, scope, project_id, session_id, type, title, content, author, author_kind,
-        version, supersedes, is_latest, embedding, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
+        id, scope, project_id, user_id, agent_id, session_id, type, title, content, author, author_kind,
+        version, supersedes, is_latest, embedding, event_at, valid_from, valid_until, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?)
     `).run(
       id,
       scope,
       projectId,
+      userId,
+      agentId,
       sessionId,
       input.type,
       sanitizedTitle,
@@ -159,6 +210,9 @@ export function createNote(input: CreateNoteInput): NoteWithRelations {
       authorKind,
       version,
       supersedesId,
+      eventAt,
+      validFrom,
+      validUntil,
       createdAt,
       updatedAt
     );
@@ -192,6 +246,8 @@ export function createNote(input: CreateNoteInput): NoteWithRelations {
       id,
       scope,
       project_id: projectId,
+      user_id: userId,
+      agent_id: agentId,
       session_id: sessionId,
       type: input.type,
       title: sanitizedTitle,
@@ -201,6 +257,9 @@ export function createNote(input: CreateNoteInput): NoteWithRelations {
       version,
       supersedes: supersedesId,
       is_latest: 1,
+      event_at: eventAt,
+      valid_from: validFrom,
+      valid_until: validUntil,
       created_at: createdAt,
       updated_at: updatedAt,
       concepts,
@@ -230,7 +289,11 @@ export function getNote(id: string): NoteWithRelations | undefined {
   };
 }
 
-function attachNoteRelations(notes: NoteRecord[], db: ReturnType<typeof getDb>): NoteWithRelations[] {
+function attachNoteRelations(
+  notes: NoteRecord[],
+  db: ReturnType<typeof getDb>,
+  queryProjectId?: string | null
+): NoteWithRelations[] {
   if (notes.length === 0) return [];
 
   const noteIds = notes.map((n) => n.id);
@@ -270,15 +333,27 @@ function attachNoteRelations(notes: NoteRecord[], db: ReturnType<typeof getDb>):
 
   return notes.map((note) => ({
     ...note,
+    match_tier: classifyMatchTier(note.scope, note.project_id, queryProjectId).match_tier,
     concepts: conceptsByNote.get(note.id) ?? [],
     files: filesByNote.get(note.id) ?? [],
   }));
 }
 
-export function getNotesByFile(filePath: string, projectId?: string, limit = 50): NoteWithRelations[] {
+export function getNotesByFile(
+  filePath: string,
+  projectId?: string,
+  limit = 50,
+  options?: {
+    includeAncestors?: boolean;
+    includeChildren?: boolean;
+    includeGlobal?: boolean;
+    userId?: string;
+  }
+): NoteWithRelations[] {
   const db = getDb();
   const cleanPath = filePath.trim();
   const boundedLimit = Math.min(Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : 50), 200);
+  const cleanProjectId = typeof projectId === 'string' && projectId.trim() ? projectId.trim() : undefined;
 
   let query = `
     SELECT ${NOTE_COLUMNS_ALIASED}
@@ -288,22 +363,43 @@ export function getNotesByFile(filePath: string, projectId?: string, limit = 50)
   `;
   const params: unknown[] = [cleanPath];
 
-  if (projectId) {
-    query += ` AND ((n.project_id = ? AND n.scope = 'project') OR n.scope = 'global')`;
-    params.push(projectId.trim());
+  let normalizedQueryProjectId: string | null = null;
+  if (cleanProjectId) {
+    const scopeSql = buildHierarchicalScopeSql({
+      tableAlias: 'n',
+      projectId: cleanProjectId,
+      includeAncestors: options?.includeAncestors !== false,
+      includeChildren: options?.includeChildren === true,
+      includeGlobal: options?.includeGlobal !== false,
+      userId: options?.userId,
+    });
+    query += ` AND ${scopeSql.clause}`;
+    params.push(...scopeSql.params);
+    normalizedQueryProjectId = scopeSql.normalizedProjectId;
+  } else {
+    if (options?.includeGlobal === false) {
+      query += " AND n.scope != 'global'";
+    }
+    if (typeof options?.userId === 'string' && options.userId.trim() !== '') {
+      query += ' AND n.user_id = ?';
+      params.push(options.userId.trim());
+    }
   }
 
   query += ` ORDER BY n.updated_at DESC LIMIT ?`;
   params.push(boundedLimit);
 
   const rows = db.prepare(query).all(...params) as NoteRecord[];
-  return attachNoteRelations(rows, db);
+  return attachNoteRelations(rows, db, normalizedQueryProjectId);
 }
 
 export function listNotes(filters?: {
   scope?: string;
   projectId?: string;
+  includeAncestors?: boolean;
+  includeChildren?: boolean;
   includeGlobal?: boolean;
+  userId?: string;
   type?: string[];
   concept?: string;
   filePath?: string;
@@ -320,18 +416,37 @@ export function listNotes(filters?: {
     conditions.push('n.is_latest = 1');
   }
 
-  if (filters?.scope) {
-    conditions.push('n.scope = ?');
-    params.push(filters.scope);
-  }
+  const cleanProjectId =
+    typeof filters?.projectId === 'string' && filters.projectId.trim()
+      ? filters.projectId.trim()
+      : undefined;
+  const cleanScope =
+    typeof filters?.scope === 'string' && filters.scope.trim() ? filters.scope.trim() : undefined;
 
-  if (filters?.projectId) {
-    if (filters.includeGlobal) {
-      conditions.push("((n.project_id = ? AND n.scope = 'project') OR n.scope = 'global')");
-      params.push(filters.projectId.trim());
-    } else {
-      conditions.push("(n.project_id = ? AND n.scope = 'project')");
-      params.push(filters.projectId.trim());
+  let normalizedQueryProjectId: string | null = null;
+
+  if (cleanProjectId || cleanScope) {
+    const includeGlobal =
+      cleanScope === 'project' && !cleanProjectId ? false : Boolean(filters?.includeGlobal);
+    const scopeSql = buildHierarchicalScopeSql({
+      tableAlias: 'n',
+      scope: cleanScope,
+      projectId: cleanProjectId,
+      includeAncestors: filters?.includeAncestors !== false,
+      includeChildren: filters?.includeChildren === true,
+      includeGlobal,
+      userId: filters?.userId,
+    });
+    conditions.push(scopeSql.clause);
+    params.push(...scopeSql.params);
+    normalizedQueryProjectId = scopeSql.normalizedProjectId;
+  } else {
+    if (filters?.includeGlobal === false) {
+      conditions.push("n.scope != 'global'");
+    }
+    if (typeof filters?.userId === 'string' && filters.userId.trim() !== '') {
+      conditions.push('n.user_id = ?');
+      params.push(filters.userId.trim());
     }
   }
 
@@ -366,7 +481,7 @@ export function listNotes(filters?: {
     `)
     .all(...params) as NoteRecord[];
 
-  return attachNoteRelations(rows, db);
+  return attachNoteRelations(rows, db, normalizedQueryProjectId);
 }
 
 export function updateNoteScope(

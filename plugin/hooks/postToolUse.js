@@ -211,27 +211,80 @@ function resolveProjectId(cwd) {
   }
 
   try {
-    let current = path.resolve(cwd || process.cwd());
+    const sanitizeSeg = (s) =>
+      String(s || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+    const normalizeSlug = (raw) =>
+      String(raw || '')
+        .trim()
+        .replace(/\/+$/, '')
+        .replace(/\/{2,}/g, '/')
+        .split('/')
+        .map((seg) => seg.trim().toLowerCase().replace(/\s+/g, '-'))
+        .filter(Boolean)
+        .join('/');
+
+    const startDir = path.resolve(cwd || process.cwd());
+    const homeDir = path.resolve(os.homedir());
+    const homePrefix = homeDir.endsWith(path.sep) ? homeDir : homeDir + path.sep;
+    const stopAtHome = startDir === homeDir || startDir.startsWith(homePrefix);
+
+    let current = startDir;
     for (;;) {
       for (const name of ['.brainrc', '.brain.json']) {
         const fp = path.join(current, name);
         if (fs.existsSync(fp)) {
           const raw = fs.readFileSync(fp, 'utf-8');
+          let slug = null;
+          let autoSubproject = false;
+          let maxDepth;
           try {
             const parsed = JSON.parse(raw);
-            const val = parsed.project_id || parsed.projectId || parsed.project;
-            if (val && typeof val === 'string') return val.trim().toLowerCase();
+            if (parsed && typeof parsed === 'object') {
+              slug = parsed.project_id || parsed.projectId || parsed.project || null;
+              autoSubproject = Boolean(parsed.auto_subproject ?? parsed.autoSubproject);
+              const rawMaxDepth = parsed.max_depth ?? parsed.maxDepth;
+              if (typeof rawMaxDepth === 'number' && Number.isInteger(rawMaxDepth) && rawMaxDepth > 0) {
+                maxDepth = rawMaxDepth;
+              }
+            } else if (typeof parsed === 'string') {
+              slug = parsed;
+            }
           } catch {
-            if (raw.trim()) return raw.trim().toLowerCase();
+            if (raw.trim()) slug = raw.trim();
+          }
+
+          if (slug && typeof slug === 'string') {
+            const baseSlug = normalizeSlug(slug);
+            if (baseSlug) {
+              if (autoSubproject && startDir !== current) {
+                const rel = path.relative(current, startDir);
+                let segments = rel
+                  .split(path.sep)
+                  .map(sanitizeSeg)
+                  .filter((seg) => seg.length > 0 && seg !== '.' && seg !== '..');
+                if (maxDepth !== undefined) {
+                  segments = segments.slice(0, maxDepth);
+                }
+                if (segments.length > 0) {
+                  return `${baseSlug}/${segments.join('/')}`;
+                }
+              }
+              return baseSlug;
+            }
           }
         }
       }
+      if (stopAtHome && current === homeDir) break;
       const parent = path.dirname(current);
       if (parent === current) break;
       current = parent;
     }
-    const base = path.basename(path.resolve(cwd || process.cwd()));
-    return base.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || null;
+    const base = path.basename(startDir);
+    return sanitizeSeg(base) || null;
   } catch {
     return null;
   }
