@@ -1,3 +1,4 @@
+import http from 'http';
 import { getDb, resetDb } from '../../lib/db';
 import {
   matryoshkaTruncate,
@@ -5,6 +6,8 @@ import {
   serializeEmbedding,
   deserializeEmbedding,
   setCustomEmbedder,
+  embedDocuments,
+  resetOpenAIClients,
   queryRemoteModelId,
   boundLocalEmbedText,
   MAX_LOCAL_EMBED_CHARS,
@@ -333,6 +336,116 @@ describe('storeMetaAndEmbed', () => {
 
       process.env.BRAIN_GPU_ENDPOINT = 'http://embedder-gpu:7997/';
       expect(resolveLocalGpuEndpoint()).toBe('http://embedder-gpu:7997');
+    });
+
+    it('batches embedDocuments and drainEmbedQueue into a single local-gpu HTTP request and falls back per-item on batch error', async () => {
+      const requests: Array<{ input: unknown }> = [];
+      let failBatch = false;
+
+      const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          requests.push({ input: body.input });
+
+          if (failBatch && Array.isArray(body.input)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: 'simulated batch error' } }));
+            return;
+          }
+
+          if (!Array.isArray(body.input) && String(body.input).includes('BAD_RECORD')) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: 'bad single record' } }));
+            return;
+          }
+
+          const inputs = Array.isArray(body.input) ? body.input : [body.input];
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              object: 'list',
+              data: inputs.map((_: unknown, index: number) => ({
+                object: 'embedding',
+                index,
+                embedding: Array.from({ length: 768 }, (__, j) => (j + 1 + index) * 0.001),
+              })),
+            })
+          );
+        });
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const addr = server.address() as { port: number };
+
+      try {
+        resetOpenAIClients();
+        process.env.BRAIN_EMBED = 'local-gpu';
+        process.env.BRAIN_EMBED_MODEL = 'nomic';
+        process.env.BRAIN_EMBED_DIM = '512';
+        process.env.BRAIN_GPU_ENDPOINT = `http://127.0.0.1:${addr.port}`;
+        verifyOrCreateStoreMeta();
+
+        // 1. Direct embedDocuments call should send 1 batched request
+        const vectors = await embedDocuments(['first doc', 'second doc']);
+        expect(vectors).toHaveLength(2);
+        expect(vectors[0]).toHaveLength(512);
+        expect(vectors[1]).toHaveLength(512);
+        expect(requests).toHaveLength(1);
+        expect(requests[0].input).toEqual([
+          'search_document: first doc',
+          'search_document: second doc',
+        ]);
+
+        // 2. drainEmbedQueue with 2 notes should also send 1 batched request
+        requests.length = 0;
+        createNote({
+          scope: 'project',
+          projectId: 'batch-proj',
+          type: 'fact',
+          title: 'Batch Note 1',
+          content: 'Good content 1',
+        });
+        createNote({
+          scope: 'project',
+          projectId: 'batch-proj',
+          type: 'fact',
+          title: 'Batch Note 2',
+          content: 'Good content 2',
+        });
+        const drainRes = await drainEmbedQueue({ target: 'live', batchSize: 10 });
+        expect(drainRes.processed).toBe(2);
+        expect(drainRes.failed).toBe(0);
+        expect(requests).toHaveLength(1);
+        expect(Array.isArray(requests[0].input)).toBe(true);
+        expect((requests[0].input as string[]).length).toBe(2);
+
+        // 3. When a batch fails, drainEmbedQueue falls back per-item so only the bad record fails
+        requests.length = 0;
+        failBatch = true;
+        createNote({
+          scope: 'project',
+          projectId: 'batch-proj',
+          type: 'fact',
+          title: 'Good Note',
+          content: 'Should succeed in fallback',
+        });
+        createNote({
+          scope: 'project',
+          projectId: 'batch-proj',
+          type: 'fact',
+          title: 'Bad Note',
+          content: 'BAD_RECORD triggers failure',
+        });
+        const fallbackRes = await drainEmbedQueue({ target: 'live', batchSize: 10 });
+        expect(fallbackRes.processed).toBe(1);
+        expect(fallbackRes.failed).toBe(1);
+        expect(requests).toHaveLength(3); // 1 failed batch + 2 single-item fallbacks
+      } finally {
+        resetOpenAIClients();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     });
   });
 });

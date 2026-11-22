@@ -305,6 +305,24 @@ function postprocessNomicOrSlice(rawVec: number[], modelName: string, recipe: Re
   return rawVec.length > recipe.embed_dim ? rawVec.slice(0, recipe.embed_dim) : rawVec;
 }
 
+// Cached OpenAI-compatible clients keyed by `${baseURL}::${apiKey}` so local-gpu,
+// remote, and vendor endpoints reuse HTTP keep-alive connections across calls.
+const openAIClientCache = new Map<string, OpenAI>();
+
+function getOpenAIClient(apiKey: string, baseURL?: string): OpenAI {
+  const key = `${baseURL ?? ''}::${apiKey}`;
+  let client = openAIClientCache.get(key);
+  if (!client) {
+    client = baseURL ? new OpenAI({ apiKey, baseURL }) : new OpenAI({ apiKey });
+    openAIClientCache.set(key, client);
+  }
+  return client;
+}
+
+export function resetOpenAIClients(): void {
+  openAIClientCache.clear();
+}
+
 export function resolveLocalGpuEndpoint(): string {
   const explicit = process.env.BRAIN_GPU_ENDPOINT?.trim() || process.env.BRAIN_EMBED_ENDPOINT?.trim();
   if (explicit) {
@@ -314,23 +332,58 @@ export function resolveLocalGpuEndpoint(): string {
   return `http://127.0.0.1:${port}`;
 }
 
-async function runLocalGpuEmbedding(text: string, recipe: ResolvedEmbedderRecipe): Promise<number[]> {
-  const endpoint = resolveLocalGpuEndpoint();
-  const client = new OpenAI({
-    apiKey: 'no-key',
-    baseURL: endpoint,
-  });
-
+async function runOpenAICompatibleBatch(
+  client: OpenAI,
+  requestModel: string,
+  postprocessModel: string,
+  boundedTexts: string[],
+  recipe: ResolvedEmbedderRecipe,
+  applyPostprocess: boolean
+): Promise<number[][]> {
   const response = await client.embeddings.create({
-    model: recipe.embed_model_id,
-    input: boundLocalEmbedText(text),
+    model: requestModel,
+    input: boundedTexts.length === 1 ? boundedTexts[0] : boundedTexts,
+    encoding_format: 'float',
   });
 
-  const rawVec = response.data[0]?.embedding ?? [];
-  return postprocessNomicOrSlice(rawVec, recipe.embed_model_id, recipe);
+  const sorted = [...(response.data ?? [])].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  if (sorted.length !== boundedTexts.length) {
+    throw new Error(
+      `Embedding batch size mismatch: expected ${boundedTexts.length}, got ${sorted.length}`
+    );
+  }
+
+  return sorted.map((item) => {
+    const rawVec = item.embedding ?? [];
+    return applyPostprocess ? postprocessNomicOrSlice(rawVec, postprocessModel, recipe) : rawVec;
+  });
+}
+
+async function runLocalGpuEmbedding(text: string, recipe: ResolvedEmbedderRecipe): Promise<number[]> {
+  const [vec] = await runLocalGpuBatch([text], recipe);
+  return vec ?? [];
+}
+
+async function runLocalGpuBatch(texts: string[], recipe: ResolvedEmbedderRecipe): Promise<number[][]> {
+  const endpoint = resolveLocalGpuEndpoint();
+  const client = getOpenAIClient('no-key', endpoint);
+  const bounded = texts.map(boundLocalEmbedText);
+  return runOpenAICompatibleBatch(
+    client,
+    recipe.embed_model_id,
+    recipe.embed_model_id,
+    bounded,
+    recipe,
+    true
+  );
 }
 
 async function runRemoteEmbedding(text: string, recipe: ResolvedEmbedderRecipe): Promise<number[]> {
+  const [vec] = await runRemoteBatch([text], recipe);
+  return vec ?? [];
+}
+
+async function runRemoteBatch(texts: string[], recipe: ResolvedEmbedderRecipe): Promise<number[][]> {
   const endpoint = (
     process.env.BRAIN_EMBED_ENDPOINT?.trim() ||
     process.env.BRAIN_ENDPOINT?.trim() ||
@@ -341,18 +394,16 @@ async function runRemoteEmbedding(text: string, recipe: ResolvedEmbedderRecipe):
     process.env.BRAIN_ENDPOINT_API_KEY?.trim() ||
     'no-key';
 
-  const client = new OpenAI({
-    apiKey,
-    baseURL: endpoint,
-  });
-
-  const response = await client.embeddings.create({
-    model: recipe.embed_model,
-    input: boundLocalEmbedText(text),
-  });
-
-  const rawVec = response.data[0]?.embedding ?? [];
-  return postprocessNomicOrSlice(rawVec, recipe.embed_model, recipe);
+  const client = getOpenAIClient(apiKey, endpoint);
+  const bounded = texts.map(boundLocalEmbedText);
+  return runOpenAICompatibleBatch(
+    client,
+    recipe.embed_model,
+    recipe.embed_model,
+    bounded,
+    recipe,
+    true
+  );
 }
 
 async function runVendorEmbedding(text: string, recipe: ResolvedEmbedderRecipe): Promise<number[]> {
@@ -399,7 +450,7 @@ async function runVendorEmbedding(text: string, recipe: ResolvedEmbedderRecipe):
     if (!apiKey) {
       throw new EmbeddingConfigurationError('OPENAI_API_KEY is required for vendor embedding');
     }
-    const client = new OpenAI({ apiKey });
+    const client = getOpenAIClient(apiKey);
     const response = await client.embeddings.create({
       model: recipe.embed_model,
       input: boundedText,
@@ -421,7 +472,7 @@ export async function queryRemoteModelId(endpointUrl?: string): Promise<string |
     'no-key';
 
   try {
-    const client = new OpenAI({ apiKey, baseURL: endpoint });
+    const client = getOpenAIClient(apiKey, endpoint);
     const modelsList = await client.models.list();
     if (modelsList.data && modelsList.data.length > 0) {
       return modelsList.data[0].id;
@@ -482,6 +533,59 @@ export async function embedQuery(text: string): Promise<number[]> {
 }
 
 export async function embedDocuments(texts: string[]): Promise<number[][]> {
+  if (texts.length === 0) {
+    return [];
+  }
+
+  const recipe = resolveEmbedderRecipe();
+  if (recipe.embed_tier === 'none') {
+    return texts.map(() => []);
+  }
+
+  if (customEmbedderFn) {
+    const results: number[][] = [];
+    for (const text of texts) {
+      results.push(await customEmbedderFn(text, false));
+    }
+    return results;
+  }
+
+  const prefixedTexts = recipe.doc_prefix
+    ? texts.map((text) => `${recipe.doc_prefix}${text}`)
+    : texts;
+
+  switch (recipe.embed_tier) {
+    case 'local-gpu':
+      return runLocalGpuBatch(prefixedTexts, recipe);
+    case 'remote':
+      return runRemoteBatch(prefixedTexts, recipe);
+    case 'vendor': {
+      const vendor = (process.env.BRAIN_VENDOR || 'google').toLowerCase().trim();
+      const vendorRejection = embeddingVendorRejection(vendor);
+      if (vendorRejection) {
+        throw new EmbeddingConfigurationError(vendorRejection);
+      }
+      if (vendor !== 'google') {
+        const apiKey = process.env.OPENAI_API_KEY?.trim();
+        if (!apiKey) {
+          throw new EmbeddingConfigurationError('OPENAI_API_KEY is required for vendor embedding');
+        }
+        const client = getOpenAIClient(apiKey);
+        return runOpenAICompatibleBatch(
+          client,
+          recipe.embed_model,
+          recipe.embed_model,
+          prefixedTexts.map(boundLocalEmbedText),
+          recipe,
+          false
+        );
+      }
+      break;
+    }
+    case 'local':
+      break;
+  }
+
   const results: number[][] = [];
   for (const text of texts) {
     results.push(await embedDocument(text));

@@ -18,6 +18,7 @@ import {
   EmbeddingConfigurationError,
   buildTrajectoryEmbeddingText,
   embedDocument,
+  embedDocuments,
   resolveEmbedderRecipe,
   serializeEmbedding,
 } from './embedding';
@@ -213,6 +214,11 @@ export async function drainEmbedQueue(
     const qdrantPointsToUpsert: Array<{ id: string; vector: number[]; payload: Record<string, any> }> = [];
     const pendingQdrantDone: Array<{ record_id: string; record_type: EmbedRecordType }> = [];
     const computedBlobs: Array<{ id: string; record_type: EmbedRecordType; blob: Buffer }> = [];
+    const preparedItems: Array<{
+      item: (typeof items)[number];
+      text: string;
+      payload: Record<string, any>;
+    }> = [];
 
     for (let itemIdx = 0; itemIdx < items.length; itemIdx++) {
       const item = items[itemIdx];
@@ -418,51 +424,9 @@ export async function drainEmbedQueue(
           }
         }
 
-        let queuedForQdrant = false;
-        if (recipe.embed_tier !== 'none') {
-          const vector = await embedDocument(text);
-          const blob = serializeEmbedding(vector);
-
-          const blobTable = EMBEDDING_TABLE_BY_TYPE[item.record_type];
-          if (blobTable) {
-            if (!skipSqliteBlobUpdate) {
-              db.prepare(`UPDATE ${blobTable} SET embedding = ? WHERE id = ?`).run(
-                blob,
-                item.record_id
-              );
-            } else if (options?.onVectorsComputed) {
-              computedBlobs.push({ id: item.record_id, record_type: item.record_type, blob });
-            }
-          }
-
-          if (qdrant && vector.length > 0) {
-            qdrantPointsToUpsert.push({
-              id: toQdrantPointId(item.record_id),
-              vector,
-              payload: { ...payload, record_id: item.record_id },
-            });
-            pendingQdrantDone.push({ record_id: item.record_id, record_type: item.record_type });
-            queuedForQdrant = true;
-          }
-        }
-
-        if (!queuedForQdrant) {
-          markEmbedDone(item.record_id, item.record_type, target);
-          totalProcessed++;
-        }
+        preparedItems.push({ item, text, payload });
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
-        if (err instanceof EmbeddingConfigurationError) {
-          // The embedder itself is unavailable (e.g. the optional local embedder
-          // is not installed). No record is at fault: put this item and the rest
-          // of the batch back to pending and stop until it is fixed.
-          for (const pending of items.slice(itemIdx)) {
-            releaseEmbedClaim(pending.record_id, pending.record_type, target, errorMsg);
-          }
-          logger.error({ target, error: errorMsg }, 'embedder unavailable; queue left pending');
-          embedderUnavailable = true;
-          break;
-        }
         logger.error(
           {
             recordId: item.record_id,
@@ -470,13 +434,122 @@ export async function drainEmbedQueue(
             target,
             error: errorMsg,
           },
-          'error embedding record'
+          'error preparing record for embedding'
         );
         markEmbedFailed(item.record_id, item.record_type, target, errorMsg);
         totalFailed++;
       }
+    }
 
-      // Yield to the event loop between embeddings so HTTP health/dashboard requests stay responsive
+    if (preparedItems.length > 0) {
+      const persistVector = (
+        prepared: (typeof preparedItems)[number],
+        vector: number[]
+      ): void => {
+        let queuedForQdrant = false;
+        const blob = serializeEmbedding(vector);
+
+        const blobTable = EMBEDDING_TABLE_BY_TYPE[prepared.item.record_type];
+        if (blobTable) {
+          if (!skipSqliteBlobUpdate) {
+            db.prepare(`UPDATE ${blobTable} SET embedding = ? WHERE id = ?`).run(
+              blob,
+              prepared.item.record_id
+            );
+          } else if (options?.onVectorsComputed) {
+            computedBlobs.push({
+              id: prepared.item.record_id,
+              record_type: prepared.item.record_type,
+              blob,
+            });
+          }
+        }
+
+        if (qdrant && vector.length > 0) {
+          qdrantPointsToUpsert.push({
+            id: toQdrantPointId(prepared.item.record_id),
+            vector,
+            payload: { ...prepared.payload, record_id: prepared.item.record_id },
+          });
+          pendingQdrantDone.push({
+            record_id: prepared.item.record_id,
+            record_type: prepared.item.record_type,
+          });
+          queuedForQdrant = true;
+        }
+
+        if (!queuedForQdrant) {
+          markEmbedDone(prepared.item.record_id, prepared.item.record_type, target);
+          totalProcessed++;
+        }
+      };
+
+      if (recipe.embed_tier === 'none') {
+        for (const prepared of preparedItems) {
+          markEmbedDone(prepared.item.record_id, prepared.item.record_type, target);
+          totalProcessed++;
+        }
+      } else {
+        let batchVectors: number[][] | null = null;
+        try {
+          batchVectors = await embedDocuments(preparedItems.map((p) => p.text));
+        } catch (err) {
+          if (err instanceof EmbeddingConfigurationError) {
+            for (const pending of preparedItems) {
+              releaseEmbedClaim(pending.item.record_id, pending.item.record_type, target, err.message);
+            }
+            logger.error({ target, error: err.message }, 'embedder unavailable; queue left pending');
+            embedderUnavailable = true;
+          } else {
+            // Fall back to per-item embedding so one bad payload never fails the whole batch
+            logger.warn(
+              {
+                target,
+                count: preparedItems.length,
+                error: err instanceof Error ? err.message : String(err),
+              },
+              'batch embedding failed; falling back to per-item embedding'
+            );
+            for (let idx = 0; idx < preparedItems.length; idx++) {
+              const prepared = preparedItems[idx];
+              try {
+                const vector = await embedDocument(prepared.text);
+                persistVector(prepared, vector);
+              } catch (itemErr) {
+                const errorMsg = itemErr instanceof Error ? itemErr.message : String(itemErr);
+                if (itemErr instanceof EmbeddingConfigurationError) {
+                  for (const pending of preparedItems.slice(idx)) {
+                    releaseEmbedClaim(pending.item.record_id, pending.item.record_type, target, errorMsg);
+                  }
+                  logger.error({ target, error: errorMsg }, 'embedder unavailable; queue left pending');
+                  embedderUnavailable = true;
+                  break;
+                }
+                logger.error(
+                  {
+                    recordId: prepared.item.record_id,
+                    record_type: prepared.item.record_type,
+                    target,
+                    error: errorMsg,
+                  },
+                  'error embedding record'
+                );
+                markEmbedFailed(prepared.item.record_id, prepared.item.record_type, target, errorMsg);
+                totalFailed++;
+              }
+              await new Promise<void>((resolve) => setImmediate(resolve));
+            }
+          }
+        }
+
+        if (batchVectors) {
+          for (let idx = 0; idx < preparedItems.length; idx++) {
+            persistVector(preparedItems[idx], batchVectors[idx] ?? []);
+          }
+        }
+      }
+
+      // Yield to the event loop between batches so HTTP health/dashboard requests stay responsive
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
 
