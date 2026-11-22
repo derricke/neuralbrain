@@ -11,37 +11,38 @@
 
 ## Canonical `project_id` Resolution
 
-1. Check `.brainrc` or `.brain.json` (`{ "project_id": "<slug>" }`), walking up all parent directories.
+1. Check `.brainrc` or `.brain.json` (`{ "project_id": "<slug>", "auto_subproject": true, "max_depth": 2 }`), walking up directories (stopping at `$HOME` when inside it).
 2. Otherwise use the git repository root's folder name (in a git worktree, the **main** repository's folder, not the worktree's).
-3. Otherwise use the folder the session started in. Lowercase; never a subfolder you happen to be in, never a full filesystem path (e.g. `~/Projects/neuralbrain/src/lib` → `neuralbrain`).
-4. If the root is ambiguous, create `.brainrc` at the root (`neuralbrain init`) rather than guessing; for a single uncertain write use `scope: "unknown"`.
-5. Allowed characters: lowercase alphanumerics plus `.`, `_`, `-`.
+3. Otherwise use the folder the session started in. Lowercase; never a full filesystem path (e.g. `~/Projects/neuralbrain/src/lib` → `neuralbrain`).
+4. Hierarchical slash-path slugs are supported (e.g. `acme/socials/calendar`, max 256 chars). Child subprojects automatically inherit parent context while isolating siblings.
+5. Allowed characters per segment: lowercase alphanumerics plus `.`, `_`, `-`, separated by `/`.
 
-## MCP Tools (11 Sanctioned Tools)
+## MCP Tools (12 Sanctioned Tools)
 
 ### Retrieval & Graph
 
 | Tool | Purpose | Parameters |
 |---|---|---|
-| `brain_search` | Hybrid dense + BM25 search across record types | `q` (req), `record_types` (default `['note', 'trajectory']`; options `'note'`, `'trajectory'`, `'summary'`, `'observation'`), `project_id`, `include_global` (default `true`), `type` (`fact`, `architecture`, `pattern`, `workflow`, `bug`, `preference`, `lesson`), `file_path`, `include_sources` (default `false`), `sources_limit` (default `20`), `sources_offset` (default `0`), `limit` (default `10`) |
-| `brain_recent_failures` | SQL-counted recent failure patterns | `project_id`, `task_type`, `limit` (default `5`) |
-| `brain_graph` | Relational graph across notes, lessons, concepts, files, sessions, actions, summaries | `project_id`, `scope` (`'project' \| 'global' \| 'unknown'`), `limit` |
+| `brain_search` | 3-signal hybrid dense + FTS5 BM25 + Entity-Graph RRF search | `q` (req), `record_types` (default `['note', 'trajectory']`; options `'note'`, `'trajectory'`, `'summary'`, `'observation'`, `'entity'`, `'action'`), `project_id`, `include_ancestors` (default `true`), `include_children` (default `false`), `include_global` (default `true`), `include_history` (default `false`), `user_id`, `after`, `before`, `as_of`, `temporal_bias` (`'none' \| 'recent' \| 'upcoming'`), `entity_type`, `memory_layer` (`'semantic' \| 'procedural'`), `type`, `file_path`, `include_sources`, `sources_limit`, `sources_offset`, `limit` |
+| `brain_recent_failures` | SQL-counted recent failure patterns | `project_id`, `task_type`, `include_ancestors` (default `true`), `include_children` (default `false`), `include_global` (default `true`), `user_id`, `limit` (default `5`) |
+| `brain_graph` | Multi-hop BFS query and entity/edge CRUD | `mode` (`'query' \| 'upsert_entity' \| 'link' \| 'unlink'`, default `'query'`), `project_id`, `scope` (req for `upsert_entity`), `include_ancestors` (default `true`), `include_children` (default `false`), `include_global` (default `false`), `depth` (`1..3`), `node_id`, `entity_type`, `relation`, `user_id`, `agent_id`, `id`, `entity_id`, `name`, `description`, `external_ref`, `metadata`, `source_type`, `source_id`, `target_type`, `target_id`, `limit` |
 
 ### Writing & Lessons
 
 | Tool | Purpose | Parameters |
 |---|---|---|
-| `brain_save` | Save a curated note or lesson | `type` (req: `'fact' \| 'architecture' \| 'pattern' \| 'workflow' \| 'bug' \| 'preference' \| 'lesson'`), `title` (req), `content` (req), `scope` (req: `'project' \| 'global' \| 'unknown'`), `project_id` (req if `scope === 'project'`), `session_id`, `concepts`, `files`, `supersedes` |
+| `brain_save` | Save a curated note or lesson | `type` (req: `'fact' \| 'architecture' \| 'pattern' \| 'workflow' \| 'bug' \| 'preference' \| 'lesson'`), `title` (req), `content` (req), `scope` (req: `'project' \| 'global' \| 'unknown'`), `project_id` (req if `scope === 'project'`), `user_id`, `agent_id`, `session_id`, `concepts`, `files`, `supersedes`, `event_at`, `valid_from`, `valid_until` |
 
 ### Sessions & Next Actions
 
 | Tool | Purpose | Parameters |
 |---|---|---|
-| `brain_sessions` | List, fetch, or chronologically replay sessions | `mode` (`'list' \| 'get' \| 'replay'`, default `'list'`), `session_id` (req for `get`/`replay`), `project_id`, `status` (`'active' \| 'completed' \| 'paused' \| 'abandoned'`), `agent_name`, `limit` |
+| `brain_sessions` | List, fetch, or chronologically replay sessions | `mode` (`'list' \| 'get' \| 'replay'`, default `'list'`), `session_id` (req for `get`/`replay`), `project_id`, `include_ancestors` (default `true`), `include_children` (default `false`), `include_global` (default `false`), `user_id`, `status`, `agent_name`, `limit` |
 | `brain_session_end` | End or pause a session with a handoff summary | `session_id` (req), `status` (`'completed' \| 'paused' \| 'abandoned'`), `summary`, `files_touched`, `handoff_summary_id` |
-| `brain_action_add` | Create a Next Action for future sessions | `title` (req), `description`, `scope` (req: `'project' \| 'global' \| 'unknown'`), `project_id` (req if `scope === 'project'`), `session_id`, `status` (`'ready' \| 'blocked' \| 'in_progress' \| 'done' \| 'dismissed'`), `priority` (`'low' \| 'normal' \| 'high' \| 'urgent'`), `blocked_reason`, `files` |
-| `brain_action_list` | List Next Actions filtered by project/status | `project_id`, `include_global`, `status`, `limit` |
-| `brain_action_update` | Update a Next Action's status, priority, or details | `id` (req), `status`, `priority`, `title`, `description`, `blocked_reason`, `resolved_by_session_id` |
+| `brain_action_add` | Create a Next Action or scheduled/recurring reminder | `title` (req), `description`, `scope` (req: `'project' \| 'global' \| 'unknown'`), `project_id` (req if `scope === 'project'`), `user_id`, `agent_id`, `session_id`, `status`, `priority`, `blocked_reason`, `files`, `due_at`, `remind_at`, `recurrence`, `snooze_until` |
+| `brain_action_list` | List Next Actions filtered by project/status/due | `project_id`, `include_ancestors` (default `true`), `include_children` (default `false`), `include_global` (default `true`), `due_only`, `before`, `user_id`, `status`, `limit` |
+| `brain_action_update` | Update a Next Action (spawns next occurrence when completing recurring action) | `id` (req), `status`, `priority`, `title`, `description`, `blocked_reason`, `resolved_by_session_id`, `due_at`, `remind_at`, `recurrence`, `snooze_until`, `user_id`, `agent_id` |
+| `brain_action_due` | List due, reminded, or overdue open Next Actions not snoozed | `project_id`, `include_ancestors` (default `true`), `include_children` (default `false`), `include_global` (default `true`), `before`, `user_id`, `limit` |
 
 ### Extractive Consolidation
 

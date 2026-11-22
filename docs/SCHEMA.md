@@ -16,20 +16,27 @@ Conventions: ids are TEXT (uuid), timestamps are INTEGER unix seconds
 this file.
 
 **`project_id` is normalised before storage** by `src/lib/scope.ts`: trimmed,
-lowercased, internal whitespace to `-`, restricted to `[a-z0-9._-]`. Paths and
-unsupported characters are **rejected, not converted** — deriving `foo` from
-`/home/user/Projects/Foo` would be a guess, collides with any other repo of
-that basename, and breaks when the repo moves. Error messages and hints say to
-use the project root folder name (from `.brainrc`, else the git repo root —
-the main repo for a worktree), never a subfolder, e.g. 'neuralbrain', so all
-agents come up with the same id. Without this, `MyProject` and
-`myproject` are two projects and memory splits silently (D25).
+trimmed of trailing `/`, consecutive `//` collapsed, and per segment lowercased,
+internal whitespace converted to `-`, restricted to `[a-z0-9._-]`, max length
+`256` characters. Both flat IDs (`neuralbrain`) and hierarchical relative slash
+paths (`acme/socials/calendar`) are supported. Filesystem paths (`/`, `\`,
+`C:/`, `~`, `.`, `..`) and unsupported characters are **rejected, not converted**
+— deriving `foo` from `/home/user/Projects/Foo` would be a guess, collides with
+any other repo of that basename, and breaks when the repo moves. Error messages
+and hints say to use the project root folder name (from `.brainrc`, else the
+git repo root — the main repo for a worktree), e.g. `'neuralbrain'` or
+`'acme/socials/calendar'`, so all agents come up with the same id. Without this,
+`MyProject` and `myproject` are two projects and memory splits silently (D25).
 
-**Every table that can be scoped carries the same three-state scope** (rule 4):
+**Every table that can be scoped carries the same three-state scope** (rule 4)
+plus nullable `user_id` (filterable) and `agent_id` (provenance only, never
+filtered):
 
 ```sql
 scope      TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
 project_id TEXT,     -- NULL unless scope='project'
+user_id    TEXT,     -- optional; filterable when explicitly provided
+agent_id   TEXT,     -- optional provenance; never filtered
 CHECK ((scope = 'project') = (project_id IS NOT NULL))
 ```
 
@@ -78,11 +85,13 @@ CREATE TABLE IF NOT EXISTS observations (
   id           TEXT PRIMARY KEY,
   scope        TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
   project_id   TEXT,
+  user_id      TEXT,
+  agent_id     TEXT,
   note_ref     TEXT,                          -- -> notes.id, optional
   task_ref     TEXT,                          -- provenance; filterable, but not a scope axis
   session_id   TEXT,
   agent        TEXT,
-  kind         TEXT NOT NULL CHECK (kind IN ('tool_call','prompt')),
+  kind         TEXT NOT NULL CHECK (kind IN ('tool_call','prompt','response')),
   tool_name    TEXT,
   file_path    TEXT,                           -- the tool's TARGET path, nothing else
   input        TEXT,
@@ -94,14 +103,15 @@ CREATE TABLE IF NOT EXISTS observations (
   CHECK ((scope = 'project') = (project_id IS NOT NULL))
 );
 
-CREATE INDEX IF NOT EXISTS idx_obs_project   ON observations(project_id);
-CREATE INDEX IF NOT EXISTS idx_obs_scope     ON observations(scope);
-CREATE INDEX IF NOT EXISTS idx_obs_session   ON observations(session_id);
-CREATE INDEX IF NOT EXISTS idx_obs_created   ON observations(created_at);
-CREATE INDEX IF NOT EXISTS idx_obs_note      ON observations(note_ref);
-CREATE INDEX IF NOT EXISTS idx_obs_task      ON observations(task_ref);
-CREATE INDEX IF NOT EXISTS idx_obs_file      ON observations(file_path);
-CREATE INDEX IF NOT EXISTS idx_obs_failed    ON observations(failed, created_at);
+CREATE INDEX IF NOT EXISTS idx_obs_project    ON observations(project_id);
+CREATE INDEX IF NOT EXISTS idx_obs_scope      ON observations(scope);
+CREATE INDEX IF NOT EXISTS idx_obs_scope_proj ON observations(scope, project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_obs_session    ON observations(session_id);
+CREATE INDEX IF NOT EXISTS idx_obs_created    ON observations(created_at);
+CREATE INDEX IF NOT EXISTS idx_obs_note       ON observations(note_ref);
+CREATE INDEX IF NOT EXISTS idx_obs_task       ON observations(task_ref);
+CREATE INDEX IF NOT EXISTS idx_obs_file       ON observations(file_path);
+CREATE INDEX IF NOT EXISTS idx_obs_failed     ON observations(failed, created_at);
 ```
 
 `input`/`output` are stored **whole**. Do not truncate on the write path —
@@ -127,6 +137,8 @@ CREATE TABLE IF NOT EXISTS trajectories (
   id           TEXT PRIMARY KEY,
   scope        TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
   project_id   TEXT,                           -- was swarm_id
+  user_id      TEXT,
+  agent_id     TEXT,
   note_ref     TEXT,                           -- new
   task_ref     TEXT,                           -- provenance; filterable, not a scope axis
   task_type    TEXT,                           -- new; what failure patterns group by
@@ -145,12 +157,13 @@ CREATE TABLE IF NOT EXISTS trajectories (
   CHECK ((scope = 'project') = (project_id IS NOT NULL))
 );
 
-CREATE INDEX IF NOT EXISTS idx_traj_project  ON trajectories(project_id);
-CREATE INDEX IF NOT EXISTS idx_traj_scope    ON trajectories(scope);
-CREATE INDEX IF NOT EXISTS idx_traj_type     ON trajectories(task_type);
-CREATE INDEX IF NOT EXISTS idx_traj_created  ON trajectories(created_at);
-CREATE INDEX IF NOT EXISTS idx_traj_success  ON trajectories(success, created_at);
-CREATE INDEX IF NOT EXISTS idx_traj_note     ON trajectories(note_ref);
+CREATE INDEX IF NOT EXISTS idx_traj_project    ON trajectories(project_id);
+CREATE INDEX IF NOT EXISTS idx_traj_scope      ON trajectories(scope);
+CREATE INDEX IF NOT EXISTS idx_traj_scope_proj ON trajectories(scope, project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_traj_type       ON trajectories(task_type);
+CREATE INDEX IF NOT EXISTS idx_traj_created    ON trajectories(created_at);
+CREATE INDEX IF NOT EXISTS idx_traj_success    ON trajectories(success, created_at);
+CREATE INDEX IF NOT EXISTS idx_traj_note       ON trajectories(note_ref);
 ```
 
 Dropped from the original: `task_id REFERENCES tasks(id)`, `swarm_id REFERENCES
@@ -191,6 +204,8 @@ CREATE TABLE IF NOT EXISTS notes (
   id           TEXT PRIMARY KEY,
   scope        TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
   project_id   TEXT,
+  user_id      TEXT,
+  agent_id     TEXT,
   session_id   TEXT,
   type         TEXT NOT NULL CHECK (type IN
                  ('fact','architecture','pattern','workflow','bug','preference','lesson')),
@@ -202,6 +217,9 @@ CREATE TABLE IF NOT EXISTS notes (
   supersedes   TEXT REFERENCES notes(id),
   is_latest    INTEGER NOT NULL DEFAULT 1,
   embedding    BLOB,
+  event_at     TEXT,
+  valid_from   TEXT,
+  valid_until  TEXT,
   created_at   INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at   INTEGER NOT NULL DEFAULT (unixepoch()),
   CHECK ((scope = 'project') = (project_id IS NOT NULL))
@@ -219,19 +237,23 @@ CREATE TABLE IF NOT EXISTS note_files (
   PRIMARY KEY (note_id, file_path)
 );
 
-CREATE INDEX IF NOT EXISTS idx_notes_project   ON notes(project_id);
-CREATE INDEX IF NOT EXISTS idx_notes_scope     ON notes(scope);
-CREATE INDEX IF NOT EXISTS idx_notes_type      ON notes(type);
-CREATE INDEX IF NOT EXISTS idx_notes_latest    ON notes(is_latest, updated_at);
-CREATE INDEX IF NOT EXISTS idx_notes_session   ON notes(session_id);
-CREATE INDEX IF NOT EXISTS idx_note_concepts_c ON note_concepts(concept);
-CREATE INDEX IF NOT EXISTS idx_note_files_f    ON note_files(file_path);
+CREATE INDEX IF NOT EXISTS idx_notes_project    ON notes(project_id);
+CREATE INDEX IF NOT EXISTS idx_notes_scope      ON notes(scope);
+CREATE INDEX IF NOT EXISTS idx_notes_scope_proj ON notes(scope, project_id, is_latest, updated_at);
+CREATE INDEX IF NOT EXISTS idx_notes_type       ON notes(type);
+CREATE INDEX IF NOT EXISTS idx_notes_latest     ON notes(is_latest, updated_at);
+CREATE INDEX IF NOT EXISTS idx_notes_session    ON notes(session_id);
+CREATE INDEX IF NOT EXISTS idx_notes_temporal   ON notes(event_at, valid_from, valid_until);
+CREATE INDEX IF NOT EXISTS idx_notes_user       ON notes(user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_note_concepts_c  ON note_concepts(concept);
+CREATE INDEX IF NOT EXISTS idx_note_files_f     ON note_files(file_path);
 ```
 
 `type` taxonomy is taken from a real notes corpus, extended with `lesson` for durable takeaways and post-mortems. `concepts` and `files` (each present on most notes in that corpus) are **join tables, not JSON
 arrays** — they are filter axes, and "which notes touch this file?" must be a
 query. `file_path` lookup is the highest-value question an agent can ask at task
-start.
+start. Temporal columns (`event_at`, `valid_from`, `valid_until`) are normalized UTC
+ISO-8601 strings supporting point-in-time (`as_of`) and range (`after`/`before`) search.
 
 **`strength` is deliberately absent.** Model-assigned strength scores tend to sit at
 one mid-scale value on every record — a model parking on a calibration it cannot do.
@@ -249,6 +271,8 @@ CREATE TABLE IF NOT EXISTS failure_patterns (
   id             TEXT PRIMARY KEY,
   scope          TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
   project_id     TEXT,
+  user_id        TEXT,
+  agent_id       TEXT,
   session_id     TEXT,
   task_type      TEXT NOT NULL DEFAULT 'unknown',
   error_text     TEXT NOT NULL,
@@ -259,8 +283,9 @@ CREATE TABLE IF NOT EXISTS failure_patterns (
   UNIQUE (project_id, task_type, error_text)
 );
 
-CREATE INDEX IF NOT EXISTS idx_fp_lookup ON failure_patterns(project_id, task_type, count DESC);
-CREATE INDEX IF NOT EXISTS idx_fp_recent ON failure_patterns(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_fp_lookup     ON failure_patterns(project_id, task_type, count DESC);
+CREATE INDEX IF NOT EXISTS idx_fp_scope_proj ON failure_patterns(scope, project_id, task_type, count DESC);
+CREATE INDEX IF NOT EXISTS idx_fp_recent     ON failure_patterns(last_seen_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fp_unique_coalesce ON failure_patterns(COALESCE(project_id, '__GLOBAL_OR_UNKNOWN__:' || scope), task_type, error_text);
 ```
 
@@ -270,10 +295,12 @@ volunteered. Testing confirmed a model reports individual facts but does not
 think to mention the aggregate — and the aggregate is the entire value here.
 
 ```sql
-INSERT INTO failure_patterns (id, scope, project_id, session_id, task_type, error_text)
-VALUES (?,?,?,?,?,?)
+INSERT INTO failure_patterns (id, scope, project_id, user_id, agent_id, session_id, task_type, error_text)
+VALUES (?,?,?,?,?,?,?,?)
 ON CONFLICT (project_id, task_type, error_text) DO UPDATE SET
   count = count + 1,
+  user_id = COALESCE(excluded.user_id, failure_patterns.user_id),
+  agent_id = COALESCE(excluded.agent_id, failure_patterns.agent_id),
   last_seen_at = unixepoch(),
   session_id = COALESCE(excluded.session_id, failure_patterns.session_id);
 ```
@@ -295,6 +322,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   id                 TEXT PRIMARY KEY,
   scope              TEXT NOT NULL DEFAULT 'unknown' CHECK(scope IN ('project','global','unknown')),
   project_id         TEXT,
+  user_id            TEXT,
+  agent_id           TEXT,
   agent_name         TEXT,
   cwd                TEXT,
   status             TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused','completed','abandoned')),
@@ -307,14 +336,16 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_proj_status ON sessions(project_id, status, started_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_scope_proj  ON sessions(scope, project_id, status, started_at);
 ```
 
 ---
 
-## actions — short-term next actions
+## actions — short-term next actions & reminders
 
-Actionable follow-ups, blockers, and unfinished work surfaced across sessions
-via `/inject` and the `brain_action_*` MCP tools.
+Actionable follow-ups, blockers, scheduled reminders, and recurring tasks
+surfaced across sessions via `/inject`, `/actions/due`, `/actions/reminders/*`,
+and the `brain_action_*` MCP tools.
 
 ```sql
 CREATE TABLE IF NOT EXISTS actions (
@@ -322,12 +353,21 @@ CREATE TABLE IF NOT EXISTS actions (
   session_id             TEXT,
   scope                  TEXT NOT NULL DEFAULT 'unknown' CHECK(scope IN ('project','global','unknown')),
   project_id             TEXT,
+  user_id                TEXT,
+  agent_id               TEXT,
   title                  TEXT NOT NULL,
   description            TEXT,
   status                 TEXT NOT NULL DEFAULT 'ready' CHECK(status IN ('ready','blocked','in_progress','done','dismissed')),
   priority               TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low','normal','high','urgent')),
   blocked_reason         TEXT,
   files_json             TEXT,
+  due_at                 TEXT,
+  remind_at              TEXT,
+  recurrence             TEXT,
+  last_reminded_at       TEXT,
+  snooze_until           TEXT,
+  parent_action_id       TEXT,
+  embedding              BLOB,
   created_at             TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at             TEXT NOT NULL DEFAULT (datetime('now')),
   resolved_at            TEXT,
@@ -336,6 +376,58 @@ CREATE TABLE IF NOT EXISTS actions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_actions_proj_status ON actions(project_id, status, priority);
+CREATE INDEX IF NOT EXISTS idx_actions_scope_proj  ON actions(scope, project_id, status, priority);
+CREATE INDEX IF NOT EXISTS idx_actions_due ON actions(status, due_at) WHERE status IN ('ready','in_progress') AND due_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_actions_remind ON actions(status, remind_at) WHERE status IN ('ready','in_progress') AND remind_at IS NOT NULL;
+```
+
+---
+
+## entities & entity_edges — persistent knowledge graph
+
+Persistent entity nodes (`brand`, `person`, `asset`, `metric`, `document`,
+`tool`, or custom domain-agnostic `entity_type`) and directed relational edges
+connecting any nodes across subprojects (`part_of`, `depends_on`, `references`,
+`owns`, `produced_by`, `blocks`, `related_to`, or custom relations).
+
+```sql
+CREATE TABLE IF NOT EXISTS entities (
+  id            TEXT PRIMARY KEY,
+  scope         TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
+  project_id    TEXT,
+  user_id       TEXT,
+  agent_id      TEXT,
+  entity_type   TEXT NOT NULL,
+  name          TEXT NOT NULL,
+  description   TEXT,
+  external_ref  TEXT,
+  metadata_json TEXT,
+  embedding     BLOB,
+  created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+  CHECK ((scope = 'project') = (project_id IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_scope_proj ON entities(scope, project_id, entity_type);
+CREATE INDEX IF NOT EXISTS idx_entities_ext_ref    ON entities(external_ref) WHERE external_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_entities_user       ON entities(user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_entities_dedup      ON entities(COALESCE(project_id, '__SCOPE__:' || scope), entity_type, lower(name));
+
+CREATE TABLE IF NOT EXISTS entity_edges (
+  id            TEXT PRIMARY KEY,
+  source_type   TEXT NOT NULL,
+  source_id     TEXT NOT NULL,
+  target_type   TEXT NOT NULL,
+  target_id     TEXT NOT NULL,
+  relation      TEXT NOT NULL,
+  metadata_json TEXT,
+  created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE (source_type, source_id, target_type, target_id, relation)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_edges_src ON entity_edges(source_id, relation);
+CREATE INDEX IF NOT EXISTS idx_entity_edges_tgt ON entity_edges(target_id, relation);
+CREATE INDEX IF NOT EXISTS idx_entity_edges_rel ON entity_edges(relation);
 ```
 
 ---
@@ -349,6 +441,8 @@ CREATE TABLE IF NOT EXISTS summaries (
   id              TEXT PRIMARY KEY,
   scope           TEXT NOT NULL CHECK (scope IN ('project','global','unknown')),
   project_id      TEXT,
+  user_id         TEXT,
+  agent_id        TEXT,
   kind            TEXT NOT NULL CHECK (kind IN ('session','rollup','failure_digest')),
   window_from     INTEGER,
   window_to       INTEGER,
@@ -377,15 +471,16 @@ CREATE TABLE IF NOT EXISTS summary_sources (
   summary_id  TEXT NOT NULL REFERENCES summaries(id) ON DELETE CASCADE,
   claim_id    TEXT REFERENCES summary_claims(id) ON DELETE CASCADE,
   record_id   TEXT NOT NULL,
-  grain       TEXT NOT NULL CHECK (grain IN ('observation','trajectory','note')),
+  record_type TEXT NOT NULL CHECK (record_type IN ('observation','trajectory','note')),
   PRIMARY KEY (summary_id, claim_id, record_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_sum_project  ON summaries(project_id);
-CREATE INDEX IF NOT EXISTS idx_sum_kind     ON summaries(kind, created_at);
-CREATE INDEX IF NOT EXISTS idx_sum_latest   ON summaries(is_latest);
-CREATE INDEX IF NOT EXISTS idx_sum_producer ON summaries(producer_tier, producer_model);
-CREATE INDEX IF NOT EXISTS idx_sum_src_rec  ON summary_sources(record_id);
+CREATE INDEX IF NOT EXISTS idx_sum_project    ON summaries(project_id);
+CREATE INDEX IF NOT EXISTS idx_sum_scope_proj ON summaries(scope, project_id, is_latest, created_at);
+CREATE INDEX IF NOT EXISTS idx_sum_kind       ON summaries(kind, created_at);
+CREATE INDEX IF NOT EXISTS idx_sum_latest     ON summaries(is_latest);
+CREATE INDEX IF NOT EXISTS idx_sum_producer   ON summaries(producer_tier, producer_model);
+CREATE INDEX IF NOT EXISTS idx_sum_src_rec    ON summary_sources(record_id);
 ```
 
 `summary_sources` is a **join table, not an id array**, so "which summaries cover
@@ -408,19 +503,36 @@ process" from a bare file read. Deliberate prose is a `note`, authored on purpos
 
 ---
 
+## FTS5 Full-Text Indexes
+
+Six FTS5 virtual tables (`tokenize='porter unicode61'`) kept synchronized by
+`AFTER INSERT` / `AFTER UPDATE` / `AFTER DELETE` triggers (plus `note_concepts`,
+`note_files`, and `summary_claims` triggers) and backfilled on migration:
+
+```sql
+fts_notes(record_id UNINDEXED, title, content, extra, tokenize='porter unicode61')
+fts_trajectories(record_id UNINDEXED, description, result, task_type, tokenize='porter unicode61')
+fts_observations(record_id UNINDEXED, tool_name, file_path, input, output, tokenize='porter unicode61')
+fts_summaries(record_id UNINDEXED, text, tokenize='porter unicode61')
+fts_entities(record_id UNINDEXED, name, entity_type, description, external_ref, tokenize='porter unicode61')
+fts_actions(record_id UNINDEXED, title, description, blocked_reason, tokenize='porter unicode61')
+```
+
+---
+
 ## embed_queue — embedding off the write path (D3)
 
 ```sql
 CREATE TABLE IF NOT EXISTS embed_queue (
   record_id   TEXT NOT NULL,
-  grain       TEXT NOT NULL CHECK (grain IN ('observation','trajectory','note','summary')),
+  record_type TEXT NOT NULL CHECK (record_type IN ('observation','trajectory','note','summary','entity','action')),
   status      TEXT NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending','running','done','failed')),
   attempts    INTEGER NOT NULL DEFAULT 0,
   last_error  TEXT,
   target      TEXT NOT NULL DEFAULT 'live',   -- 'live' or a re-embed collection name
   queued_at   INTEGER NOT NULL DEFAULT (unixepoch()),
-  PRIMARY KEY (record_id, grain, target)
+  PRIMARY KEY (record_id, record_type, target)
 );
 
 CREATE INDEX IF NOT EXISTS idx_eq_claim ON embed_queue(target, status, queued_at);
@@ -490,18 +602,21 @@ sparse_vectors: { bm25: { modifier: idf } }        -- server-side Qdrant/bm25
 `payload_schema: {}`, which is why its filters were useless:
 
 ```
-scope (keyword)       project_id (keyword)    grain (keyword)
-kind (keyword)        type (keyword)          task_type (keyword)
-note_ref (keyword)    task_ref (keyword)      file_path (keyword)
-agent (keyword)       success (bool)          created_at (integer)
+scope (keyword)             project_id (keyword)    project_ancestors (keyword[])
+user_id (keyword)           entity_type (keyword)   record_type (keyword)
+kind (keyword)              type (keyword)          task_type (keyword)
+note_ref (keyword)          task_ref (keyword)      file_path (keyword)
+agent (keyword)             success (bool)          created_at (integer)
 ```
 
-Fuse dense and sparse with **RRF, never a weighted sum** — BM25 scores shift per
-query while dense scores do not, and adding incompatible scales makes the
-ranking meaningless.
+Fuse dense vectors, SQLite FTS5 BM25, and Entity-Graph 1-hop links with
+**Reciprocal Rank Fusion (RRF, $1 / (60 + \text{rank})$), never a weighted sum**
+— BM25 scores shift per query while dense scores do not, and adding incompatible
+scales makes the ranking meaningless.
 
-`grain` lets a search exclude derived rows, so a summary can never silently
-outrank the record it describes.
+`record_type` (`note`, `trajectory`, `observation`, `summary`, `entity`, `action`)
+lets a search target specific layers or exclude derived rows, so a summary can
+never silently outrank the record it describes.
 
 ---
 

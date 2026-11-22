@@ -112,5 +112,24 @@ describe('Doctor Scripts Tests', () => {
 
       db.exec('PRAGMA foreign_keys = ON;');
     });
+
+    it('detects missing entities, FTS5 tables, and action/note reminder/temporal columns', async () => {
+      const db = getDb();
+      db.exec(`
+        DROP TABLE IF EXISTS fts_entities;
+        DROP TABLE IF EXISTS entity_edges;
+        DROP TABLE IF EXISTS entities;
+      `);
+
+      const report = await runDoctor({ ai: false });
+      expect(report.schemaAligned).toBe(false);
+      expect(report.allPassing).toBe(false);
+
+      const schemaCheck = report.checks.find((c) => c.name === 'Schema Alignment');
+      expect(schemaCheck?.pass).toBe(false);
+      expect(schemaCheck?.message).toContain('table entities does not exist');
+      expect(schemaCheck?.message).toContain('table entity_edges does not exist');
+      expect(schemaCheck?.message).toContain('FTS5 table fts_entities does not exist');
+    });
   });
 });

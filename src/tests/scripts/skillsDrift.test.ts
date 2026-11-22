@@ -39,7 +39,8 @@ describe('Plugin skills structure, MCP tool coverage, and non-duplicating instal
   test('Every MCP tool registered in src/mcp/server.ts is documented in REFERENCE.md and plugin/rules/AGENTS.md', () => {
     const serverSrc = fs.readFileSync(MCP_SERVER_PATH, 'utf8');
     const toolMatches = [...serverSrc.matchAll(/server\.tool\(\s*'([^']+)'/g)].map((m) => m[1]);
-    expect(toolMatches.length).toBe(11);
+    expect(toolMatches.length).toBe(12);
+    expect(toolMatches).toContain('brain_action_due');
 
     const referenceMd = fs.readFileSync(
       path.join(SKILLS_DIR, 'brain-memory', 'REFERENCE.md'),

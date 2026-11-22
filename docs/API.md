@@ -54,14 +54,15 @@ The hot path. Accepts one observation or a batch.
 - **`scope` is required and never guessed.** Omitted → `"unknown"`, never
   `"global"`. Defaulting to global would put unlabelled records into every
   project's injection.
-- **`project_id` is normalised and echoed back.** Trimmed, lowercased,
-  whitespace to `-`, charset `[a-z0-9._-]`. A path or an unsupported character
-  is a `400`, not a silent conversion — so a client learns its id is wrong
-  rather than quietly writing to a second project. The error hints say to
-  use the project root folder name (from `.brainrc`, else the git repo root —
-  the main repo for a worktree), never a subfolder, e.g. 'neuralbrain', so all
-  agents come up with the same id. The response carries the
-  stored form.
+- **`project_id` is normalised and echoed back.** Supports flat slugs (`neuralbrain`)
+  and hierarchical relative slash paths (`acme/socials/calendar`, max 256 chars),
+  lowercased per segment with internal whitespace converted to `-`, charset
+  `[a-z0-9._-]` per segment. A filesystem path or unsupported character is a
+  `400`, not a silent conversion — so a client learns its id is wrong rather than
+  quietly writing to a second project.
+- **User & Agent IDs.** All memory tables store optional nullable `user_id` and
+  `agent_id`. Queries filter by `user_id` when supplied, and **never filter on
+  `agent_id`** (cross-agent memory visibility is preserved).
 - **`failed` comes from the client's failure hook.** Never derived from output
   text.
 - Partial success is `201` with a populated `rejected` array — one malformed
@@ -84,41 +85,78 @@ failed source, `1` only for a client-signalled rollup with no failure, and `NULL
 
 ### `POST /search`
 
-Hybrid: dense + BM25, fused with RRF.
+3-signal hybrid retrieval: Qdrant dense vectors + SQLite FTS5 BM25 + Entity-Graph
+1-hop expansion (`entity_edges`), fused with RRF ($1 / (60 + \text{rank})$) and
+scaled by hierarchical tier multipliers (`exact > parent > grandparent > global > child`)
+and temporal bias/validity adjustments.
 
 ```json
 {
   "q": "foreign key constraint failed on migration",
-  "grains": ["note","trajectory"],
+  "record_types": ["note", "trajectory"],
   "scope": "project",
-  "project_id": "neuralbrain",
+  "project_id": "acme/socials/calendar",
+  "include_ancestors": true,
+  "include_children": false,
   "include_global": true,
-  "filters": { "type": ["bug","pattern"], "file_path": "src/lib/db.ts" },
+  "include_history": false,
+  "user_id": "alice",
+  "after": "2026-01-01T00:00:00Z",
+  "before": "2026-12-31T23:59:59Z",
+  "as_of": "2026-06-01T00:00:00Z",
+  "temporal_bias": "recent",
+  "filters": {
+    "type": ["bug", "pattern"],
+    "file_path": "src/lib/db.ts",
+    "entity_type": "asset",
+    "memory_layer": "procedural"
+  },
   "limit": 10
 }
 ```
 
-`200` → results carrying `grain`, `score`, the record, and `sources` for derived
-rows.
+`200` → results carrying `record_type`, `score`, `project_id`, `match_tier`
+(`exact | ancestor | child | global | unknown`), optional `matched_entities`
+(when matched/boosted via `entity_edges`), `record`, and `claims` / `sources`
+for derived rows.
 
+- `record_types` supports `'note' | 'trajectory' | 'observation' | 'summary' | 'entity' | 'action'` (default `['note', 'trajectory']`; legacy `grains` alias still accepted).
+- `include_ancestors: true` (default) inherits ancestor projects (`acme`, `acme/socials`) while isolating sibling subprojects (`acme/socials/generator`, `acme/cogs`).
+- `include_children: true` rolls up all strict descendant subprojects (`acme/*`).
 - `include_global: true` merges `scope='global'` with the named project. It
   never includes `scope='unknown'` — those are surfaced only by an explicit
   `scope: "unknown"` query, which doubles as the repair list.
+- `as_of` filters notes by validity window (`valid_from <= as_of <= valid_until`). Invalid ISO timestamps on `after`/`before`/`as_of` return `400 SCHEMA_INVALID`.
 - If `store_meta` mismatches config, this returns `200` with
-  `"degraded": "vector search unavailable: <what differs>"` and BM25-only
+  `"degraded": "vector search unavailable: <what differs>"` and BM25 + Entity-Graph
   results. **It does not pretend to be healthy and does not silently drop the
   dense leg.**
-- With `BRAIN_EMBED=none` it is BM25-only by design, reported as
-  `"mode": "bm25"`.
+- With `BRAIN_EMBED=none` it runs in `"mode": "bm25"` (FTS5 BM25 + Entity-Graph).
+
+### `GET /notes` · `GET /files/:path/notes` · `GET /sessions` · `GET /trajectories` · `GET /observations` · `GET /failure-patterns`
+
+List endpoints accept optional hierarchical and user filters (preserving exact
+defaults when omitted):
+
+| Endpoint | Default `include_ancestors` | Default `include_children` | Default `include_global` | Extra Params |
+|---|---|---|---|---|
+| `GET /notes` | `true` | `false` | `true` | `scope`, `project_id`, `user_id`, `type`, `concept`, `file_path`, `limit`, `offset` |
+| `GET /files/:path/notes` | `true` | `false` | `true` | `project_id`, `user_id`, `limit` |
+| `GET /sessions` | `true` | `false` | `false` | `project_id`, `user_id`, `status`, `agent_name`, `limit` |
+| `GET /actions` | `true` | `false` | `true` | `project_id`, `user_id`, `status`, `session_id`, `due_only`, `before`, `limit` |
+| `GET /failure-patterns` | `true` | `false` | `true` | `project_id`, `task_type`, `user_id`, `limit` |
+| `GET /trajectories` | `true` | `false` | `false` | `project_id`, `scope`, `user_id`, `task_type`, `success`, `rollup_source`, `limit`, `offset` |
+| `GET /observations` | `true` | `false` | `false` | `project_id`, `scope`, `user_id`, `session_id`, `failed`, `limit`, `offset` |
 
 ### `GET /notes/:id` · `GET /trajectories/:id` · `GET /observations/:id`
 
 Single record. `404` if absent. Derived rows include their `sources`.
 
-### `GET /files/:path/notes`
+### `POST /notes`
 
-What do we know about this file? Highest-value question at task start; backed by
-the `note_files` join table.
+Creates a curated note with explicit `scope` (`project | global | unknown`),
+optional `user_id`, `agent_id`, `session_id`, `concepts`, `files`, `supersedes`,
+and optional UTC ISO-8601 temporal fields `event_at`, `valid_from`, `valid_until`.
 
 ---
 
@@ -126,33 +164,37 @@ the `note_files` join table.
 
 ### `GET /inject`
 
-The half NeuralSwarm got right. Everything an agent should know *before* it
-starts, delivered without asking.
+Everything an agent should know *before* it starts, delivered without asking.
+Automatically includes ancestor projects (`include_ancestors: true`) and global
+context (`include_global: true`). Accepts `project_id`, `task_type`, `user_id`, `limit`.
 
 ```
-GET /inject?project_id=X&task_type=migration&limit=5
+GET /inject?project_id=acme/socials/calendar&task_type=migration&limit=5
 ```
 
 ```json
 {
   "failure_patterns": [
     {"task_type":"migration","error_text":"SqliteError: FOREIGN KEY constraint failed",
-     "count":4,"last_seen_at":1762...}
+     "count":4,"last_seen_at":1762...,"match_tier":"exact"}
   ],
   "prior_outcomes": [ ... recent trajectories, same task_type ... ],
   "ready_actions": [ ... open actions with status in ('ready','in_progress') ... ],
-  "latest_session_summary": { ... most recent ended session with non-empty summary, or null ... },
+  "due_actions": [ ... open due/reminded actions not snoozed, with overdue flag ... ],
+  "latest_session_summary": { ... most recent ended session with non-empty summary (ancestor fallback), or null ... },
   "lessons": [ ... scoped notes, type in ('lesson','bug','pattern') ... ],
   "notes": [ ... scoped notes, type in ('architecture','workflow','preference','fact') ... ],
-  "formatted_warnings": "CRITICAL WARNINGS ..."
+  "formatted_warnings": "CRITICAL WARNINGS ...",
+  "consolidation_warning": "..."
 }
 ```
 
 Counts come from `failure_patterns.count` (SQL), never from a model. Scope is the
-named project plus `global`.
+named project, its ancestor projects, and `global`.
 
 - `ready_actions`: Open (`ready` or `in_progress`) next actions ordered by priority (`urgent` → `high` → `normal` → `low`) then recency.
-- `latest_session_summary`: Most recent ended session with a non-empty `summary` for the project (or global if `project_id` is omitted), or `null`.
+- `due_actions`: Open (`ready` or `in_progress`) actions whose `remind_at <= now` or `due_at <= now` and not snoozed (`snooze_until IS NULL OR snooze_until <= now`), with `overdue` and `match_tier` fields.
+- `latest_session_summary`: Most recent ended session with a non-empty `summary` for the project (falling back through ancestor projects if none exist on the child, or global if `project_id` is omitted), or `null`.
 - `lessons`: Scoped notes with `type` in `('lesson', 'bug', 'pattern')`.
 - `notes`: Scoped notes with `type` in `('architecture', 'workflow', 'preference', 'fact')`.
 - `formatted_warnings`: Pre-rendered `CRITICAL WARNINGS` block for prompt injection.
@@ -164,12 +206,15 @@ named project plus `global`.
 ### `POST /sessions/start`
 
 Starts a new session or reactivates an existing session if `id` already exists.
+Accepts optional `user_id` and `agent_id`.
 
 ```json
 {
   "id": "sess_optional",
   "scope": "project",
-  "project_id": "neuralbrain",
+  "project_id": "acme/socials/calendar",
+  "user_id": "alice",
+  "agent_id": "planner-1",
   "agent_name": "claude-code",
   "cwd": "/path/to/repo"
 }
@@ -185,7 +230,7 @@ Ends a session, setting `ended_at`, `status` (`active | paused | completed | aba
 
 ### `GET /sessions`
 
-Lists sessions. Query parameters: `project_id`, `status`, `agent_name`, `limit` (default `50`, max `200`).
+Lists sessions. Query parameters: `project_id`, `include_ancestors` (default `true`), `include_children` (default `false`), `include_global` (default `false` when `project_id` is set), `user_id`, `status`, `agent_name`, `limit` (default `50`, max `200`).
 
 `200` → `{ "sessions": [ ... ] }`
 
@@ -203,66 +248,139 @@ Returns a chronological replay timeline of `observation`, `note`, and `action` i
 
 ---
 
-## Next Actions (Short Term)
+## Next Actions & Proactive Reminders (Short Term)
 
 ### `POST /actions`
 
-Creates a Next Action with explicit 3-state `scope` (`project` requires `project_id`).
+Creates a Next Action (with optional scheduling/recurrence) and explicit 3-state `scope` (`project` requires `project_id`).
 
 ```json
 {
-  "title": "Re-run smoke tests after schema change",
-  "description": "Verify /inject returns ready_actions",
+  "title": "Publish weekly social calendar",
+  "description": "Verify asset links before Monday send",
   "scope": "project",
-  "project_id": "neuralbrain",
+  "project_id": "acme/socials/calendar",
+  "user_id": "alice",
+  "agent_id": "scheduler-1",
   "session_id": "sess_...",
   "status": "ready",
   "priority": "high",
   "blocked_reason": null,
-  "files": ["src/app.ts"]
+  "files": ["src/app.ts"],
+  "due_at": "2026-12-01T15:00:00Z",
+  "remind_at": "2026-12-01T14:00:00Z",
+  "recurrence": "P1W",
+  "snooze_until": null
 }
 ```
 
 - `status`: `ready | blocked | in_progress | done | dismissed` (default `ready`)
 - `priority`: `low | normal | high | urgent` (default `normal`)
+- `recurrence`: 5-field UTC cron (`0 9 * * 1`), macro (`@hourly | @daily | @midnight | @weekly | @monthly | @yearly | @annually`), or ISO-8601 duration (`P1D`, `P1W`, `P1M`, `PT2H`)
 
 `201` → `{ "action": { ... } }`
 
 ### `GET /actions`
 
-Lists Next Actions ordered by priority (`urgent` → `high` → `normal` → `low`), then `created_at DESC`. Query parameters: `project_id`, `include_global` (default `true`), `status`, `session_id`, `limit` (default `50`, max `200`).
+Lists Next Actions ordered by priority (`urgent` → `high` → `normal` → `low`), then `created_at DESC`. Query parameters: `project_id`, `include_ancestors` (default `true`), `include_children` (default `false`), `include_global` (default `true`), `user_id`, `status`, `session_id`, `due_only` (`true | 1`), `before` (ISO-8601), `limit` (default `50`, max `200`).
 
 `200` → `{ "actions": [ ... ] }`
 
+### `GET /actions/due`
+
+Lists open (`ready` or `in_progress`) actions whose `remind_at <= cutoff` or `due_at <= cutoff` and not snoozed (`snooze_until IS NULL OR snooze_until <= cutoff`), ordered by earliest `COALESCE(remind_at, due_at)` ASC then priority. Query parameters: `project_id`, `include_ancestors` (default `true`), `include_children` (default `false`), `include_global` (default `true`), `user_id`, `before` (ISO-8601, defaults to now), `unreminded_only`, `cooldown_ms` (or `cooldown` e.g. `30m`), `limit`.
+
+`200` → `{ "actions": [ ... ] }` (each item includes `match_tier` and `overdue`).
+
+### `POST /actions/reminders/check`
+
+Evaluates due unreminded actions (`unremindedOnly: true`, respecting `cooldown_ms` / `cooldown`) and, unless `dry_run: true`, atomically stamps `last_reminded_at` in SQLite. Accepts JSON body: `project_id`, `include_ancestors`, `include_children`, `include_global`, `user_id`, `before`, `cooldown_ms` / `cooldown`, `dry_run`, `limit`.
+
+`200` → `{ "checked_at": "...", "reminders": [ ... ], "marked_count": 2 }`
+
+### `POST /actions/reminders/ack`
+
+Acknowledges delivered reminders (e.g. after webhook delivery in `neuralbrain reminders check --webhook <url>`) by stamping `last_reminded_at` on the specified action IDs. Body: `{ "ids": ["act_..."], "reminded_at": "..." }` (`reminded_at` optional, defaults to now).
+
+`200` → `{ "updated": 1, "reminded_at": "..." }` · `400 SCHEMA_INVALID` if `ids` is missing/not an array.
+
 ### `PATCH /actions/:id`
 
-Updates an existing Next Action (`scope`, `project_id`, `title`, `description`, `status`, `priority`, `blocked_reason`, `files`, `resolved_by_session_id`). Automatically sets `resolved_at` when `status` transitions to `done` or `dismissed`.
+Updates an existing Next Action (`scope`, `project_id`, `user_id`, `agent_id`, `title`, `description`, `status`, `priority`, `blocked_reason`, `files`, `due_at`, `remind_at`, `recurrence`, `snooze_until`, `resolved_by_session_id`). Automatically sets `resolved_at` when `status` transitions to `done` or `dismissed`. When transitioning to `done` on an action with `recurrence`, atomically spawns the next `'ready'` occurrence (`next_occurrence` in response, linked via `parent_action_id`, preserving `due_at - remind_at` lead time).
 
 `200` → `{ "action": { ... } }` · `404` if not found.
 
 ---
 
-## Knowledge Graph
+## Knowledge Graph & Persistent Entities
 
 ### `GET /graph`
 
-Returns a scoped knowledge graph built from SQLite notes, lessons, concepts, files, sessions, actions, summaries, and `summary_sources` citations. Query parameters: `project_id`, `scope`, `limit` (default `80`, max `200`).
+Returns a scoped knowledge graph built from SQLite notes, lessons, concepts, files, sessions, actions, persistent entities, summaries, and `entity_edges` / `summary_sources`, with 1..3 hop cross-subproject BFS traversal. Query parameters: `project_id`, `scope`, `include_ancestors` (default `true`), `include_children` (default `false`), `include_global` (default `false`), `depth` (`1..3`, default `1`), `node_id`, `entity_type`, `relation`, `user_id`, `limit` (default `80`, max `200`).
 
 ```json
 {
   "nodes": [
-    { "id": "...", "type": "note|lesson|concept|file|session|action|summary", "label": "...", "scope": "...", "project_id": "...", "meta": {} }
+    { "id": "...", "type": "note|lesson|concept|file|session|action|summary|entity|observation|trajectory", "label": "...", "scope": "...", "project_id": "...", "entity_type": "...", "external_ref": "...", "match_tier": "...", "meta": {} }
   ],
   "edges": [
-    { "source": "...", "target": "...", "type": "has_concept|touches_file|supersedes|from_session|cites_source" }
+    { "source": "...", "target": "...", "type": "has_concept|touches_file|supersedes|from_session|cites_source|part_of|depends_on|references|owns|produced_by|blocks|related_to|..." }
   ],
   "stats": { "nodeCount": 0, "edgeCount": 0 }
 }
 ```
 
-### `GET /dashboard/api/graph`
+### `POST /graph/entities`
 
-Dashboard BFF endpoint returning the same `{ nodes, edges, stats }` knowledge graph payload for the Dashboard `Graph` tab (accepts the same `project_id`, `scope`, `limit` query parameters).
+Creates or updates a persistent entity node with explicit Rule 4 scope, secret redaction, deduplication on `(scope/project_id, entity_type, lower(name))`, and atomic `embed_queue` enqueueing.
+
+```json
+{
+  "scope": "project",
+  "project_id": "acme/socials/generator",
+  "entity_type": "asset",
+  "name": "Q4 Launch Video",
+  "description": "Primary hero asset",
+  "external_ref": "s3://acme-assets/q4-launch.mp4",
+  "metadata": { "format": "mp4" },
+  "user_id": "alice"
+}
+```
+
+`201` → `{ "entity": { ... } }`
+
+### `GET /graph/entities` · `GET /graph/entities/:id`
+
+- `GET /graph/entities`: Lists entities with hierarchical filters (`project_id`, `scope`, `include_ancestors`, `include_children`, `include_global`, `entity_type`, `external_ref`, `user_id`, `limit`). `200` → `{ "entities": [ ... ] }`.
+- `GET /graph/entities/:id`: Returns `{ "entity": { ... } }` or `404 NOT_FOUND`.
+
+### `POST /graph/edges`
+
+Creates or updates a directed edge in `entity_edges` (supports cross-subproject links; auto-resolves `source_type` / `target_type` when omitted).
+
+```json
+{
+  "source_id": "note_123",
+  "target_id": "ent_456",
+  "relation": "references",
+  "metadata": { "role": "hero" }
+}
+```
+
+`201` → `{ "edge": { ... } }`
+
+### `DELETE /graph/edges` · `DELETE /graph/edges/:id`
+
+- `DELETE /graph/edges`: Unlinks edges matching body or query `{ id, source_id, target_id, relation }`. `200` → `{ "deleted": 1 }`.
+- `DELETE /graph/edges/:id`: Unlinks a single edge by ID. `200` → `{ "deleted": 1 }` or `404 NOT_FOUND` if absent.
+
+### `GET /dashboard/api/graph` & Dashboard BFF Endpoints
+
+Dashboard BFF endpoints (cookie/Bearer auth + CSRF protection on writes):
+- `GET /dashboard/api/graph` (same params/payload as `GET /graph`)
+- `GET /dashboard/api/graph/entities` · `POST /dashboard/api/graph/entities`
+- `POST /dashboard/api/graph/edges` · `DELETE /dashboard/api/graph/edges`
+- `GET /dashboard/api/actions/due`
 
 ---
 
@@ -343,6 +461,17 @@ Starts or resumes a re-embed. Builds a new collection, drains `embed_queue` with
 `target` set to it, moves the Qdrant alias on completion, updates `store_meta`
 last. `GET` the same path for progress. Resumable: a crash continues from the
 queue. The old collection is kept until explicitly dropped.
+
+### `POST /maintenance/rename-project`
+
+Renames a `project_id` across SQLite tables (`observations`, `observations_archive`, `trajectories`, `trajectory_archive`, `notes`, `failure_patterns`, `sessions`, `actions`, `summaries`, `entities`, `consolidation_leases`) and updates `project_id` / `project_ancestors` payloads in Qdrant. Body: `{ "from_project_id": "...", "to_project_id": "..." }`.
+
+### `neuralbrain reminders check` CLI
+
+HTTP-only CLI command (`src/cli.ts`) for cron or webhook-based reminder delivery (never opens SQLite directly):
+- `neuralbrain reminders check [--json] [--webhook <url>] [--project <id>] [--include-children] [--no-ancestors] [--no-global] [--cooldown <dur>] [--dry-run] [--limit <n>]`
+- Without `--webhook`: calls `POST /actions/reminders/check`.
+- With `--webhook`: calls `POST /actions/reminders/check` with `dry_run: true`, POSTs `{ event: "neuralbrain.reminders.due", checked_at, count, reminders }` to the webhook URL, and calls `POST /actions/reminders/ack` only if the webhook returns HTTP 2xx and `--dry-run` is not set.
 
 ### `GET /maintenance/api-keys`
 

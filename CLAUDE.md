@@ -37,13 +37,14 @@ Many agent memory systems fail in the same four ways. Each one maps to a non-neg
 1. **No LLM in the capture path.** Records are structured columns. Rollups are arithmetic: count tool calls, sum durations, take the first prompt as the description, derive success from whether a failure hook fired. Nothing between a client's POST and the committed row may hallucinate. (Generative models are permitted solely for producing **derived** records under Rule 6).
 2. **SQLite is the source of truth. Qdrant is an index.** Every record must be inspectable and repairable with standard SQL. If Qdrant is lost, it is rebuilt from SQLite. **The database file is opened by the brain service and by nothing else** — see "Database access" below.
 3. **Never reject a write for capacity.** No per-session caps. No rate limit on capture (`POST /capture/*` is exempt). Backpressure is acceptable; rejection is not. Dead letters are strictly for **malformed** records — never for volume or dependency outages.
-4. **Explicit scope, never inferred — and "global" is not "unknown".** The writer states scope as one of three values: `project` (with a non-empty `project_id`), `global` (deliberately universal), or `unknown` (writer omitted scope). Never guess or backfill by inference. When determining `project_id`, error messages and hints guide agents to use the name of the project's **root** folder — the folder containing `.brainrc` if present, otherwise the git repository root (for a git worktree, the main repository's folder, not the worktree's), otherwise the folder the session started in — lowercase, never a subfolder and never a filesystem path (e.g. working in `~/Projects/neuralbrain/src/lib` or a worktree of it → `neuralbrain`), so all agents come up with the same id. Plugin hooks pin one `project_id` per session. If the root is ambiguous, create a `.brainrc` at the root (`neuralbrain init`) rather than guessing.
+4. **Explicit scope, never inferred — and "global" is not "unknown".** The writer states scope as one of three values: `project` (with a non-empty `project_id`), `global` (deliberately universal), or `unknown` (writer omitted scope). Never guess or backfill by inference. `project_id` supports both flat slugs (`neuralbrain`) and hierarchical relative slash paths (`acme/socials/calendar`, max 256 chars), normalized per segment. When determining `project_id`, error messages and hints guide agents to use the name of the project's **root** folder — the folder containing `.brainrc` if present (with optional `auto_subproject` and `max_depth` for hierarchical subprojects), otherwise the git repository root (for a git worktree, the main repository's folder, not the worktree's), otherwise the folder the session started in — lowercase, never a filesystem path, so all agents come up with the same id. Child subprojects inherit ancestor context (`include_ancestors: true` by default) while isolating siblings (`acme/socials/calendar` is isolated from `acme/socials/generator` and `acme/cogs`). Plugin hooks pin one `project_id` per session. If the root is ambiguous, create a `.brainrc` at the root (`neuralbrain init`) rather than guessing.
 5. **Three grains, one schema.**
-   - `observations`: Machine-written tool calls and prompts. High volume. Archive at 30 days, purge at 90 days.
+   - `observations`: Machine-written tool calls, prompts, and responses. High volume. Archive at 30 days, purge at 90 days.
    - `trajectories`: Machine-written task attempts with arithmetic outcome metrics. Low volume, long retention.
-   - `notes`: Curated knowledge (facts, decisions, patterns, bugs, workflows, preferences). Authored deliberately, scoped per Rule 4, **never auto-deleted**.
+   - `notes`: Curated knowledge (facts, decisions, patterns, bugs, workflows, preferences, lessons). Authored deliberately, scoped per Rule 4, **never auto-deleted**, with optional temporal/validity timestamps (`event_at`, `valid_from`, `valid_until`).
    - Observations roll up into trajectories arithmetically (Rule 1). Notes are authored on purpose and edited by supersede.
 6. **Derived records are additive, attributed and disposable.** A summary is a new row that cites its sources in `summary_sources`. It never mutates or replaces source records. The store remains fully functional with every derived row deleted. Nothing load-bearing depends on consolidation.
+7. **User & Agent ID Policy.** Memory tables store optional nullable `user_id` and `agent_id`. Filter by `user_id` when explicitly supplied; **NEVER filter on `agent_id`** (cross-agent visibility is intentional; `agent_id` is provenance only).
 
 ---
 
@@ -94,33 +95,35 @@ Bypassing the service connection causes silent, undetectable desynchronisation:
 │  [Core Endpoints]                                                           │
 │    POST /capture/observations, /capture/trajectories                        │
 │    POST /sessions/start, /sessions/:id/end · GET /sessions, /sessions/:id*  │
-│    POST /actions · GET /actions · PATCH /actions/:id                        │
-│    GET  /inject (Failure patterns, outcomes, ready actions, summary, notes) │
-│    POST /search (Hybrid dense vector + in-process BM25 via RRF)             │
-│    GET  /graph  (Knowledge graph across notes, sessions, actions, summaries)│
+│    POST /actions · GET /actions, /actions/due · PATCH /actions/:id          │
+│    POST /actions/reminders/check · POST /actions/reminders/ack              │
+│    GET  /inject (Failures, outcomes, ready/due actions, summary, notes)     │
+│    POST /search (3-signal RRF: Qdrant dense + FTS5 BM25 + Entity-Graph)     │
+│    GET  /graph · POST/GET /graph/entities · POST/DELETE /graph/edges        │
 │    GET  /consolidate/candidates  &  POST /consolidate/summaries (Gate)      │
 │    GET  /dashboard  (CSP-secured Operator UI)                               │
-│    POST /maintenance/{reembed, rollup-sweep, cleanup, api-keys}             │
+│    POST /maintenance/{reembed, rollup-sweep, cleanup, rename-project,       │
+│                       api-keys}                                             │
 │                                                                             │
 │  [Storage Engine]                            [Vector & AI Engine]           │
-│    SQLite (node:sqlite, WAL, FKs)              In-process nomic ONNX        │
+│    SQLite (node:sqlite, WAL, FKs, FTS5)        In-process nomic ONNX        │
 │    Relational Tables (sessions, actions,       Matryoshka LayerNorm/Slice/L2│
-│     notes, observations, trajectories, etc.)   Qdrant Client (Port 6333)    │
+│     notes, entities, entity_edges, etc.)       Qdrant Client (Port 6333)    │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 - **Memory Layers**:
-  - **Long Term**: Curated `notes` (`fact`, `architecture`, `pattern`, `workflow`, `bug`, `preference`) and `lesson` records (`notes.type = 'lesson'`), versioned by supersede and never auto-deleted.
-  - **Short Term**: `sessions` lifecycle (`POST /sessions/start`, `/sessions/:id/end`, `/sessions/:id/replay`), `actions` (Next Actions queue via `/actions`), and deterministic arithmetic session summaries.
-  - **Observations**: High-volume `observations` (30d archive / 90d purge), arithmetic `trajectories`, and derived `summaries`.
-  - **Knowledge Graph**: Relational graph across notes, lessons, concepts, files, sessions, actions, and summaries (`GET /graph` and `GET /dashboard/api/graph`).
+  - **Long Term**: Curated `notes` (`fact`, `architecture`, `pattern`, `workflow`, `bug`, `preference`, `lesson`), versioned by supersede and never auto-deleted, with optional temporal/validity fields (`event_at`, `valid_from`, `valid_until`).
+  - **Short Term**: `sessions` lifecycle (`POST /sessions/start`, `/sessions/:id/end`, `/sessions/:id/replay`), `actions` (Next Actions queue & due/recurring reminders via `/actions`, `/actions/due`, `/actions/reminders/*`), and deterministic arithmetic session summaries.
+  - **Observations**: High-volume `observations` (`tool_call`, `prompt`, `response`; 30d archive / 90d purge), arithmetic `trajectories`, and derived `summaries`.
+  - **Knowledge Graph & Entities**: Relational graph across notes, lessons, concepts, files, sessions, actions, persistent `entities`, `entity_edges` (multi-hop BFS), and summaries (`GET /graph`, `POST/GET /graph/entities`, `POST/DELETE /graph/edges`, and `GET /dashboard/api/graph`).
 - **HTTP API**: The single ingress point. Validates schemas, enforces scope, handles auth, and logs traces.
 - **Client Spool (`src/lib/spool.ts`)**: Local client JSONL spool for network transport failures (5 MB cap, 168h max age, dedupe, flush).
-- **Thin MCP Server (`src/mcp/server.ts`)**: Pure REST client with zero direct DB access (`import` from `../lib/db` forbidden). Exposes 11 sanctioned tools: `brain_search`, `brain_save`, `brain_recent_failures`, `brain_consolidate_candidates`, `brain_submit_summary`, `brain_action_add`, `brain_action_list`, `brain_action_update`, `brain_sessions`, `brain_session_end`, `brain_graph`.
-- **Hybrid Retrieval**: Combines dense Qdrant vector retrieval and in-process BM25 lexical ranking fused via Reciprocal Rank Fusion ($1 / (60 + \text{rank})$).
+- **Thin MCP Server (`src/mcp/server.ts`)**: Pure REST client with zero direct DB access (`import` from `../lib/db` forbidden). Exposes 12 sanctioned tools: `brain_search`, `brain_save`, `brain_recent_failures`, `brain_consolidate_candidates`, `brain_submit_summary`, `brain_action_add`, `brain_action_list`, `brain_action_update`, `brain_action_due`, `brain_sessions`, `brain_session_end`, `brain_graph`. (HTTP `/mcp` in `src/routes/mcp.ts` exposes identical 12-tool parity via `createDirectBrainMcpHandlers`.)
+- **Hybrid Retrieval**: 3-signal Reciprocal Rank Fusion ($1 / (60 + \text{rank})$) combining dense Qdrant vector retrieval, SQLite FTS5 BM25 lexical ranking (`fts_*` virtual tables), and 1-hop Entity-Graph expansion (`entity_edges`), with hierarchical tier multipliers (`exact > ancestor > global > child`) and temporal filters (`after`, `before`, `as_of`, `temporal_bias`).
 - **Push & Pull Delivery**:
-  - *Push* (`GET /inject`): Scoped failure patterns (atomic SQL UPSERTs), prior outcomes, `ready_actions`, `latest_session_summary`, `lessons`, `notes`, and `formatted_warnings` (`CRITICAL WARNINGS` block).
-  - *Pull* (`POST /search` / `brain_search`): Mid-task hybrid semantic search.
+  - *Push* (`GET /inject`): Scoped failure patterns (with ancestor inheritance), prior outcomes, `ready_actions`, `due_actions`, `latest_session_summary`, `lessons`, `notes`, and `formatted_warnings` (`CRITICAL WARNINGS` block).
+  - *Pull* (`POST /search` / `brain_search`): Mid-task 3-signal hybrid search.
 - **Web Operator Dashboard (`GET /dashboard`)**: Built-in, zero-dependency operator UI.
 
 ### User Directory (`~/.neuralbrain/` / `BRAIN_HOME`)
@@ -215,7 +218,9 @@ BRAIN_EMBED_MODEL=nomic                    # nomic | minilm | endpoint model nam
 | `neuralbrain logs` | Tails Docker Compose logs or `~/.neuralbrain/brain.log`. |
 | `neuralbrain doctor` | Runs operational health and AI conformance diagnostics. |
 | `neuralbrain install-agent` | Configures Antigravity, Claude Code/Desktop, Cursor, or project rules. |
-| `neuralbrain init [project-id]` | Writes `.brainrc` in the current folder so every agent below it uses one `project_id` (defaults to the folder name; `--force` replaces an existing one). |
+| `neuralbrain init [project-id]` | Writes `.brainrc` in the current folder so every agent below it uses one `project_id` (`--auto-subproject`, `--max-depth <n>`, `--force`). Supports hierarchical slugs (`acme/socials/calendar`). |
+| `neuralbrain reminders check` | HTTP-only due/overdue action reminder evaluator (`--json`, `--webhook <url>`, `--project <id>`, `--include-children`, `--no-ancestors`, `--no-global`, `--cooldown <dur>`, `--dry-run`, `--limit <n>`). |
+| `neuralbrain rename-project <from> <to>` | Renames a `project_id` across SQLite tables and Qdrant payloads via `POST /maintenance/rename-project`. |
 | `neuralbrain mcp` | Starts the stdio MCP server (`dist/mcp/server.js`). |
 
 ### NPM Scripts
