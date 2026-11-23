@@ -586,7 +586,7 @@ export function runCleanup(): CleanupResult {
   const selectObsBatch = db.prepare(`
     SELECT id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, agent,
            kind, tool_name, file_path, input, output, duration_ms, failed,
-           created_at, archived_at
+           event_at, created_at, archived_at
     FROM observations
     WHERE (created_at < ? AND archived_at IS NULL) OR archived_at IS NOT NULL
     LIMIT ?
@@ -595,8 +595,8 @@ export function runCleanup(): CleanupResult {
   const insertObsArchive = db.prepare(`
     INSERT OR IGNORE INTO observations_archive (
       id, original_observation_id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, agent,
-      kind, tool_name, file_path, input, output, duration_ms, failed, created_at, archived_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      kind, tool_name, file_path, input, output, duration_ms, failed, event_at, created_at, archived_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const deleteObsActive = db.prepare('DELETE FROM observations WHERE id = ?');
@@ -621,6 +621,7 @@ export function runCleanup(): CleanupResult {
         output: string | null;
         duration_ms: number;
         failed: number;
+        event_at: string | null;
         created_at: number;
         archived_at: number | null;
       }>;
@@ -646,6 +647,7 @@ export function runCleanup(): CleanupResult {
           obs.output,
           obs.duration_ms,
           obs.failed,
+          obs.event_at,
           obs.created_at,
           obs.archived_at ?? now
         );

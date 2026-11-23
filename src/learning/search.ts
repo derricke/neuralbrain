@@ -458,7 +458,7 @@ const RECORD_SPECS: Record<MemoryRecordType, RecordTypeSpec> = {
     ftsTable: 'fts_observations',
     hasEmbedding: false,
     scanOrderCol: 'o.created_at',
-    temporalExpr: (a) => `strftime('%Y-%m-%dT%H:%M:%fZ', ${a}.created_at, 'unixepoch')`,
+    temporalExpr: (a) => `COALESCE(${a}.event_at, strftime('%Y-%m-%dT%H:%M:%fZ', ${a}.created_at, 'unixepoch'))`,
     buildExtraConditions: ({ params }) => {
       const conditions: string[] = [];
       const queryParams: unknown[] = [];
@@ -889,7 +889,7 @@ function computeTierMultiplier(
 }
 
 function getCandidateCreatedMs(c: CandidateDoc): number | null {
-  if (c.record_type === 'note' && c.record.event_at) {
+  if ((c.record_type === 'note' || c.record_type === 'observation') && c.record.event_at) {
     const eventMs = parseTimestampMs(c.record.event_at);
     if (eventMs !== null) return eventMs;
   }
@@ -922,7 +922,7 @@ function computeTemporalMultiplier(
       if (dueMs !== null && dueMs >= nowMs) {
         mult *= 1.12;
       }
-    } else if (c.record_type === 'note' && c.record.event_at) {
+    } else if ((c.record_type === 'note' || c.record_type === 'observation') && c.record.event_at) {
       const eventMs = parseTimestampMs(c.record.event_at);
       if (eventMs !== null && eventMs >= nowMs) {
         mult *= 1.08;

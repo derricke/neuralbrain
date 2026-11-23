@@ -662,4 +662,111 @@ describe('hierarchical multi-memory search', () => {
       .all() as Array<{ record_id: string }>;
     expect(ftsHit.map((r) => r.record_id)).toEqual([n1.id]);
   });
+
+  it('filters and ranks observations by event_at (after, before, temporal_bias) even when ingested in same-second batch', async () => {
+    process.env.BRAIN_EMBED = 'none';
+    const sameIngestSec = Math.floor(Date.now() / 1000);
+    const futureIso = new Date(Date.now() + 14 * 86_400_000).toISOString();
+
+    // All observations share the exact same created_at (simulating a bulk/spool import),
+    // but have distinct historical/future event_at timestamps (ingested out of order).
+    const cap = captureObservations([
+      {
+        id: 'obs-jan',
+        scope: 'project',
+        project_id: 'acme/ops',
+        kind: 'prompt',
+        input: 'Deploy canary release pipeline',
+        event_at: '2025-01-10T12:00:00Z',
+        created_at: sameIngestSec,
+      },
+      {
+        id: 'obs-jun',
+        scope: 'project',
+        project_id: 'acme/ops',
+        kind: 'prompt',
+        input: 'Deploy canary release pipeline',
+        event_at: '2025-06-20T12:00:00Z',
+        created_at: sameIngestSec,
+      },
+      {
+        id: 'obs-mar',
+        scope: 'project',
+        project_id: 'acme/ops',
+        kind: 'prompt',
+        input: 'Deploy canary release pipeline',
+        event_at: '2025-03-15T12:00:00Z',
+        created_at: sameIngestSec,
+      },
+      {
+        id: 'obs-null-event',
+        scope: 'project',
+        project_id: 'acme/ops',
+        kind: 'prompt',
+        input: 'Deploy canary release pipeline',
+        created_at: Math.floor(Date.parse('2025-04-01T00:00:00Z') / 1000),
+      },
+    ]);
+    expect(cap.accepted).toBe(4);
+
+    // after / before range matches event_at (and falls back to created_at when event_at is NULL)
+    const rangeRes = await hybridSearch({
+      q: 'Deploy canary release pipeline',
+      project_id: 'acme/ops',
+      record_types: ['observation'],
+      after: '2025-03-01T00:00:00Z',
+      before: '2025-05-01T00:00:00Z',
+      limit: 10,
+    });
+    expect(rangeRes.results.map((r) => r.id).sort()).toEqual(['obs-mar', 'obs-null-event']);
+    const marHit = rangeRes.results.find((r) => r.id === 'obs-mar')!;
+    expect(marHit.record.event_at).toBe('2025-03-15T12:00:00.000Z');
+
+    // temporal_bias: 'recent' ranks obs-jun > obs-null-event (Apr) > obs-mar > obs-jan
+    // despite identical text and identical created_at for jan/mar/jun
+    const recentRes = await hybridSearch({
+      q: 'Deploy canary release pipeline',
+      project_id: 'acme/ops',
+      record_types: ['observation'],
+      temporal_bias: 'recent',
+      limit: 10,
+    });
+    expect(recentRes.results.map((r) => r.id)).toEqual([
+      'obs-jun',
+      'obs-null-event',
+      'obs-mar',
+      'obs-jan',
+    ]);
+
+    // temporal_bias: 'upcoming' boosts observations with future event_at
+    captureObservations([
+      {
+        id: 'obs-past-launch',
+        scope: 'project',
+        project_id: 'acme/ops',
+        kind: 'prompt',
+        input: 'Quarterly summit keynote checklist',
+        event_at: '2025-01-01T00:00:00Z',
+        created_at: sameIngestSec,
+      },
+      {
+        id: 'obs-future-launch',
+        scope: 'project',
+        project_id: 'acme/ops',
+        kind: 'prompt',
+        input: 'Quarterly summit keynote checklist',
+        event_at: futureIso,
+        created_at: sameIngestSec,
+      },
+    ]);
+
+    const upcomingRes = await hybridSearch({
+      q: 'Quarterly summit keynote checklist',
+      project_id: 'acme/ops',
+      record_types: ['observation'],
+      temporal_bias: 'upcoming',
+      limit: 10,
+    });
+    expect(upcomingRes.results.map((r) => r.id)).toEqual(['obs-future-launch', 'obs-past-launch']);
+  });
 });

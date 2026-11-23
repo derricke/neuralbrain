@@ -35,10 +35,16 @@ describe('db migrations, entities/edges DDL, and FTS5 sync', () => {
     expect(colNames('notes')).toEqual(
       expect.arrayContaining(['user_id', 'agent_id', 'event_at', 'valid_from', 'valid_until'])
     );
-    expect(colNames('observations')).toEqual(expect.arrayContaining(['user_id', 'agent_id']));
-    expect(colNames('observations_archive')).toEqual(
-      expect.arrayContaining(['user_id', 'agent_id'])
+    expect(colNames('observations')).toEqual(
+      expect.arrayContaining(['user_id', 'agent_id', 'event_at'])
     );
+    expect(colNames('observations_archive')).toEqual(
+      expect.arrayContaining(['user_id', 'agent_id', 'event_at'])
+    );
+    const obsIndexes = (
+      db.prepare(`PRAGMA index_list(observations)`).all() as Array<{ name: string }>
+    ).map((i) => i.name);
+    expect(obsIndexes).toContain('idx_obs_event_at');
     expect(colNames('trajectories')).toEqual(expect.arrayContaining(['user_id', 'agent_id']));
     expect(colNames('trajectory_archive')).toEqual(
       expect.arrayContaining(['user_id', 'agent_id'])
@@ -429,10 +435,33 @@ describe('db migrations, entities/edges DDL, and FTS5 sync', () => {
     ).toEqual([{ record_id: 'leg-act' }]);
 
     // Rebuilt tables accept new enum/CHECK values and triggers survive rebuilds
+    const migratedObsCols = (
+      db.prepare(`PRAGMA table_info(observations)`).all() as Array<{ name: string }>
+    ).map((c) => c.name);
+    const migratedObsArcCols = (
+      db.prepare(`PRAGMA table_info(observations_archive)`).all() as Array<{ name: string }>
+    ).map((c) => c.name);
+    expect(migratedObsCols).toContain('event_at');
+    expect(migratedObsArcCols).toContain('event_at');
+    const migratedObsIndexes = (
+      db.prepare(`PRAGMA index_list(observations)`).all() as Array<{ name: string }>
+    ).map((i) => i.name);
+    expect(migratedObsIndexes).toContain('idx_obs_event_at');
+
+    // Pre-existing observation preserves NULL event_at
+    const legacyObsRow = db
+      .prepare(`SELECT event_at FROM observations WHERE id = 'leg-obs'`)
+      .get() as { event_at: string | null };
+    expect(legacyObsRow.event_at).toBeNull();
+
     db.prepare(
-      `INSERT INTO observations (id, scope, project_id, kind, input)
-       VALUES ('post-obs', 'project', 'example-org/app', 'response', 'post-migration response')`
+      `INSERT INTO observations (id, scope, project_id, kind, input, event_at)
+       VALUES ('post-obs', 'project', 'example-org/app', 'response', 'post-migration response', '2025-03-10T12:00:00.000Z')`
     ).run();
+    const postObsRow = db
+      .prepare(`SELECT event_at FROM observations WHERE id = 'post-obs'`)
+      .get() as { event_at: string | null };
+    expect(postObsRow.event_at).toBe('2025-03-10T12:00:00.000Z');
     expect(
       db.prepare(`SELECT record_id FROM fts_observations WHERE fts_observations MATCH 'response'`).all()
     ).toEqual([{ record_id: 'post-obs' }]);

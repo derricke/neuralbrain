@@ -39,7 +39,8 @@ The hot path. Accepts one observation or a batch.
     "input": "...",
     "output": "...",
     "duration_ms": 412,
-    "failed": 0
+    "failed": 0,
+    "event_at": "2026-05-01T14:30:00.000Z"
   }]
 }
 ```
@@ -47,6 +48,8 @@ The hot path. Accepts one observation or a batch.
 `201` → `{"accepted": 1, "ids": ["obs_..."], "rejected": []}`
 
 **Rules this endpoint must obey:**
+
+- **Optional `event_at` timestamp.** Accepts an ISO-8601 date/time string (normalized to UTC ISO-8601) or finite numeric Unix epoch seconds. Omitted, `null`, or empty string stores `NULL`. Malformed values are dead-lettered as `schema_invalid`. Used by `/search` `after`/`before` and `temporal_bias` (falling back to `created_at` when `NULL`).
 
 - **Exempt from rate limiting.** Hook-driven capture exceeds 100/min in seconds,
   and rule 3 forbids rejecting a write for volume.

@@ -288,10 +288,11 @@ describe('trajectoryStore', () => {
     const oldTimestamp = Math.floor(Date.now() / 1000) - 35 * 86400; // 35 days ago
 
     const obsId = 'obs-old-1';
+    const obsEventAt = '2024-06-15T09:30:00.000Z';
     db.prepare(`
-      INSERT INTO observations (id, scope, project_id, user_id, agent_id, kind, input, created_at)
-      VALUES (?, 'project', 'proj-archive', 'u-obs', 'a-obs', 'response', 'old resp', ?)
-    `).run(obsId, oldTimestamp);
+      INSERT INTO observations (id, scope, project_id, user_id, agent_id, kind, input, event_at, created_at)
+      VALUES (?, 'project', 'proj-archive', 'u-obs', 'a-obs', 'response', 'old resp', ?, ?)
+    `).run(obsId, obsEventAt, oldTimestamp);
 
     // 1. Project-scoped old trajectory
     const idProject = randomUUID();
@@ -315,13 +316,14 @@ describe('trajectoryStore', () => {
     expect(getTrajectory(idUnknown)).toBeUndefined();
 
     const arcObs = db
-      .prepare('SELECT original_observation_id, user_id, agent_id, kind FROM observations_archive WHERE original_observation_id = ?')
-      .get(obsId) as { original_observation_id: string; user_id: string | null; agent_id: string | null; kind: string } | undefined;
+      .prepare('SELECT original_observation_id, user_id, agent_id, kind, event_at FROM observations_archive WHERE original_observation_id = ?')
+      .get(obsId) as { original_observation_id: string; user_id: string | null; agent_id: string | null; kind: string; event_at: string | null } | undefined;
     expect(arcObs).toEqual({
       original_observation_id: obsId,
       user_id: 'u-obs',
       agent_id: 'a-obs',
       kind: 'response',
+      event_at: obsEventAt,
     });
 
     const arcProject = db

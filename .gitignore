@@ -23,3 +23,8 @@ data/.session-secret
 skills-lock.json
 BRANDING.md
 
+
+# graphify knowledge graph output
+graphify-out/
+.agents/rules/graphify.md
+.agents/workflows/graphify.md

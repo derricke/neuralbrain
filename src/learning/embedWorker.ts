@@ -257,6 +257,7 @@ export async function drainEmbedQueue(
               file_path: obs.file_path,
               agent: obs.agent,
               success: obs.failed === 0,
+              event_at: obs.event_at ?? null,
               created_at: obs.created_at,
               text,
             };
@@ -322,6 +323,7 @@ export async function drainEmbedQueue(
               file_path: null,
               agent: note.author,
               success: null,
+              event_at: note.event_at ?? null,
               created_at: note.created_at,
               text,
             };

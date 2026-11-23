@@ -4,6 +4,7 @@ import { logger } from '../lib/logger';
 import { enqueueForEmbedding } from './embedQueueStore';
 import { recordDeadLetter } from './deadLetterStore';
 import { buildHierarchicalScopeSql, resolveScope } from '../lib/scope';
+import { normalizeUtcIso } from '../lib/recurrence';
 import { redactOptional } from '../lib/redactSecrets';
 import { transaction } from '../lib/sqlite';
 
@@ -27,6 +28,7 @@ export interface ObservationRecord {
   output: string | null;
   duration_ms: number;
   failed: number;
+  event_at: string | null;
   created_at: number;
   archived_at: number | null;
 }
@@ -58,6 +60,7 @@ interface ValidatedObservation {
   output: string | null;
   durationMs: number;
   failed: number;
+  eventAt: string | null;
   createdAt: number;
 }
 
@@ -134,6 +137,31 @@ function validateObservationItem(
   const input = raw.input !== undefined && raw.input !== null ? redactOptional(String(raw.input)) : null;
   const output = raw.output !== undefined && raw.output !== null ? redactOptional(String(raw.output)) : null;
 
+  // event_at: optional ISO-8601 string (or Date) or finite numeric Unix epoch seconds
+  let eventAt: string | null = null;
+  const rawEventAt = raw.event_at !== undefined ? raw.event_at : raw.eventAt;
+  if (rawEventAt !== undefined && rawEventAt !== null) {
+    if (typeof rawEventAt === 'number') {
+      if (!Number.isFinite(rawEventAt)) {
+        return { valid: false, error: 'event_at must be a finite Unix epoch timestamp in seconds' };
+      }
+      const d = new Date(rawEventAt * 1000);
+      if (Number.isNaN(d.getTime())) {
+        return { valid: false, error: `event_at '${String(rawEventAt)}' is out of valid date range` };
+      }
+      eventAt = d.toISOString();
+    } else {
+      try {
+        eventAt = normalizeUtcIso(rawEventAt, 'event_at');
+      } catch (err) {
+        return {
+          valid: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    }
+  }
+
   const rawCreatedAt = raw.created_at ?? raw.createdAt;
   const createdAt = typeof rawCreatedAt === 'number' && Number.isFinite(rawCreatedAt)
     ? Math.floor(rawCreatedAt)
@@ -158,6 +186,7 @@ function validateObservationItem(
       output,
       durationMs,
       failed,
+      eventAt,
       createdAt,
     },
   };
@@ -197,8 +226,8 @@ export function captureObservations(rawItems: unknown[]): CaptureResult {
       INSERT INTO observations (
         id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, agent,
         kind, tool_name, file_path, input, output, duration_ms, failed,
-        created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        event_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const reactivateSessionStmt = db.prepare(`
@@ -229,6 +258,7 @@ export function captureObservations(rawItems: unknown[]): CaptureResult {
         item.output,
         item.durationMs,
         item.failed,
+        item.eventAt,
         item.createdAt
       );
       if (item.sessionId) {

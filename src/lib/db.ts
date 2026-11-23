@@ -181,6 +181,7 @@ const OBSERVATIONS_DDL = `
     output       TEXT,
     duration_ms  INTEGER NOT NULL DEFAULT 0,
     failed       INTEGER NOT NULL DEFAULT 0,     -- set by the failure hook, never inferred
+    event_at     TEXT,                           -- optional UTC ISO-8601 when event occurred
     created_at   INTEGER NOT NULL DEFAULT (unixepoch()),
     archived_at  INTEGER,
     CHECK ((scope = 'project') = (project_id IS NOT NULL))
@@ -191,6 +192,7 @@ const OBSERVATIONS_INDEX_DDL = `
   CREATE INDEX IF NOT EXISTS idx_obs_project   ON observations(project_id);
   CREATE INDEX IF NOT EXISTS idx_obs_scope     ON observations(scope);
   CREATE INDEX IF NOT EXISTS idx_obs_scope_proj ON observations(scope, project_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_obs_event_at  ON observations(scope, project_id, event_at);
   CREATE INDEX IF NOT EXISTS idx_obs_session   ON observations(session_id);
   CREATE INDEX IF NOT EXISTS idx_obs_created   ON observations(created_at);
   CREATE INDEX IF NOT EXISTS idx_obs_note      ON observations(note_ref);
@@ -219,6 +221,7 @@ const OBSERVATIONS_ARCHIVE_DDL = `
     output                  TEXT,
     duration_ms             INTEGER NOT NULL DEFAULT 0,
     failed                  INTEGER NOT NULL DEFAULT 0,
+    event_at                TEXT,
     created_at              INTEGER NOT NULL,
     archived_at             INTEGER NOT NULL,
     CHECK ((scope = 'project') = (project_id IS NOT NULL))
@@ -250,6 +253,7 @@ function alignObservationsSchema(db: Database): void {
     ensureColumns(db, table, [
       { name: 'user_id', ddl: 'TEXT' },
       { name: 'agent_id', ddl: 'TEXT' },
+      { name: 'event_at', ddl: 'TEXT' },
     ]);
 
     const row = db

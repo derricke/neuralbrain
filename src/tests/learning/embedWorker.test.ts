@@ -424,6 +424,7 @@ describe('embedWorker single-flight and re-embed yield', () => {
     expect(obsPayload).toMatchObject({
       project_ancestors: ['acme', 'acme/socials', 'acme/socials/calendar'],
       user_id: 'user-obs',
+      event_at: null,
     });
     expect(byRecordId.get('sum_1')).toMatchObject({
       record_type: 'summary',
@@ -483,5 +484,54 @@ describe('embedWorker single-flight and re-embed yield', () => {
     const actBlob = db.prepare('SELECT embedding FROM actions WHERE id = ?').get('act_reembed') as { embedding: Buffer | null };
     expect(entBlob.embedding).not.toBeNull();
     expect(actBlob.embedding).not.toBeNull();
+  });
+
+  it('includes event_at in Qdrant payloads for observations and notes while preserving created_at', async () => {
+    const note = createNote({
+      scope: 'project',
+      projectId: 'acme/ops',
+      type: 'fact',
+      title: 'Release date',
+      content: 'Scheduled release window',
+      eventAt: '2025-07-01T08:00:00Z',
+    });
+    const cap = captureObservations([
+      {
+        scope: 'project',
+        project_id: 'acme/ops',
+        kind: 'prompt',
+        input: 'Run deploy verification',
+        event_at: '2025-07-01T08:15:00Z',
+        created_at: 1751357700,
+      },
+    ]);
+    expect(cap.accepted).toBe(1);
+
+    setCustomEmbedder(async () => Array.from({ length: 512 }, () => 0.05));
+
+    const upsertedPoints: any[] = [];
+    const mockQdrant = {
+      upsert: jest.fn(async (_col: string, body: { points: any[] }) => {
+        upsertedPoints.push(...body.points);
+        return true;
+      }),
+    } as any;
+
+    const drainRes = await drainEmbedQueue({ target: 'live', batchSize: 10, client: mockQdrant });
+    expect(drainRes.failed).toBe(0);
+    expect(drainRes.remaining).toBe(0);
+
+    const byRecordId = new Map(upsertedPoints.map((p) => [p.payload.record_id, p.payload]));
+    expect(byRecordId.get(note.id)).toMatchObject({
+      record_type: 'note',
+      event_at: '2025-07-01T08:00:00.000Z',
+    });
+    expect(typeof byRecordId.get(note.id).created_at).toBe('number');
+
+    expect(byRecordId.get(cap.ids[0])).toMatchObject({
+      record_type: 'observation',
+      event_at: '2025-07-01T08:15:00.000Z',
+      created_at: 1751357700,
+    });
   });
 });

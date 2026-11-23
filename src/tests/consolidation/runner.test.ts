@@ -104,6 +104,7 @@ describe('vendor-driven consolidation run', () => {
           output: 'y'.repeat(50),
           duration_ms: 1,
           failed: 0,
+          event_at: null,
           created_at: 1,
           archived_at: null,
         },

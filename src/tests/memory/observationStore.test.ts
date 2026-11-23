@@ -201,4 +201,87 @@ describe('observationStore', () => {
     expect(failedList).toHaveLength(1);
     expect(failedList[0].session_id).toBe('sess-1');
   });
+
+  it('validates and persists event_at (ISO-8601, numeric epoch seconds, null/omitted, and dead-letters invalid)', () => {
+    const result = captureObservations([
+      // 0: ISO-8601 with timezone offset -> normalized to UTC ISO
+      {
+        scope: 'project',
+        project_id: 'event-proj',
+        kind: 'prompt',
+        input: 'ISO with offset',
+        event_at: '2023-05-30T10:00:00-05:00',
+      },
+      // 1: camelCase eventAt with numeric Unix epoch seconds
+      {
+        scope: 'project',
+        project_id: 'event-proj',
+        kind: 'response',
+        output: 'Numeric epoch',
+        eventAt: 1685404800, // 2023-05-30T00:00:00.000Z
+      },
+      // 2: explicit null
+      {
+        scope: 'project',
+        project_id: 'event-proj',
+        kind: 'prompt',
+        input: 'Null event_at',
+        event_at: null,
+      },
+      // 3: empty string -> stored as null
+      {
+        scope: 'project',
+        project_id: 'event-proj',
+        kind: 'prompt',
+        input: 'Empty event_at',
+        event_at: '   ',
+      },
+      // 4: omitted -> stored as null
+      {
+        scope: 'project',
+        project_id: 'event-proj',
+        kind: 'prompt',
+        input: 'Omitted event_at',
+      },
+      // 5: invalid ISO string -> dead-lettered as schema_invalid
+      {
+        scope: 'project',
+        project_id: 'event-proj',
+        kind: 'prompt',
+        input: 'Bad string',
+        event_at: 'not-a-timestamp',
+      },
+      // 6: non-finite number -> dead-lettered as schema_invalid
+      {
+        scope: 'project',
+        project_id: 'event-proj',
+        kind: 'prompt',
+        input: 'NaN epoch',
+        event_at: Number.NaN,
+      },
+      // 7: invalid type (boolean) -> dead-lettered as schema_invalid
+      {
+        scope: 'project',
+        project_id: 'event-proj',
+        kind: 'prompt',
+        input: 'Boolean event_at',
+        event_at: true,
+      },
+    ]);
+
+    expect(result.accepted).toBe(5);
+    expect(result.rejected).toHaveLength(3);
+    expect(result.rejected.map((r) => r.index)).toEqual([5, 6, 7]);
+    expect(result.rejected.every((r) => r.reason === 'schema_invalid')).toBe(true);
+
+    expect(getObservation(result.ids[0])?.event_at).toBe('2023-05-30T15:00:00.000Z');
+    expect(getObservation(result.ids[1])?.event_at).toBe('2023-05-30T00:00:00.000Z');
+    expect(getObservation(result.ids[2])?.event_at).toBeNull();
+    expect(getObservation(result.ids[3])?.event_at).toBeNull();
+    expect(getObservation(result.ids[4])?.event_at).toBeNull();
+
+    const deadLetters = listDeadLetters({ source: 'capture' });
+    expect(deadLetters).toHaveLength(3);
+    expect(deadLetters.every((dl) => dl.reason === 'schema_invalid')).toBe(true);
+  });
 });
