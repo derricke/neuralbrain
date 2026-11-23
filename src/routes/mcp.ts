@@ -66,7 +66,7 @@ function validateScopeAndProject(
       error: {
         code: 'SCHEMA_INVALID',
         message:
-          "SCHEMA_INVALID: project_id is required when scope is 'project' (use the project root folder name, e.g. 'neuralbrain' — from .brainrc or the git repo root, not a subfolder or filesystem path)",
+          "SCHEMA_INVALID: project_id is required when scope is 'project' (use the project_id in .brainrc if present, else the git repo root folder name, e.g. 'neuralbrain' or 'acme/socials/calendar', not a subfolder or filesystem path)",
       },
     };
   }

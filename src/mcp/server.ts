@@ -28,7 +28,7 @@ export const MCP_INSTRUCTIONS = [
   'surface unfinished work, blockers, or scheduled follow-ups (due_at, remind_at, recurrence, snooze_until) via brain_action_add / brain_action_update and check overdue items with brain_action_due',
   'call brain_session_end at session completion or pause to record a clean cross-agent handoff summary',
   'pass scope: "unknown" rather than guessing',
-  'for project scope, project_id is the project root folder name or hierarchical slash-path slug (e.g. "neuralbrain" or "acme/socials/calendar", from .brainrc, else the git repo root — the main repo for a worktree — else the folder the session started in), lowercase, never a filesystem path, so all agents come up with the same id; child subprojects automatically inherit parent project context while isolating sibling subprojects',
+  'for project scope, project_id is the project_id configured in .brainrc / .brain.json if present (that value wins over the folder name and may be a flat slug like "neuralbrain" or a hierarchical slash-path slug like "acme/socials/calendar"), otherwise the lowercase name of the git repo root (the main repo for a worktree), otherwise the folder the session started in — never a subfolder or filesystem path, so all agents come up with the same id; child subprojects automatically inherit parent project context while isolating sibling subprojects',
 ].join('\n');
 
 function validateScopeAndProject(
@@ -51,7 +51,7 @@ function validateScopeAndProject(
       error: {
         code: 'SCHEMA_INVALID',
         message:
-          "SCHEMA_INVALID: project_id is required when scope is 'project' (use the project root folder name, e.g. 'neuralbrain' — from .brainrc or the git repo root, not a subfolder or filesystem path)",
+          "SCHEMA_INVALID: project_id is required when scope is 'project' (use the project_id in .brainrc if present, else the git repo root folder name, e.g. 'neuralbrain' or 'acme/socials/calendar', not a subfolder or filesystem path)",
       },
     };
   }
