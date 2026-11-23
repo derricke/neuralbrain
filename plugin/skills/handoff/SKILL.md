@@ -26,7 +26,7 @@ Cross-agent handoffs fail when agents guess what was left unfinished. `brain_ses
 ## Workflow
 
 ### Resuming (default)
-1. Resolve canonical `project_id` from `.brainrc`, else the git repo root folder name (main repo for worktrees), never a subfolder (or use `$ARGUMENTS` if a slug was given).
+1. Resolve canonical `project_id`: use the `project_id` set in `.brainrc` / `.brain.json` if present (it wins over the folder name), else the git repo root folder name (main repo for worktrees), never a subfolder or filesystem path (or use `$ARGUMENTS` if a slug was given).
 2. Call `brain_sessions` (`mode: "list"`, `project_id`, `limit: 5`). Pick the most recent relevant session (`completed` or `paused` preferred over `abandoned`). Optionally call `brain_sessions` with `mode: "get"` or `"replay"` on that `session_id` for full details.
 3. Call `brain_action_list` (`project_id`, `status: "ready"`, and also check `"blocked"` if needed).
 4. If the session has no summary, call `brain_search` with `record_types: ["summary", "note"]` for that `project_id`.

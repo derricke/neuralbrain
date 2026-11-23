@@ -1,8 +1,15 @@
 # Neuralbrain
 
-A memory service for coding agents. It runs on your machine, stores everything in SQLite, and talks to Claude Code, Claude Desktop, Antigravity and Cursor over HTTP and MCP.
+A memory service for all agents. It runs on your machine, stores everything in SQLite, and talks to Claude Code, Claude Desktop, Antigravity and Cursor over HTTP and MCP.
 
 It started as the memory subsystem of NeuralSwarm, my agent orchestrator. That version was scoped to swarms, roles and LLM providers. This one is scoped to projects, notes and tasks, so any agent can use it.
+
+# Benchmarks
+| Benchmark | Score (`top_50`) | Avg Tokens | Latency p50 / p95 | 
+| --- | :---: | ---: | ---: |
+| LoCoMo Full (1,540 Qs) | 89.9% | ~2.3K | 59ms / 82ms |
+| LongMemEval Full (500 Qs) |	72.2% | ~11.3K | 33.9ms / 43.6ms |
+
 
 ## Why I built it
 

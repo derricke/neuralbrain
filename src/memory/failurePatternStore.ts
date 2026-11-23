@@ -44,6 +44,23 @@ export function sanitizeErrorText(raw: unknown): string {
   return text || 'Unknown error';
 }
 
+const TRANSIENT_FAILURE_PATTERNS: RegExp[] = [
+  /\bMCP error -32602\b/i,
+  /\bInput validation error\b/i,
+  /\bInvalid arguments for tool\b/i,
+  /\b(SCHEMA_INVALID|SCOPE_REQUIRED)\b/,
+  /\bfile does not exist\b/i,
+  /\bno such file or directory\b/i,
+];
+
+/**
+ * Returns true for transient agent/tool mistakes (schema validation errors,
+ * missing-file probes) that should not be persisted or surfaced as failure patterns.
+ */
+export function isTransientFailureError(errorText: string): boolean {
+  return TRANSIENT_FAILURE_PATTERNS.some((re) => re.test(errorText));
+}
+
 export interface FailurePattern {
   id: string;
   scope: FailureScope;
@@ -70,7 +87,7 @@ export function upsertFailurePattern(params: {
   session_id?: string | null;
   taskType?: string | null;
   errorText: string;
-}): string {
+}): string | null {
   const { scope } = params;
   const taskType = params.taskType?.trim() || 'unknown';
   const cleanErrorText = sanitizeErrorText(params.errorText);
@@ -88,6 +105,11 @@ export function upsertFailurePattern(params: {
     logger.error({ scope, projectId: params.projectId }, err.message);
     throw err;
   }
+
+  if (isTransientFailureError(cleanErrorText)) {
+    return null;
+  }
+
   const projectId = scoped.projectId;
 
   const db = getDb();
@@ -199,7 +221,8 @@ export function getFailurePatterns(params: {
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const limit = params.limit ?? 50;
-  queryParams.push(limit);
+  const fetchLimit = Math.max(limit * 3, limit + 20);
+  queryParams.push(fetchLimit);
 
   try {
     const rows = db
@@ -212,10 +235,13 @@ export function getFailurePatterns(params: {
       `)
       .all(...queryParams) as FailurePattern[];
 
-    return rows.map((row) => ({
-      ...row,
-      match_tier: classifyMatchTier(row.scope, row.project_id, scopeSql.normalizedProjectId).match_tier,
-    }));
+    return rows
+      .filter((row) => !isTransientFailureError(row.error_text))
+      .slice(0, limit)
+      .map((row) => ({
+        ...row,
+        match_tier: classifyMatchTier(row.scope, row.project_id, scopeSql.normalizedProjectId).match_tier,
+      }));
   } catch (error) {
     logger.error(
       {

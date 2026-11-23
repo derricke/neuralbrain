@@ -43,9 +43,9 @@ function pathRejectionError(trimmed: string): ProjectIdResult {
     ok: false,
     error:
       `project_id '${trimmed}' looks like a path. Send a stable identifier ` +
-      `(e.g. 'neuralbrain' or 'acme/app'), not a filesystem path: use the project root ` +
-      `folder name (from .brainrc, else the git repo root; the main repo for a worktree), ` +
-      `never a subfolder, so all agents come up with the same id.`,
+      `(e.g. 'neuralbrain' or 'acme/app'), not a filesystem path: use the project_id ` +
+      `set in .brainrc (which wins over the folder name), else the project root folder ` +
+      `name (git repo root; main repo for a worktree), never a subfolder, so all agents come up with the same id.`,
   };
 }
 

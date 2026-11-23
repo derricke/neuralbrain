@@ -41,7 +41,7 @@ Hooks capture tool calls and prompts automatically as raw observations, without 
 
 1. **Task start**: Review any `CRITICAL WARNINGS` or startup context from `SessionStart`. Call `brain_recent_failures` and `brain_search` for non-trivial work. Include `"summary"` in `record_types` when resuming a file or debugging a recurring error.
 2. **Mid-task**: Use `brain_search` with `file_path` before editing unfamiliar modules, and `brain_action_list` to check open Next Actions.
-3. **Decision / resolution**: Call `brain_save` immediately when a bug root cause, architectural choice, gotcha, or user correction occurs. Always pass explicit `scope` (`"project"` with canonical `project_id` (project root folder name, not a subfolder), `"global"`, or `"unknown"`).
+3. **Decision / resolution**: Call `brain_save` immediately when a bug root cause, architectural choice, gotcha, or user correction occurs. Always pass explicit `scope` (`"project"` with canonical `project_id` — `.brainrc` `project_id` if set, else project root folder name, never a subfolder or filesystem path — `"global"`, or `"unknown"`).
 4. **Session handoff**: Use `brain_action_add` for unfinished follow-ups and `brain_session_end` when wrapping up a tracked session.
 5. **Consolidation**: If `CONSOLIDATION REMINDER` appears, tell the user and suggest running consolidation in a fresh session via `brain_consolidate_candidates` and `brain_submit_summary` (see [REFERENCE.md](REFERENCE.md)).
 
@@ -49,7 +49,7 @@ Hooks capture tool calls and prompts automatically as raw observations, without 
 
 WRONG: Batch-save a vague summary at session end, omit `scope`, or pass a full filesystem path as `project_id`.
 
-RIGHT: Save at the moment of resolution with explicit `scope`, canonical `project_id` (from `.brainrc`, else the git repo root folder — main repo for worktrees — never a subfolder), specific `concepts`, and real `files`.
+RIGHT: Save at the moment of resolution with explicit `scope`, canonical `project_id` (the `project_id` in `.brainrc` / `.brain.json` if set, which wins over the folder name; else the git repo root folder — main repo for worktrees — never a subfolder), specific `concepts`, and real `files`.
 
 ## Checklist
 

@@ -22,7 +22,7 @@ Only summarize sessions, summaries, and actions returned by the tools. An empty 
 
 ## Workflow
 
-1. Resolve canonical `project_id` from `.brainrc`, else the git repo root folder name (main repo for worktrees), never a subfolder.
+1. Resolve canonical `project_id`: use the `project_id` set in `.brainrc` / `.brain.json` if present (it wins over the folder name), else the git repo root folder name (main repo for worktrees), never a subfolder or filesystem path.
 2. Parse `$ARGUMENTS`:
    - `today` = current local date
    - `this week` = last 7 days

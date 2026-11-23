@@ -47,7 +47,7 @@ Notes are never auto-deleted and never carry `importance` or `confidence` scores
    - **Lesson**: One imperative rule (what to do or avoid, trigger situation, and consequence). Strip incident storytelling.
    - Redact all API keys, tokens, passwords, and credentials.
 3. Set `scope` explicitly (never guess or default):
-   - `"project"` with canonical `project_id` (from `.brainrc`, else the git repo root folder name — main repo for worktrees — lowercase; never a subfolder or filesystem path; if ambiguous use `"unknown"`).
+   - `"project"` with canonical `project_id` (`project_id` set in `.brainrc` / `.brain.json` wins over the folder name; else the git repo root folder name — main repo for worktrees — lowercase; never a subfolder or filesystem path; if ambiguous use `"unknown"`).
    - `"global"` strictly for universal cross-project truths.
    - `"unknown"` when scope is genuinely unclear.
 4. Add 2–5 specific lowercased `concepts` and real repo-relative `files`. If updating an older note, pass `supersedes: "<old_note_id>"`.
@@ -61,7 +61,7 @@ RIGHT: Use explicit `scope: "project"` + canonical `project_id` (or `"unknown"` 
 
 ## Checklist
 
-- Explicit `scope` provided (`project`, `global`, or `unknown`); `project_id` is the project root folder slug, not a subfolder or path.
+- Explicit `scope` provided (`project`, `global`, or `unknown`); `project_id` matches `.brainrc` (if set) or the project root folder slug, not a subfolder or filesystem path.
 - Lessons are framed as imperative rule + trigger + consequence.
 - No secrets or credentials in `title` or `content`.
 - 2–5 specific `concepts` and real `files` included; `supersedes` used for updates.

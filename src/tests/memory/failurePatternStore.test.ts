@@ -185,4 +185,49 @@ describe('failurePatternStore', () => {
       'Root workspace build error',
     ]);
   });
+
+  it('skips and filters transient MCP schema validation and missing-file errors', () => {
+    const schemaId = upsertFailurePattern({
+      scope: 'project',
+      projectId: 'proj-filter',
+      taskType: 'unknown',
+      errorText:
+        'MCP error -32602: Input validation error: Invalid arguments for tool brain_search: [ { "expected": "string", "path": [ "q" ] } ]',
+    });
+    const missingFileId = upsertFailurePattern({
+      scope: 'project',
+      projectId: 'proj-filter',
+      taskType: 'unknown',
+      errorText: 'file does not exist',
+    });
+    const enoentId = upsertFailurePattern({
+      scope: 'project',
+      projectId: 'proj-filter',
+      taskType: 'unknown',
+      errorText: 'ENOENT: no such file or directory, open "/tmp/nope"',
+    });
+    const realId = upsertFailurePattern({
+      scope: 'project',
+      projectId: 'proj-filter',
+      taskType: 'build',
+      errorText: 'TypeError: Cannot read properties of undefined',
+    });
+
+    expect(schemaId).toBeNull();
+    expect(missingFileId).toBeNull();
+    expect(enoentId).toBeNull();
+    expect(realId).not.toBeNull();
+
+    // Even if legacy transient rows exist in SQLite, getFailurePatterns filters them out
+    getDb()
+      .prepare(
+        `INSERT INTO failure_patterns (id, scope, project_id, task_type, error_text, count, first_seen_at, last_seen_at)
+         VALUES (?, 'project', 'proj-filter', 'unknown', ?, 9, unixepoch(), unixepoch())`
+      )
+      .run('legacy-transient-1', 'file does not exist');
+
+    const patterns = getFailurePatterns({ projectId: 'proj-filter', includeGlobal: false });
+    expect(patterns).toHaveLength(1);
+    expect(patterns[0].error_text).toBe('TypeError: Cannot read properties of undefined');
+  });
 });

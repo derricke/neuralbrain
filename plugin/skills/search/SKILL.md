@@ -26,7 +26,7 @@ Only report what the tools actually returned. An empty result, timeout, or `"deg
 
 ## Workflow
 
-1. Resolve the canonical `project_id` from `.brainrc`, else the git repo root folder name (main repo for worktrees), lowercase (never a subfolder or full filesystem path). Omit `project_id` only if the user asks for global-only results.
+1. Resolve the canonical `project_id`: use the `project_id` set in `.brainrc` / `.brain.json` if present (it wins over the folder name), else the git repo root folder name (main repo for worktrees), lowercase (never a subfolder or full filesystem path). Omit `project_id` only if the user asks for global-only results.
 2. Choose `record_types`:
    - Default `["note", "trajectory"]` for general decisions, facts, lessons, and outcomes.
    - Include `"summary"` (`["note", "trajectory", "summary"]`) when resuming work on a file, checking `files_touched`, or debugging recurring `error_verbatim`.
