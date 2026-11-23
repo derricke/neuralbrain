@@ -2437,6 +2437,29 @@ tr.row-highlight {
   color: var(--text-primary);
 }
 
+tr.project-row-expandable {
+  cursor: pointer;
+}
+
+tr.project-row-expandable:hover td {
+  background: var(--bg-elevated, rgba(255, 255, 255, 0.03));
+}
+
+.project-expand-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  flex-shrink: 0;
+  user-select: none;
+}
+
+tr.project-row-expandable:hover .project-expand-toggle {
+  color: var(--text-primary);
+}
+
 .external-ref-row {
   display: flex;
   align-items: center;

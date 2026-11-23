@@ -174,6 +174,8 @@ describe('Web Operator Dashboard & UI Route Tests', () => {
       expect(res.text).toContain('.external-ref-link');
       expect(res.text).toContain('.project-hierarchy-cell');
       expect(res.text).toContain('.project-prefix-badge');
+      expect(res.text).toContain('.project-row-expandable');
+      expect(res.text).toContain('.project-expand-toggle');
     });
 
     it('GET /dashboard/app.js serves JavaScript with security headers', async () => {
@@ -203,6 +205,10 @@ describe('Web Operator Dashboard & UI Route Tests', () => {
 
       // Hierarchical memory, due actions, entities, and safe external_ref handling
       expect(res.text).toContain('createMatchTierBadge');
+      expect(res.text).toContain('buildProjectTree');
+      expect(res.text).toContain('renderProjectsTableBody');
+      expect(res.text).toContain('project-children-badge');
+      expect(res.text).not.toContain("createBadge('L' + depth");
       expect(res.text).toContain('createSafeExternalRefNode');
       expect(res.text).toContain('openActionModal');
       expect(res.text).toContain('openAddEntityModal');

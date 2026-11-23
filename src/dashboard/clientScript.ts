@@ -15,6 +15,7 @@ export const dashboardJs = `
   let graphData = null;
   let selectedGraphNodeId = null;
   let isReembedding = false;
+  const expandedProjectIds = new Set();
   const tabHistoryStack = ['overview'];
   const tabDisplayNames = {
     overview: 'Overview',
@@ -1404,6 +1405,9 @@ export const dashboardJs = `
     const projectsContainer = document.getElementById('projectsTableContainer');
     if (projectsContainer && statsData.projects) {
       projectsContainer.replaceChildren();
+      const projectRoots = buildProjectTree(statsData.projects);
+      const tbody = el('tbody', {});
+      renderProjectsTableBody(tbody, projectRoots);
       const table = el('table', { className: 'data-table' },
         el('thead', {},
           el('tr', {},
@@ -1416,60 +1420,180 @@ export const dashboardJs = `
             el('th', {}, 'Actions')
           )
         ),
-        el('tbody', {},
-          ...statsData.projects.map((proj) => {
-            const entCount = Number(proj.entities_count) || 0;
-            const totalGrains = (proj.notes_count || 0) + (proj.trajectories_count || 0) + (proj.observations_count || 0) + entCount;
-            const segments = String(proj.project_id || '').split('/').filter(Boolean);
-            const depth = Math.max(1, segments.length);
-            const projCellChildren = [];
-            if (depth > 1) {
-              projCellChildren.push(
-                el('span', {
-                  className: 'project-hierarchy-indent',
-                  style: { marginLeft: ((depth - 2) * 12) + 'px' }
-                })
-              );
-              projCellChildren.push(
-                el('strong', { className: 'text-mono' },
-                  el('span', { className: 'project-prefix-badge', textContent: segments.slice(0, -1).join('/') + '/' }),
-                  el('span', { className: 'project-segment-leaf', textContent: segments[segments.length - 1] })
-                )
-              );
-            } else {
-              projCellChildren.push(
-                el('strong', { className: 'text-mono', style: { color: 'var(--text-primary)' } }, proj.project_id)
-              );
-            }
-            projCellChildren.push(createBadge('L' + depth, 'subtle', true));
-
-            return el('tr', {},
-              el('td', {}, el('div', { className: 'project-hierarchy-cell' }, ...projCellChildren)),
-              el('td', {}, el('span', { className: 'code-pill' }, String(proj.notes_count))),
-              el('td', {}, el('span', { className: 'code-pill' }, String(proj.trajectories_count))),
-              el('td', {}, el('span', { className: 'code-pill' }, String(proj.observations_count))),
-              el('td', {}, el('span', { className: 'code-pill' }, String(entCount))),
-              el('td', {}, el('span', { className: 'badge badge-subtle badge-mono' }, String(totalGrains))),
-              el('td', {},
-                el('button', {
-                  type: 'button',
-                  className: 'btn hit-slop',
-                  style: { height: '28px', padding: '0 10px', fontSize: '12px' },
-                  onClick: () => {
-                    switchTab('notes');
-                    const projInput = document.getElementById('notesFilterProject');
-                    if (projInput) projInput.value = proj.project_id;
-                    const scopeSelect = document.getElementById('notesFilterScope');
-                    if (scopeSelect) scopeSelect.value = 'project';
-                    applyNotesFilter();
-                  }
-                }, 'Explore Notes')
-              )
-            );
-          })
-        )
+        tbody
       );
       projectsContainer.appendChild(table);
+    }
+  }
+
+  function buildProjectTree(projects) {
+    const nodeMap = new Map();
+    const ensureNode = (projectId) => {
+      if (nodeMap.has(projectId)) return nodeMap.get(projectId);
+      const node = {
+        project_id: projectId,
+        notes_count: 0,
+        trajectories_count: 0,
+        observations_count: 0,
+        entities_count: 0,
+        children: [],
+        totalDirect: 0,
+        totalWithChildren: 0
+      };
+      nodeMap.set(projectId, node);
+      return node;
+    };
+
+    for (const proj of projects) {
+      const pid = String(proj.project_id || '').trim();
+      if (!pid) continue;
+      const node = ensureNode(pid);
+      node.notes_count = Number(proj.notes_count) || 0;
+      node.trajectories_count = Number(proj.trajectories_count) || 0;
+      node.observations_count = Number(proj.observations_count) || 0;
+      node.entities_count = Number(proj.entities_count) || 0;
+      node.totalDirect = node.notes_count + node.trajectories_count + node.observations_count + node.entities_count;
+    }
+
+    // Synthesize any missing ancestor parent nodes
+    for (const pid of Array.from(nodeMap.keys())) {
+      const segments = pid.split('/').filter(Boolean);
+      for (let i = 1; i < segments.length; i++) {
+        ensureNode(segments.slice(0, i).join('/'));
+      }
+    }
+
+    const roots = [];
+    for (const node of nodeMap.values()) {
+      const segments = node.project_id.split('/').filter(Boolean);
+      if (segments.length > 1) {
+        const parent = nodeMap.get(segments.slice(0, -1).join('/'));
+        if (parent) {
+          parent.children.push(node);
+          continue;
+        }
+      }
+      roots.push(node);
+    }
+
+    const computeSubtreeTotals = (node) => {
+      let sum = node.totalDirect;
+      for (const child of node.children) {
+        sum += computeSubtreeTotals(child);
+      }
+      node.totalWithChildren = sum;
+      node.children.sort((a, b) => (b.totalWithChildren - a.totalWithChildren) || a.project_id.localeCompare(b.project_id));
+      return sum;
+    };
+
+    for (const root of roots) {
+      computeSubtreeTotals(root);
+    }
+    roots.sort((a, b) => (b.totalWithChildren - a.totalWithChildren) || a.project_id.localeCompare(b.project_id));
+    return roots;
+  }
+
+  function renderProjectsTableBody(tbody, roots) {
+    tbody.replaceChildren();
+
+    const appendNodeRows = (node, depth) => {
+      const segments = String(node.project_id || '').split('/').filter(Boolean);
+      const hasChildren = node.children.length > 0;
+      const isExpanded = hasChildren && expandedProjectIds.has(node.project_id);
+      const projCellChildren = [];
+
+      if (depth > 1) {
+        projCellChildren.push(
+          el('span', {
+            className: 'project-hierarchy-indent',
+            style: { marginLeft: ((depth - 2) * 12) + 'px' }
+          })
+        );
+      }
+
+      if (hasChildren) {
+        projCellChildren.push(
+          el('span', {
+            className: 'project-expand-toggle' + (isExpanded ? ' is-expanded' : ''),
+            'aria-hidden': 'true',
+            textContent: isExpanded ? '▾' : '▸'
+          })
+        );
+      }
+
+      if (depth > 1) {
+        projCellChildren.push(
+          el('strong', { className: 'text-mono' },
+            el('span', { className: 'project-prefix-badge', textContent: segments.slice(0, -1).join('/') + '/' }),
+            el('span', { className: 'project-segment-leaf', textContent: segments[segments.length - 1] })
+          )
+        );
+      } else {
+        projCellChildren.push(
+          el('strong', { className: 'text-mono', style: { color: 'var(--text-primary)' } }, node.project_id)
+        );
+      }
+
+      if (hasChildren) {
+        projCellChildren.push(
+          el('span', {
+            className: 'badge badge-subtle badge-mono project-children-badge',
+            textContent: node.children.length + (node.children.length === 1 ? ' child' : ' children')
+          })
+        );
+      }
+
+      const rowProps = hasChildren
+        ? {
+            className: 'project-row-expandable',
+            'aria-expanded': isExpanded ? 'true' : 'false',
+            onClick: () => {
+              if (expandedProjectIds.has(node.project_id)) {
+                expandedProjectIds.delete(node.project_id);
+              } else {
+                expandedProjectIds.add(node.project_id);
+              }
+              renderProjectsTableBody(tbody, roots);
+            }
+          }
+        : {};
+
+      tbody.appendChild(
+        el('tr', rowProps,
+          el('td', {}, el('div', { className: 'project-hierarchy-cell' }, ...projCellChildren)),
+          el('td', {}, el('span', { className: 'code-pill' }, String(node.notes_count))),
+          el('td', {}, el('span', { className: 'code-pill' }, String(node.trajectories_count))),
+          el('td', {}, el('span', { className: 'code-pill' }, String(node.observations_count))),
+          el('td', {}, el('span', { className: 'code-pill' }, String(node.entities_count))),
+          el('td', {}, el('span', { className: 'badge badge-subtle badge-mono' }, String(node.totalDirect))),
+          el('td', {},
+            el('button', {
+              type: 'button',
+              className: 'btn hit-slop',
+              style: { height: '28px', padding: '0 10px', fontSize: '12px' },
+              onClick: (e) => {
+                e.stopPropagation();
+                switchTab('notes');
+                const projInput = document.getElementById('notesFilterProject');
+                if (projInput) projInput.value = node.project_id;
+                const scopeSelect = document.getElementById('notesFilterScope');
+                if (scopeSelect) scopeSelect.value = 'project';
+                applyNotesFilter();
+              }
+            }, 'Explore Notes')
+          )
+        )
+      );
+
+      if (isExpanded) {
+        for (const child of node.children) {
+          appendNodeRows(child, depth + 1);
+        }
+      }
+    };
+
+    for (const root of roots) {
+      appendNodeRows(root, 1);
     }
   }
 
