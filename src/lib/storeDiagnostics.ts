@@ -104,6 +104,10 @@ export function inspectSchemaAlignment(
     const projCol = cols.get('project_id');
     if (!projCol) issues.push(`${table}.project_id missing`);
     else if (projCol.notnull !== 0) issues.push(`${table}.project_id is not nullable (notnull=1)`);
+
+    for (const col of ['event_at', 'condensed_text']) {
+      if (!cols.has(col)) issues.push(`${table}.${col} missing`);
+    }
   }
 
   for (const table of ['entities', 'entity_edges']) {

@@ -1,4 +1,13 @@
 import { getDb } from '../lib/db';
+import {
+  computeInformationDensity,
+  condenseObservation,
+  condenseText,
+  extractQueryFocusedSnippet,
+  parseQuerySignals,
+  safeUtf16Slice,
+  type ParsedQuerySignals,
+} from '../lib/condenser';
 import { logger } from '../lib/logger';
 import { normalizeUtcIso } from '../lib/recurrence';
 import {
@@ -14,17 +23,325 @@ import { verifyOrCreateStoreMeta } from './storeMeta';
 import { getQdrantClient } from './embedWorker';
 import type {
   MemoryRecordType,
+  ObservationSearchKind,
   SearchRequest,
   SearchResponse,
   SearchResultItem,
   SearchSummarySource,
+  SnippetMode,
 } from './types';
 
-const MAX_OBS_RECORD_CHARS = 2000;
+const DEFAULT_RAW_SAFETY_CAP_CHARS = 32_000;
 const MAX_SOURCE_PREVIEW_CHARS = 160;
 const MAX_ENTITY_SEEDS = 15;
 const MIN_ENTITY_DENSE_SIM = 0.55;
 const RRF_K = 60;
+
+export type QueryKindIntent = 'assistant' | 'tool' | 'general';
+
+const OBSERVATION_KINDS: readonly ObservationSearchKind[] = ['prompt', 'response', 'tool_call'];
+
+const ASSISTANT_INTENT_RE =
+  /\b(?:did you|what did you|you (?:suggest\w*|recommend\w*|say|said|mention\w*|tell|told|give|gave|advis\w*|explain\w*|list\w*|provid\w*|wrote|write|share\w*|show\w*)|your (?:recipe|advice|recommendation\w*|suggestion\w*|list|explanation|answer|response|plan|outline|summary))\b/i;
+
+const TOOL_FILE_OR_SYMBOL_RE =
+  /(?:(?:^|[\s"'`(])(?:\.{0,2}\/)?[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_./-]+|\b[a-zA-Z0-9_-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|py|rs|go|java|rb|php|sh|bash|zsh|yml|yaml|toml|sql|md|css|scss|html|lock|env|conf|ini|xml|c|cpp|h|hpp)\b|\b[a-z0-9]+_[a-z0-9_]+\b|\b[a-z]+[A-Z][a-zA-Z0-9]*\b)/;
+
+const TOOL_ERROR_OR_CLI_RE =
+  /\b(?:error|errors|failed|failure|exception|traceback|stack\s*trace|stderr|stdout|exit\s*code|command|enoent|econnrefused|eaddrinuse|eacces|etimedout|typeerror|referenceerror|syntaxerror|sqliteerror|npm|npx|jest|tsc|git|docker|kubectl|curl|grep|bash)\b/i;
+
+const INTENT_DEFAULT_KIND_WEIGHTS: Record<
+  QueryKindIntent,
+  Record<ObservationSearchKind, number>
+> = {
+  assistant: { response: 1.20, prompt: 1.0, tool_call: 0.95 },
+  tool: { tool_call: 1.18, prompt: 1.08, response: 0.95 },
+  general: { prompt: 1.15, tool_call: 1.05, response: 0.90 },
+};
+
+export function detectQueryKindIntent(q: string, hasFileFilter = false): QueryKindIntent {
+  const sample = typeof q === 'string' ? (q.length > 4_000 ? safeUtf16Slice(q, 0, 4_000) : q) : '';
+  if (sample && ASSISTANT_INTENT_RE.test(sample)) {
+    return 'assistant';
+  }
+  if (
+    hasFileFilter ||
+    (sample && (TOOL_FILE_OR_SYMBOL_RE.test(sample) || TOOL_ERROR_OR_CLI_RE.test(sample)))
+  ) {
+    return 'tool';
+  }
+  return 'general';
+}
+
+function resolveKindWeights(
+  intent: QueryKindIntent,
+  callerWeights?: Partial<Record<ObservationSearchKind, number>>
+): Record<ObservationSearchKind, number> {
+  const weights: Record<ObservationSearchKind, number> = {
+    ...INTENT_DEFAULT_KIND_WEIGHTS[intent],
+  };
+  if (callerWeights && typeof callerWeights === 'object') {
+    for (const k of OBSERVATION_KINDS) {
+      if (Object.prototype.hasOwnProperty.call(callerWeights, k)) {
+        const raw = callerWeights[k];
+        if (typeof raw === 'number' && Number.isFinite(raw)) {
+          weights[k] = Math.min(5.0, Math.max(0.1, raw));
+        }
+      }
+    }
+  }
+  return weights;
+}
+
+function resolveMaxKindShare(
+  params: SearchRequest,
+  recordTypes: MemoryRecordType[],
+  intent: QueryKindIntent,
+  limit: number
+): Partial<Record<ObservationSearchKind, number>> | null {
+  if (params.max_kind_share !== undefined && params.max_kind_share !== null) {
+    if (typeof params.max_kind_share === 'object' && !Array.isArray(params.max_kind_share)) {
+      const ownKeys = Object.keys(params.max_kind_share);
+      if (ownKeys.length === 0) {
+        return null;
+      }
+      const explicit: Partial<Record<ObservationSearchKind, number>> = {};
+      let hasAny = false;
+      for (const k of OBSERVATION_KINDS) {
+        if (Object.prototype.hasOwnProperty.call(params.max_kind_share, k)) {
+          const raw = params.max_kind_share[k];
+          if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+            explicit[k] = Math.min(1, raw);
+            hasAny = true;
+          }
+        }
+      }
+      if (hasAny) {
+        return explicit;
+      }
+    }
+  }
+
+  if (
+    recordTypes.includes('observation') &&
+    !params.filters?.kind &&
+    intent !== 'assistant' &&
+    limit >= 5
+  ) {
+    return { response: 0.6 };
+  }
+  return null;
+}
+
+function computeObservationDensityMultiplier(
+  record: Record<string, any>,
+  querySignals: ParsedQuerySignals
+): number {
+  const rawBody = [record.input, record.output].filter(Boolean).join('\n');
+  if (rawBody.length <= 800) {
+    return 1.0;
+  }
+
+  const lowerBody = rawBody.toLowerCase();
+  let matchedTerms = 0;
+  for (const tok of querySignals.contentTokens) {
+    if (lowerBody.includes(tok)) {
+      matchedTerms++;
+    }
+  }
+  const coverage =
+    querySignals.contentTokens.length > 0
+      ? matchedTerms / querySignals.contentTokens.length
+      : 0;
+
+  if (coverage >= 0.5) {
+    return 1.0;
+  }
+
+  const info = computeInformationDensity(rawBody);
+  const lowUnique = Math.max(0, (0.45 - info.uniqueContentRatio) / 0.45);
+  const highBoilerplate = Math.min(1, info.boilerplateListRatio / 0.55);
+  const lowDensity = Math.max(0, (0.38 - info.density) / 0.38);
+  const bloatSignal = Math.min(1, 0.45 * lowUnique + 0.35 * highBoilerplate + 0.20 * lowDensity);
+
+  if (bloatSignal <= 0.05) {
+    return 1.0;
+  }
+
+  const lenScale = 0.5 + 0.5 * Math.min(1, (rawBody.length - 800) / 3200);
+  const covScale = 1 - coverage;
+  const severity = Math.min(1, bloatSignal * lenScale * covScale * 1.25);
+  return Math.max(0.82, Math.min(0.95, 0.95 - 0.13 * severity));
+}
+
+function hasAnyQueryTerm(text: string | null | undefined, signals: ParsedQuerySignals): boolean {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  for (const phrase of signals.phrases) {
+    if (lower.includes(phrase)) return true;
+  }
+  for (const tok of signals.contentTokens) {
+    if (lower.includes(tok)) return true;
+  }
+  return false;
+}
+
+function allocateFieldBudgets(
+  inLen: number,
+  outLen: number,
+  inMatches: boolean,
+  outMatches: boolean,
+  totalCap: number
+): [number, number] {
+  if (inLen === 0) return [0, totalCap];
+  if (outLen === 0) return [totalCap, 0];
+  if (inLen + outLen <= totalCap) return [inLen, outLen];
+
+  const quarter = Math.max(32, Math.floor(totalCap * 0.25));
+  if (inLen <= quarter) {
+    return [inLen, Math.max(32, totalCap - inLen)];
+  }
+  if (outLen <= quarter) {
+    return [Math.max(32, totalCap - outLen), outLen];
+  }
+
+  if (outMatches && !inMatches) {
+    const inShare = Math.max(36, Math.floor(totalCap * 0.22));
+    return [inShare, Math.max(36, totalCap - inShare)];
+  }
+  if (inMatches && !outMatches) {
+    const outShare = Math.max(36, Math.floor(totalCap * 0.22));
+    return [Math.max(36, totalCap - outShare), outShare];
+  }
+
+  const inShare = Math.max(36, Math.floor(totalCap * 0.45));
+  return [inShare, Math.max(36, totalCap - inShare)];
+}
+
+function capRawField(value: string | null | undefined, cap: number): string | null {
+  if (value === null || value === undefined) return null;
+  if (value.length <= cap) return value;
+  if (cap <= 3) return safeUtf16Slice(value, 0, Math.max(0, cap));
+  return `${safeUtf16Slice(value, 0, cap - 3)}...`;
+}
+
+function formatObservationResult(
+  rawRecord: Record<string, any>,
+  q: string,
+  signals: ParsedQuerySignals,
+  snippetMode: SnippetMode,
+  explicitMaxChars?: number
+): { record: Record<string, any>; snippet: string } {
+  const obsKind = (rawRecord.kind as ObservationSearchKind) || 'tool_call';
+  const rawInput: string | null = typeof rawRecord.input === 'string' ? rawRecord.input : null;
+  const rawOutput: string | null = typeof rawRecord.output === 'string' ? rawRecord.output : null;
+  const toolPrefix = [rawRecord.tool_name, rawRecord.file_path].filter(Boolean).join(' ');
+  const combinedRaw = [
+    toolPrefix ? `[${toolPrefix}]` : '',
+    rawInput || '',
+    rawOutput || '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const previewCap = explicitMaxChars ?? (obsKind === 'prompt' ? 1000 : 600);
+
+  if (snippetMode === 'raw') {
+    const rawCap = explicitMaxChars ?? DEFAULT_RAW_SAFETY_CAP_CHARS;
+    const snippet = combinedRaw
+      ? extractQueryFocusedSnippet(combinedRaw, q, { maxChars: previewCap })
+      : '';
+    return {
+      record: {
+        ...rawRecord,
+        input: capRawField(rawInput, rawCap),
+        output: capRawField(rawOutput, rawCap),
+      },
+      snippet,
+    };
+  }
+
+  if (snippetMode === 'condensed') {
+    const maxChars = explicitMaxChars ?? 600;
+    const storedOrComputed =
+      (typeof rawRecord.condensed_text === 'string' && rawRecord.condensed_text.trim() !== ''
+        ? rawRecord.condensed_text
+        : condenseObservation({
+            kind: obsKind,
+            toolName: rawRecord.tool_name,
+            filePath: rawRecord.file_path,
+            input: rawInput,
+            output: rawOutput,
+            maxChars,
+          })) || '';
+    const snippet =
+      storedOrComputed.length <= maxChars
+        ? storedOrComputed
+        : condenseText(storedOrComputed, { kind: obsKind, maxChars });
+
+    const [inBudget, outBudget] = allocateFieldBudgets(
+      rawInput?.length ?? 0,
+      rawOutput?.length ?? 0,
+      hasAnyQueryTerm(rawInput, signals),
+      hasAnyQueryTerm(rawOutput, signals),
+      maxChars
+    );
+
+    const formattedInput =
+      rawInput === null
+        ? null
+        : rawInput.length <= inBudget && obsKind === 'prompt' && rawInput.length <= 500
+          ? rawInput
+          : condenseText(rawInput, { kind: obsKind, maxChars: Math.max(40, inBudget) });
+    const formattedOutput =
+      rawOutput === null
+        ? null
+        : rawOutput.length <= outBudget && obsKind === 'prompt' && rawOutput.length <= 500
+          ? rawOutput
+          : condenseText(rawOutput, { kind: obsKind, maxChars: Math.max(40, outBudget) });
+
+    return {
+      record: {
+        ...rawRecord,
+        input: formattedInput !== null ? capRawField(formattedInput, inBudget) : null,
+        output: formattedOutput !== null ? capRawField(formattedOutput, outBudget) : null,
+      },
+      snippet: capRawField(snippet, maxChars) || '',
+    };
+  }
+
+  // Default: 'query_focused'
+  const maxChars = previewCap;
+  const [inBudget, outBudget] = allocateFieldBudgets(
+    rawInput?.length ?? 0,
+    rawOutput?.length ?? 0,
+    hasAnyQueryTerm(rawInput, signals),
+    hasAnyQueryTerm(rawOutput, signals),
+    maxChars
+  );
+
+  const formattedInput =
+    rawInput === null
+      ? null
+      : extractQueryFocusedSnippet(rawInput, q, { maxChars: Math.max(32, inBudget) });
+  const formattedOutput =
+    rawOutput === null
+      ? null
+      : extractQueryFocusedSnippet(rawOutput, q, { maxChars: Math.max(32, outBudget) });
+
+  const snippet = combinedRaw
+    ? extractQueryFocusedSnippet(combinedRaw, q, { maxChars })
+    : '';
+
+  return {
+    record: {
+      ...rawRecord,
+      input: formattedInput,
+      output: formattedOutput,
+    },
+    snippet,
+  };
+}
 
 const SEMANTIC_NOTE_TYPES = ['fact', 'architecture', 'preference'] as const;
 const PROCEDURAL_NOTE_TYPES = ['workflow', 'pattern', 'lesson', 'bug'] as const;
@@ -39,11 +356,6 @@ const VALID_RECORD_TYPES = new Set<MemoryRecordType>([
 
 function docKey(recordType: string, id: string): string {
   return `${recordType}:${id}`;
-}
-
-function truncateObsField(value: string | null): string | null {
-  if (!value || value.length <= MAX_OBS_RECORD_CHARS) return value;
-  return `${value.slice(0, MAX_OBS_RECORD_CHARS)}...`;
 }
 
 function cosineSimilarity(a: number[], b: number[]): number {
@@ -93,7 +405,10 @@ export function buildSafeFtsQuery(q: string): string | null {
 
 function resolveEffectiveNoteTypes(params: SearchRequest): string[] | null {
   const layer = params.filters?.memory_layer;
-  const rawTypes = params.filters?.type?.filter((t) => typeof t === 'string' && t.trim() !== '');
+  const rawTypeParam = params.filters?.type;
+  const rawTypes = Array.isArray(rawTypeParam)
+    ? rawTypeParam.filter((t): t is string => typeof t === 'string' && t.trim() !== '')
+    : undefined;
 
   let layerSet: Set<string> | null = null;
   if (layer === 'semantic') {
@@ -186,7 +501,7 @@ export function buildQdrantFilter(
   }
 
   const effectiveNoteTypes = resolveEffectiveNoteTypes(params);
-  if (params.filters?.type && params.filters.type.length > 0) {
+  if (Array.isArray(params.filters?.type) && params.filters.type.length > 0) {
     const typesToFilter =
       params.filters.memory_layer && effectiveNoteTypes ? effectiveNoteTypes : params.filters.type;
     if (typesToFilter.length === 0) {
@@ -494,13 +809,8 @@ const RECORD_SPECS: Record<MemoryRecordType, RecordTypeSpec> = {
     },
     hydrate: (_db, rows) =>
       rows.map((row) => {
-        const { fts_bm25, ...rest } = row;
+        const { fts_bm25, ...record } = row;
         const text = `${row.tool_name || ''}\n${row.file_path || ''}\n${row.input || ''}\n${row.output || ''}`;
-        const record = {
-          ...rest,
-          input: truncateObsField(row.input),
-          output: truncateObsField(row.output),
-        };
         return {
           id: row.id,
           record_type: 'observation' as const,
@@ -589,7 +899,7 @@ const RECORD_SPECS: Record<MemoryRecordType, RecordTypeSpec> = {
         conditions.push('a.status = ?');
         queryParams.push(params.filters.kind.trim());
       }
-      if (params.filters?.type && params.filters.type.length > 0) {
+      if (Array.isArray(params.filters?.type) && params.filters.type.length > 0) {
         conditions.push(`a.priority IN (${params.filters.type.map(() => '?').join(',')})`);
         queryParams.push(...params.filters.type);
       }
@@ -934,16 +1244,34 @@ function computeTemporalMultiplier(
 }
 
 export async function hybridSearch(params: SearchRequest): Promise<SearchResponse> {
-  const q = params.q?.trim() || '';
-  const requestedTypes =
-    params.record_types && params.record_types.length > 0
+  const q = typeof params.q === 'string' ? params.q.trim() : '';
+  const requestedTypesRaw =
+    Array.isArray(params.record_types) && params.record_types.length > 0
       ? params.record_types
-      : params.grains;
-  const recordTypes: MemoryRecordType[] = (
-    requestedTypes && requestedTypes.length > 0 ? requestedTypes : ['note', 'trajectory']
-  ).filter((t): t is MemoryRecordType => VALID_RECORD_TYPES.has(t as MemoryRecordType));
+      : Array.isArray(params.grains) && params.grains.length > 0
+        ? params.grains
+        : typeof (params.record_types as unknown) === 'string' &&
+            (params.record_types as unknown as string).trim() !== ''
+          ? [(params.record_types as unknown as string).trim()]
+          : typeof (params.grains as unknown) === 'string' &&
+              (params.grains as unknown as string).trim() !== ''
+            ? [(params.grains as unknown as string).trim()]
+            : null;
+  const recordTypes: MemoryRecordType[] = (requestedTypesRaw ?? ['note', 'trajectory']).filter(
+    (t): t is MemoryRecordType =>
+      typeof t === 'string' && VALID_RECORD_TYPES.has(t as MemoryRecordType)
+  );
 
-  const limit = Math.min(Math.max(params.limit ?? 10, 1), 100);
+  const parsedLimit =
+    typeof params.limit === 'number'
+      ? params.limit
+      : typeof (params.limit as unknown) === 'string' &&
+          (params.limit as unknown as string).trim() !== ''
+        ? Number(params.limit)
+        : Number.NaN;
+  const limit = Number.isFinite(parsedLimit)
+    ? Math.min(Math.max(Math.trunc(parsedLimit), 1), 100)
+    : 10;
   const includeGlobal = params.include_global !== false;
   const includeAncestors = params.include_ancestors !== false;
   const includeChildren = params.include_children === true;
@@ -1224,6 +1552,20 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
   }
 
   const nowMs = Date.now();
+  const hasFileFilter = Boolean(params.filters?.file_path?.trim());
+  const intent = detectQueryKindIntent(q, hasFileFilter);
+  const kindWeights = resolveKindWeights(intent, params.kind_weights);
+  const querySignals = parseQuerySignals(q);
+  const snippetMode: SnippetMode =
+    params.snippet_mode === 'condensed' || params.snippet_mode === 'raw'
+      ? params.snippet_mode
+      : 'query_focused';
+  const explicitMaxChars =
+    typeof params.max_record_chars === 'number' &&
+    Number.isFinite(params.max_record_chars) &&
+    params.max_record_chars > 0
+      ? Math.max(32, Math.trunc(params.max_record_chars))
+      : undefined;
 
   for (const c of candidates) {
     const key = docKey(c.record_type, c.id);
@@ -1253,7 +1595,17 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
         queryProjectNorm !== null
       );
       const temporalMult = computeTemporalMultiplier(c, params, nowMs);
-      c.rrfScore = baseScore * tierMult * temporalMult;
+      let obsMult = 1.0;
+      if (c.record_type === 'observation') {
+        const obsKind = c.record.kind as ObservationSearchKind;
+        const kindMult =
+          obsKind === 'prompt' || obsKind === 'response' || obsKind === 'tool_call'
+            ? kindWeights[obsKind]
+            : 1.0;
+        const densityMult = computeObservationDensityMultiplier(c.record, querySignals);
+        obsMult = kindMult * densityMult;
+      }
+      c.rrfScore = baseScore * tierMult * temporalMult * obsMult;
     } else {
       c.rrfScore = 0;
     }
@@ -1262,19 +1614,73 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
   const matched = candidates.filter((c) => (c.rrfScore ?? 0) > 0);
   matched.sort((a, b) => (b.rrfScore ?? 0) - (a.rrfScore ?? 0));
 
-  const sliced = matched.slice(0, limit);
+  const maxKindShare = resolveMaxKindShare(params, recordTypes, intent, limit);
+  let sliced: CandidateDoc[];
+  if (!maxKindShare) {
+    sliced = matched.slice(0, limit);
+  } else {
+    const selected: CandidateDoc[] = [];
+    const deferred: CandidateDoc[] = [];
+    const countsByKind: Record<ObservationSearchKind, number> = {
+      prompt: 0,
+      response: 0,
+      tool_call: 0,
+    };
+
+    for (const c of matched) {
+      if (selected.length >= limit) break;
+      if (c.record_type === 'observation') {
+        const obsKind = c.record.kind as ObservationSearchKind;
+        const shareCap =
+          obsKind === 'prompt' || obsKind === 'response' || obsKind === 'tool_call'
+            ? maxKindShare[obsKind]
+            : undefined;
+        if (shareCap !== undefined) {
+          const maxForKind = Math.max(1, Math.floor(limit * shareCap));
+          if (countsByKind[obsKind] >= maxForKind) {
+            deferred.push(c);
+            continue;
+          }
+          countsByKind[obsKind]++;
+        }
+      }
+      selected.push(c);
+    }
+
+    if (selected.length < limit && deferred.length > 0) {
+      selected.push(...deferred.slice(0, limit - selected.length));
+      selected.sort((a, b) => (b.rrfScore ?? 0) - (a.rrfScore ?? 0));
+    }
+
+    sliced = selected;
+  }
 
   const results: SearchResultItem[] = sliced.map((c) => {
+    let recordOut = c.record;
+    let snippetOut: string | undefined;
+    if (c.record_type === 'observation') {
+      const formatted = formatObservationResult(
+        c.record,
+        q,
+        querySignals,
+        snippetMode,
+        explicitMaxChars
+      );
+      recordOut = formatted.record;
+      snippetOut = formatted.snippet;
+    }
+
     const item: SearchResultItem = {
       id: c.id,
       record_type: c.record_type,
       score: c.rrfScore ?? 0,
-      project_id: c.record.project_id ?? null,
+      project_id: recordOut.project_id ?? null,
       match_tier: c.matchTier,
       ...(c.matchedEntities && c.matchedEntities.length > 0
         ? { matched_entities: c.matchedEntities }
         : {}),
-      record: c.record,
+      ...(snippetOut !== undefined ? { snippet: snippetOut } : {}),
+      record: recordOut,
     };
     if (c.record_type === 'summary') {
       item.claims = c.claims;

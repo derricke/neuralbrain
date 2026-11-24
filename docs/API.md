@@ -108,6 +108,10 @@ and temporal bias/validity adjustments.
   "before": "2026-12-31T23:59:59Z",
   "as_of": "2026-06-01T00:00:00Z",
   "temporal_bias": "recent",
+  "snippet_mode": "query_focused",
+  "max_record_chars": 600,
+  "kind_weights": { "prompt": 1.15, "tool_call": 1.05, "response": 0.9 },
+  "max_kind_share": { "response": 0.6 },
   "filters": {
     "type": ["bug", "pattern"],
     "file_path": "src/lib/db.ts",
@@ -120,10 +124,17 @@ and temporal bias/validity adjustments.
 
 `200` → results carrying `record_type`, `score`, `project_id`, `match_tier`
 (`exact | ancestor | child | global | unknown`), optional `matched_entities`
-(when matched/boosted via `entity_edges`), `record`, and `claims` / `sources`
+(when matched/boosted via `entity_edges`), optional `snippet` (populated on
+`observation` results), `record`, and `claims` / `sources`
 for derived rows.
 
 - `record_types` supports `'note' | 'trajectory' | 'observation' | 'summary' | 'entity' | 'action'` (default `['note', 'trajectory']`; legacy `grains` alias still accepted).
+- `snippet_mode` (`'query_focused' | 'condensed' | 'raw'`, default `'query_focused'`) controls how `observation` records are windowed at read time without mutating stored `input`/`output`:
+  - `'query_focused'` (default): scans the full untruncated `input`/`output` to extract query-matching passages (joining non-adjacent spans with ` [...] `) within `max_record_chars` (default `1000` for `prompt`, `600` for `response`/`tool_call`) and populates `snippet`.
+  - `'condensed'`: uses `condensed_text` (or computes extractive condensation on the fly) capped at `max_record_chars` (default `600`).
+  - `'raw'`: returns raw `record.input` and `record.output` (respecting explicit `max_record_chars` if supplied, else 32,000-char safety bound) while still attaching a query-focused `snippet`.
+- `kind_weights` (`Partial<Record<'prompt' | 'response' | 'tool_call', number>>`, clamped to `[0.1, 5.0]`) overrides automatic query-intent observation weighting (`assistant` recall queries boost `response`, code/path/error `tool` queries boost `tool_call`, and `general` recall queries boost `prompt` while damping verbose low-density essays).
+- `max_kind_share` (`Partial<Record<'prompt' | 'response' | 'tool_call', number>>` in `(0, 1]`) caps any single observation `kind` in pass 1 (default `{ "response": 0.6 }` when searching observations with `limit >= 5`, no `filters.kind`, and non-assistant intent) and backfills in score order in pass 2 when fewer alternatives exist.
 - `include_ancestors: true` (default) inherits ancestor projects (`acme`, `acme/socials`) while isolating sibling subprojects (`acme/socials/generator`, `acme/cogs`).
 - `include_children: true` rolls up all strict descendant subprojects (`acme/*`).
 - `include_global: true` merges `scope='global'` with the named project. It

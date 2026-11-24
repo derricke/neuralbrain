@@ -6,6 +6,7 @@ import { recordDeadLetter } from './deadLetterStore';
 import { buildHierarchicalScopeSql, resolveScope } from '../lib/scope';
 import { normalizeUtcIso } from '../lib/recurrence';
 import { redactOptional } from '../lib/redactSecrets';
+import { condenseObservation } from '../lib/condenser';
 import { transaction } from '../lib/sqlite';
 
 export type ObservationScope = 'project' | 'global' | 'unknown';
@@ -26,6 +27,7 @@ export interface ObservationRecord {
   file_path: string | null;
   input: string | null;
   output: string | null;
+  condensed_text?: string | null;
   duration_ms: number;
   failed: number;
   event_at: string | null;
@@ -225,9 +227,9 @@ export function captureObservations(rawItems: unknown[]): CaptureResult {
     const insertStmt = db.prepare(`
       INSERT INTO observations (
         id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, agent,
-        kind, tool_name, file_path, input, output, duration_ms, failed,
+        kind, tool_name, file_path, input, output, condensed_text, duration_ms, failed,
         event_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const reactivateSessionStmt = db.prepare(`
@@ -241,6 +243,13 @@ export function captureObservations(rawItems: unknown[]): CaptureResult {
     // If insertSingle throws, its savepoint is rolled back without aborting the outer transaction.
     const insertSingle = transaction(db, (entry: { item: ValidatedObservation; index: number; raw: unknown }) => {
       const item = entry.item;
+      const condensedText = condenseObservation({
+        kind: item.kind,
+        toolName: item.toolName,
+        filePath: item.filePath,
+        input: item.input,
+        output: item.output,
+      });
       insertStmt.run(
         item.id,
         item.scope,
@@ -256,6 +265,7 @@ export function captureObservations(rawItems: unknown[]): CaptureResult {
         item.filePath,
         item.input,
         item.output,
+        condensedText,
         item.durationMs,
         item.failed,
         item.eventAt,

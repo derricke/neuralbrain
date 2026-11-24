@@ -213,9 +213,10 @@ const OBSERVATIONS_DDL = `
     kind         TEXT NOT NULL CHECK (kind IN ('tool_call','prompt','response')),
     tool_name    TEXT,
     file_path    TEXT,                           -- the tool's TARGET path, nothing else
-    input        TEXT,
-    output       TEXT,
-    duration_ms  INTEGER NOT NULL DEFAULT 0,
+    input          TEXT,
+    output         TEXT,
+    condensed_text TEXT,
+    duration_ms    INTEGER NOT NULL DEFAULT 0,
     failed       INTEGER NOT NULL DEFAULT 0,     -- set by the failure hook, never inferred
     event_at     TEXT,                           -- optional UTC ISO-8601 when event occurred
     created_at   INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -255,6 +256,7 @@ const OBSERVATIONS_ARCHIVE_DDL = `
     file_path               TEXT,
     input                   TEXT,
     output                  TEXT,
+    condensed_text          TEXT,
     duration_ms             INTEGER NOT NULL DEFAULT 0,
     failed                  INTEGER NOT NULL DEFAULT 0,
     event_at                TEXT,
@@ -290,6 +292,7 @@ function alignObservationsSchema(db: Database): void {
       { name: 'user_id', ddl: 'TEXT' },
       { name: 'agent_id', ddl: 'TEXT' },
       { name: 'event_at', ddl: 'TEXT' },
+      { name: 'condensed_text', ddl: 'TEXT' },
     ]);
 
     const row = db

@@ -36,10 +36,10 @@ describe('db migrations, entities/edges DDL, and FTS5 sync', () => {
       expect.arrayContaining(['user_id', 'agent_id', 'event_at', 'valid_from', 'valid_until'])
     );
     expect(colNames('observations')).toEqual(
-      expect.arrayContaining(['user_id', 'agent_id', 'event_at'])
+      expect.arrayContaining(['user_id', 'agent_id', 'event_at', 'condensed_text'])
     );
     expect(colNames('observations_archive')).toEqual(
-      expect.arrayContaining(['user_id', 'agent_id', 'event_at'])
+      expect.arrayContaining(['user_id', 'agent_id', 'event_at', 'condensed_text'])
     );
     const obsIndexes = (
       db.prepare(`PRAGMA index_list(observations)`).all() as Array<{ name: string }>
@@ -442,7 +442,9 @@ describe('db migrations, entities/edges DDL, and FTS5 sync', () => {
       db.prepare(`PRAGMA table_info(observations_archive)`).all() as Array<{ name: string }>
     ).map((c) => c.name);
     expect(migratedObsCols).toContain('event_at');
+    expect(migratedObsCols).toContain('condensed_text');
     expect(migratedObsArcCols).toContain('event_at');
+    expect(migratedObsArcCols).toContain('condensed_text');
     const migratedObsIndexes = (
       db.prepare(`PRAGMA index_list(observations)`).all() as Array<{ name: string }>
     ).map((i) => i.name);

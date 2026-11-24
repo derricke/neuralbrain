@@ -34,6 +34,10 @@ after             string   optional ISO-8601 lower bound timestamp filter
 before            string   optional ISO-8601 upper bound timestamp filter
 as_of             string   optional ISO-8601 validity filter for notes (valid_from <= as_of <= valid_until)
 temporal_bias     string   none|recent|upcoming (optional)
+snippet_mode      string   query_focused|condensed|raw (default: query_focused for observation hits)
+max_record_chars  integer  optional character cap for observation fields and snippet
+kind_weights      object   optional { prompt?, response?, tool_call? } multipliers in [0.1, 5.0]
+max_kind_share    object   optional { prompt?, response?, tool_call? } result-set share caps in (0, 1]
 entity_type       string   optional entity_type filter (e.g. brand, person, asset, metric, document, tool)
 memory_layer      string   semantic|procedural (optional note layer filter)
 type              string[] fact|architecture|pattern|workflow|bug|preference|lesson
@@ -45,7 +49,8 @@ limit             integer  default 10 (1..100)
 ```
 
 Returns records with `record_type`, `score`, `project_id`, `match_tier`, optional
-`matched_entities` (for Entity-Graph hits), and for derived rows `claims` /
+`matched_entities` (for Entity-Graph hits), optional `snippet` (query-focused or
+condensed passage preview on `observation` hits), and for derived rows `claims` /
 `sources` so the agent can verify a claim against what it cites.
 
 Surfaces `"degraded"` verbatim when vector search is unavailable. An agent must

@@ -38,6 +38,9 @@ export type MemoryRecordType =
   | 'entity'
   | 'action';
 
+export type ObservationSearchKind = 'prompt' | 'response' | 'tool_call';
+export type SnippetMode = 'query_focused' | 'condensed' | 'raw';
+
 export interface SearchRequest {
   q: string;
   /** Record types to search (replaces legacy `grains`). Defaults to ['note', 'trajectory']. */
@@ -55,6 +58,14 @@ export interface SearchRequest {
   before?: string;
   as_of?: string;
   temporal_bias?: 'none' | 'recent' | 'upcoming';
+  /** Observation snippet formatting mode (default: 'query_focused'). */
+  snippet_mode?: SnippetMode;
+  /** Optional character budget cap for observation fields and snippet. */
+  max_record_chars?: number;
+  /** Optional per-kind score multipliers overriding intent-aware defaults for observations. */
+  kind_weights?: Partial<Record<ObservationSearchKind, number>>;
+  /** Optional per-kind result-set diversity cap in (0, 1] with score-ordered backfill. */
+  max_kind_share?: Partial<Record<ObservationSearchKind, number>>;
   filters?: {
     type?: string[];
     file_path?: string;
@@ -97,6 +108,7 @@ export interface SearchResultItem {
   project_id?: string | null;
   match_tier?: MatchTier;
   matched_entities?: string[];
+  snippet?: string;
   record: Record<string, any>;
   sources?: SearchSummarySource[];
   sources_total?: number;

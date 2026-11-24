@@ -94,6 +94,10 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
     before?: string;
     as_of?: string;
     temporal_bias?: 'none' | 'recent' | 'upcoming';
+    snippet_mode?: 'query_focused' | 'condensed' | 'raw';
+    max_record_chars?: number;
+    kind_weights?: Partial<Record<'prompt' | 'response' | 'tool_call', number>>;
+    max_kind_share?: Partial<Record<'prompt' | 'response' | 'tool_call', number>>;
     entity_type?: string;
     memory_layer?: 'semantic' | 'procedural';
     type?: string[];
@@ -120,6 +124,10 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
       ...(args.before !== undefined ? { before: args.before } : {}),
       ...(args.as_of !== undefined ? { as_of: args.as_of } : {}),
       ...(args.temporal_bias !== undefined ? { temporal_bias: args.temporal_bias } : {}),
+      ...(args.snippet_mode !== undefined ? { snippet_mode: args.snippet_mode } : {}),
+      ...(args.max_record_chars !== undefined ? { max_record_chars: args.max_record_chars } : {}),
+      ...(args.kind_weights !== undefined ? { kind_weights: args.kind_weights } : {}),
+      ...(args.max_kind_share !== undefined ? { max_kind_share: args.max_kind_share } : {}),
       ...(args.sources_limit !== undefined ? { sources_limit: args.sources_limit } : {}),
       ...(args.sources_offset !== undefined ? { sources_offset: args.sources_offset } : {}),
       limit: args.limit ?? 10,
@@ -826,6 +834,35 @@ export function createBrainMcpServer(options: BrainMcpServerOptions = {}): McpSe
         .enum(['none', 'recent', 'upcoming'])
         .optional()
         .describe("Optional temporal ranking bias ('none', 'recent', or 'upcoming')"),
+      snippet_mode: z
+        .enum(['query_focused', 'condensed', 'raw'])
+        .optional()
+        .describe(
+          "Observation snippet mode: 'query_focused' (default — extracts query-matching passages from full observation text), 'condensed' (uses precomputed extractive condensed_text), or 'raw' (full raw input/output)"
+        ),
+      max_record_chars: z
+        .number()
+        .int()
+        .min(32)
+        .max(100000)
+        .optional()
+        .describe('Optional character budget cap for returned observation fields and snippet'),
+      kind_weights: z
+        .object({
+          prompt: z.number().min(0.1).max(5).optional(),
+          response: z.number().min(0.1).max(5).optional(),
+          tool_call: z.number().min(0.1).max(5).optional(),
+        })
+        .optional()
+        .describe('Optional per-kind score multipliers overriding intent-aware defaults for observations'),
+      max_kind_share: z
+        .object({
+          prompt: z.number().gt(0).max(1).optional(),
+          response: z.number().gt(0).max(1).optional(),
+          tool_call: z.number().gt(0).max(1).optional(),
+        })
+        .optional()
+        .describe('Optional maximum result-set share (0..1] per observation kind with score-ordered backfill'),
       entity_type: z
         .string()
         .optional()
