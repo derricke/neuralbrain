@@ -608,8 +608,8 @@ export function runCleanup(): CleanupResult {
   // 1. Archive observations in bounded batches (each batch in its own transaction)
   const selectObsBatch = db.prepare(`
     SELECT id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, agent,
-           kind, tool_name, file_path, input, output, condensed_text, duration_ms, failed,
-           event_at, created_at, archived_at
+           kind, tool_name, file_path, input, output, condensed_text, resolved_dates_json,
+           duration_ms, failed, event_at, created_at, archived_at
     FROM observations
     WHERE (created_at < ? AND archived_at IS NULL) OR archived_at IS NOT NULL
     LIMIT ?
@@ -618,8 +618,9 @@ export function runCleanup(): CleanupResult {
   const insertObsArchive = db.prepare(`
     INSERT OR IGNORE INTO observations_archive (
       id, original_observation_id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, agent,
-      kind, tool_name, file_path, input, output, condensed_text, duration_ms, failed, event_at, created_at, archived_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      kind, tool_name, file_path, input, output, condensed_text, resolved_dates_json,
+      duration_ms, failed, event_at, created_at, archived_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const deleteObsActive = db.prepare('DELETE FROM observations WHERE id = ?');
@@ -643,6 +644,7 @@ export function runCleanup(): CleanupResult {
         input: string | null;
         output: string | null;
         condensed_text: string | null;
+        resolved_dates_json: string | null;
         duration_ms: number;
         failed: number;
         event_at: string | null;
@@ -670,6 +672,7 @@ export function runCleanup(): CleanupResult {
           obs.input,
           obs.output,
           obs.condensed_text,
+          obs.resolved_dates_json,
           obs.duration_ms,
           obs.failed,
           obs.event_at,

@@ -93,6 +93,7 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
     after?: string;
     before?: string;
     as_of?: string;
+    reference_date?: string;
     temporal_bias?: 'none' | 'recent' | 'upcoming';
     snippet_mode?: 'query_focused' | 'condensed' | 'raw';
     max_record_chars?: number;
@@ -123,6 +124,7 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
       ...(args.after !== undefined ? { after: args.after } : {}),
       ...(args.before !== undefined ? { before: args.before } : {}),
       ...(args.as_of !== undefined ? { as_of: args.as_of } : {}),
+      ...(args.reference_date !== undefined ? { reference_date: args.reference_date } : {}),
       ...(args.temporal_bias !== undefined ? { temporal_bias: args.temporal_bias } : {}),
       ...(args.snippet_mode !== undefined ? { snippet_mode: args.snippet_mode } : {}),
       ...(args.max_record_chars !== undefined ? { max_record_chars: args.max_record_chars } : {}),
@@ -830,6 +832,12 @@ export function createBrainMcpServer(options: BrainMcpServerOptions = {}): McpSe
       after: z.string().optional().describe('ISO-8601 lower bound timestamp filter'),
       before: z.string().optional().describe('ISO-8601 upper bound timestamp filter'),
       as_of: z.string().optional().describe('ISO-8601 point-in-time validity filter for notes (valid_from <= as_of <= valid_until)'),
+      reference_date: z
+        .string()
+        .optional()
+        .describe(
+          'Optional ISO-8601 reference timestamp used to anchor relative temporal expressions in q (e.g. "four weeks ago", "last month", "in March"); defaults to current time'
+        ),
       temporal_bias: z
         .enum(['none', 'recent', 'upcoming'])
         .optional()

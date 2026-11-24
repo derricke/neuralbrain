@@ -95,7 +95,8 @@ CREATE TABLE IF NOT EXISTS observations (
   file_path      TEXT,                         -- the tool's TARGET path, nothing else
   input          TEXT,
   output         TEXT,
-  condensed_text TEXT,                         -- deterministic extractive condensation (additive)
+  condensed_text      TEXT,                    -- deterministic extractive condensation (additive)
+  resolved_dates_json TEXT,                    -- deterministic UTC relative-date annotations (additive)
   duration_ms    INTEGER NOT NULL DEFAULT 0,
   failed       INTEGER NOT NULL DEFAULT 0,     -- set by the failure hook, never inferred
   event_at     TEXT,                           -- optional UTC ISO-8601 when event occurred
@@ -118,18 +119,23 @@ CREATE INDEX IF NOT EXISTS idx_obs_failed     ON observations(failed, created_at
 
 `input`/`output` are stored **whole**. Do not truncate on the write path —
 truncating *and then* summarising the remainder away is how the ground truth gets lost.
-`condensed_text` is an additive, disposable column computed deterministically at
-ingest (`src/lib/condenser.ts`, zero generative model calls): it strips
+`condensed_text` and `resolved_dates_json` are additive, disposable columns computed
+deterministically at ingest (`src/lib/condenser.ts` and `src/lib/temporal.ts`, zero
+generative model calls): `resolveRelativeDates` anchors relative expressions
+(`yesterday`, `last Saturday`, `two weeks ago`, `last month`, etc.) in UTC against
+`event_at ?? created_at` without mutating raw `input`/`output`, persists structured
+spans in `resolved_dates_json` (`NULL` when none match), and feeds inline
+`[YYYY-MM-DD]` annotations into `condensed_text`. `condenseObservation` strips
 conversational boilerplate, deduplicates near-identical lines, preserves concise
-`prompt` observations (`<= 500` chars) verbatim, and extracts high-signal
-passages for verbose `response` and `tool_call` rows. `trg_fts_observations_au`
-is scoped to `AFTER UPDATE OF id, tool_name, file_path, input, output` so
-updating non-FTS columns never re-indexes `fts_observations`.
+`prompt` observations (`<= 500` chars), and extracts high-signal passages for
+verbose `response` and `tool_call` rows. `trg_fts_observations_au` is scoped to
+`AFTER UPDATE OF id, tool_name, file_path, input, output` so updating non-FTS
+columns never re-indexes `fts_observations`.
 `file_path` is defined narrowly: the path a tool acted on. A path merely
 mentioned in command output does not count. (Testing showed two producers
 disagreeing on this exact point with nothing to flag it.)
 
-`observations_archive` mirrors this table (including `condensed_text`) with `archived_at INTEGER NOT NULL`,
+`observations_archive` mirrors this table (including `condensed_text` and `resolved_dates_json`) with `archived_at INTEGER NOT NULL`,
 and **every column nullable that is nullable here** — in particular
 `project_id`. The inherited `trajectory_archive` had `swarm_id NOT NULL`, which
 would have made null-scope records unarchivable and broken retention for exactly

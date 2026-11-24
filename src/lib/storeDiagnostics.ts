@@ -105,7 +105,7 @@ export function inspectSchemaAlignment(
     if (!projCol) issues.push(`${table}.project_id missing`);
     else if (projCol.notnull !== 0) issues.push(`${table}.project_id is not nullable (notnull=1)`);
 
-    for (const col of ['event_at', 'condensed_text']) {
+    for (const col of ['event_at', 'condensed_text', 'resolved_dates_json']) {
       if (!cols.has(col)) issues.push(`${table}.${col} missing`);
     }
   }

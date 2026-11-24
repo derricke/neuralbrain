@@ -11,6 +11,12 @@ import {
 import { logger } from '../lib/logger';
 import { normalizeUtcIso } from '../lib/recurrence';
 import {
+  parseTemporalQueryWindow,
+  resolveRelativeDates,
+  type ParsedTemporalWindow,
+  type ResolvedDateAnnotation,
+} from '../lib/temporal';
+import {
   buildHierarchicalScopeSql,
   classifyMatchTier,
   getProjectAncestors,
@@ -230,26 +236,48 @@ function formatObservationResult(
   q: string,
   signals: ParsedQuerySignals,
   snippetMode: SnippetMode,
-  explicitMaxChars?: number
+  explicitMaxChars?: number,
+  parsedWindow?: ParsedTemporalWindow | null
 ): { record: Record<string, any>; snippet: string } {
   const obsKind = (rawRecord.kind as ObservationSearchKind) || 'tool_call';
   const rawInput: string | null = typeof rawRecord.input === 'string' ? rawRecord.input : null;
   const rawOutput: string | null = typeof rawRecord.output === 'string' ? rawRecord.output : null;
+
+  const obsAnchor: string | number | null =
+    typeof rawRecord.event_at === 'string' && rawRecord.event_at.trim() !== ''
+      ? rawRecord.event_at
+      : typeof rawRecord.created_at === 'number' && Number.isFinite(rawRecord.created_at)
+        ? rawRecord.created_at
+        : null;
+
+  const annotatedInput =
+    rawInput !== null && obsAnchor !== null
+      ? resolveRelativeDates(rawInput, obsAnchor).annotatedText
+      : rawInput;
+  const annotatedOutput =
+    rawOutput !== null && obsAnchor !== null
+      ? resolveRelativeDates(rawOutput, obsAnchor).annotatedText
+      : rawOutput;
+
   const toolPrefix = [rawRecord.tool_name, rawRecord.file_path].filter(Boolean).join(' ');
-  const combinedRaw = [
+  const combinedAnnotated = [
     toolPrefix ? `[${toolPrefix}]` : '',
-    rawInput || '',
-    rawOutput || '',
+    annotatedInput || '',
+    annotatedOutput || '',
   ]
     .filter(Boolean)
     .join('\n');
+
+  const snippetQuery = parsedWindow
+    ? `${q} ${new Date(parsedWindow.centerMs).toISOString().slice(0, 10)}`
+    : q;
 
   const previewCap = explicitMaxChars ?? (obsKind === 'prompt' ? 1000 : 600);
 
   if (snippetMode === 'raw') {
     const rawCap = explicitMaxChars ?? DEFAULT_RAW_SAFETY_CAP_CHARS;
-    const snippet = combinedRaw
-      ? extractQueryFocusedSnippet(combinedRaw, q, { maxChars: previewCap })
+    const snippet = combinedAnnotated
+      ? extractQueryFocusedSnippet(combinedAnnotated, snippetQuery, { maxChars: previewCap })
       : '';
     return {
       record: {
@@ -270,8 +298,8 @@ function formatObservationResult(
             kind: obsKind,
             toolName: rawRecord.tool_name,
             filePath: rawRecord.file_path,
-            input: rawInput,
-            output: rawOutput,
+            input: annotatedInput,
+            output: annotatedOutput,
             maxChars,
           })) || '';
     const snippet =
@@ -280,25 +308,25 @@ function formatObservationResult(
         : condenseText(storedOrComputed, { kind: obsKind, maxChars });
 
     const [inBudget, outBudget] = allocateFieldBudgets(
-      rawInput?.length ?? 0,
-      rawOutput?.length ?? 0,
-      hasAnyQueryTerm(rawInput, signals),
-      hasAnyQueryTerm(rawOutput, signals),
+      annotatedInput?.length ?? 0,
+      annotatedOutput?.length ?? 0,
+      hasAnyQueryTerm(annotatedInput, signals),
+      hasAnyQueryTerm(annotatedOutput, signals),
       maxChars
     );
 
     const formattedInput =
-      rawInput === null
+      annotatedInput === null
         ? null
-        : rawInput.length <= inBudget && obsKind === 'prompt' && rawInput.length <= 500
-          ? rawInput
-          : condenseText(rawInput, { kind: obsKind, maxChars: Math.max(40, inBudget) });
+        : annotatedInput.length <= inBudget && obsKind === 'prompt' && annotatedInput.length <= 500
+          ? annotatedInput
+          : condenseText(annotatedInput, { kind: obsKind, maxChars: Math.max(40, inBudget) });
     const formattedOutput =
-      rawOutput === null
+      annotatedOutput === null
         ? null
-        : rawOutput.length <= outBudget && obsKind === 'prompt' && rawOutput.length <= 500
-          ? rawOutput
-          : condenseText(rawOutput, { kind: obsKind, maxChars: Math.max(40, outBudget) });
+        : annotatedOutput.length <= outBudget && obsKind === 'prompt' && annotatedOutput.length <= 500
+          ? annotatedOutput
+          : condenseText(annotatedOutput, { kind: obsKind, maxChars: Math.max(40, outBudget) });
 
     return {
       record: {
@@ -312,25 +340,30 @@ function formatObservationResult(
 
   // Default: 'query_focused'
   const maxChars = previewCap;
+  const effectiveSignals = parsedWindow ? parseQuerySignals(snippetQuery) : signals;
   const [inBudget, outBudget] = allocateFieldBudgets(
-    rawInput?.length ?? 0,
-    rawOutput?.length ?? 0,
-    hasAnyQueryTerm(rawInput, signals),
-    hasAnyQueryTerm(rawOutput, signals),
+    annotatedInput?.length ?? 0,
+    annotatedOutput?.length ?? 0,
+    hasAnyQueryTerm(annotatedInput, effectiveSignals),
+    hasAnyQueryTerm(annotatedOutput, effectiveSignals),
     maxChars
   );
 
   const formattedInput =
-    rawInput === null
+    annotatedInput === null
       ? null
-      : extractQueryFocusedSnippet(rawInput, q, { maxChars: Math.max(32, inBudget) });
+      : extractQueryFocusedSnippet(annotatedInput, snippetQuery, {
+          maxChars: Math.max(32, inBudget),
+        });
   const formattedOutput =
-    rawOutput === null
+    annotatedOutput === null
       ? null
-      : extractQueryFocusedSnippet(rawOutput, q, { maxChars: Math.max(32, outBudget) });
+      : extractQueryFocusedSnippet(annotatedOutput, snippetQuery, {
+          maxChars: Math.max(32, outBudget),
+        });
 
-  const snippet = combinedRaw
-    ? extractQueryFocusedSnippet(combinedRaw, q, { maxChars })
+  const snippet = combinedAnnotated
+    ? extractQueryFocusedSnippet(combinedAnnotated, snippetQuery, { maxChars })
     : '';
 
   return {
@@ -560,6 +593,7 @@ interface CandidateDoc {
   bm25Score?: number;
   denseScore?: number;
   entityLinkScore?: number;
+  temporalRecallScore?: number;
   matchedEntities?: string[];
   matchTier?: MatchTier;
   rrfScore?: number;
@@ -1206,10 +1240,188 @@ function getCandidateCreatedMs(c: CandidateDoc): number | null {
   return parseTimestampMs(c.record.created_at);
 }
 
+const YMD_STRICT_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+function parseYmdUtcMs(ymd: unknown, hour: number, min: number, sec: number, ms: number): number | null {
+  if (typeof ymd !== 'string') return null;
+  const m = YMD_STRICT_RE.exec(ymd.trim());
+  if (!m) return null;
+  const year = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10);
+  const day = parseInt(m[3], 10);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return Date.UTC(year, month - 1, day, hour, min, sec, ms);
+}
+
+function parseResolvedDateAnnotations(rawJson: unknown): ResolvedDateAnnotation[] {
+  if (typeof rawJson !== 'string' || rawJson.trim() === '') return [];
+  try {
+    const parsed = JSON.parse(rawJson);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (el): el is ResolvedDateAnnotation =>
+        Boolean(el) &&
+        typeof el === 'object' &&
+        !Array.isArray(el) &&
+        typeof (el as Record<string, unknown>).resolved_date === 'string'
+    );
+  } catch {
+    return [];
+  }
+}
+
+function getBestTemporalWindowDistanceMs(
+  c: CandidateDoc,
+  parsedWindow: ParsedTemporalWindow
+): number | null {
+  const createdMs = getCandidateCreatedMs(c);
+  let bestDist: number | null =
+    createdMs !== null ? Math.abs(createdMs - parsedWindow.centerMs) : null;
+
+  if (c.record_type === 'observation' && c.record.resolved_dates_json) {
+    const annotations = parseResolvedDateAnnotations(c.record.resolved_dates_json);
+    for (const ann of annotations) {
+      let dist: number | null = null;
+      if (ann.granularity !== 'day' && ann.window_start && ann.window_end) {
+        const sMs = parseYmdUtcMs(ann.window_start, 0, 0, 0, 0);
+        const eMs = parseYmdUtcMs(ann.window_end, 23, 59, 59, 999);
+        if (sMs !== null && eMs !== null) {
+          if (parsedWindow.centerMs >= sMs && parsedWindow.centerMs <= eMs) {
+            dist = Math.min(parsedWindow.halfWidthMs * 0.25, (eMs - sMs) * 0.1);
+          } else {
+            dist =
+              parsedWindow.centerMs < sMs
+                ? sMs - parsedWindow.centerMs
+                : parsedWindow.centerMs - eMs;
+          }
+        }
+      } else if (ann.resolved_date) {
+        const midMs = parseYmdUtcMs(ann.resolved_date, 12, 0, 0, 0);
+        if (midMs !== null) {
+          dist = Math.abs(midMs - parsedWindow.centerMs);
+        }
+      }
+
+      if (dist !== null) {
+        bestDist = bestDist === null ? dist : Math.min(bestDist, dist);
+      }
+    }
+  }
+
+  return bestDist;
+}
+
+function queryTemporalWindowCandidates(
+  db: ReturnType<typeof getDb>,
+  recordTypes: MemoryRecordType[],
+  ctx: FilterContext,
+  parsedWindow: ParsedTemporalWindow
+): CandidateDoc[] {
+  const out: CandidateDoc[] = [];
+  const centerIso = new Date(parsedWindow.centerMs).toISOString();
+  const windowStartDate = parsedWindow.windowStartIso.slice(0, 10);
+  const windowEndDate = parsedWindow.windowEndIso.slice(0, 10);
+
+  const targetTypes: Array<'observation' | 'note'> = ['observation', 'note'];
+  for (const rType of targetTypes) {
+    if (!recordTypes.includes(rType)) continue;
+    const spec = RECORD_SPECS[rType];
+    const built = buildWhereForType(spec, ctx);
+    if (built.impossible) continue;
+
+    const tExpr = spec.temporalExpr(spec.alias);
+    const windowSql = `
+      SELECT ${spec.alias}.*
+      FROM ${spec.table} ${spec.alias}
+      WHERE ${built.conditions.join(' AND ')}
+        AND ${tExpr} >= ?
+        AND ${tExpr} <= ?
+      ORDER BY ABS(julianday(${tExpr}) - julianday(?)) ASC, ${spec.scanOrderCol} DESC
+      LIMIT 150
+    `;
+    const windowRows = db
+      .prepare(windowSql)
+      .all(
+        ...built.queryParams,
+        parsedWindow.windowStartIso,
+        parsedWindow.windowEndIso,
+        centerIso
+      ) as any[];
+    out.push(...spec.hydrate(db, windowRows));
+
+    if (rType === 'observation') {
+      const resolvedOverlapSql = `
+        SELECT o.*
+        FROM observations o
+        WHERE ${built.conditions.join(' AND ')}
+          AND o.resolved_dates_json IS NOT NULL
+          AND json_valid(o.resolved_dates_json) = 1
+          AND json_type(o.resolved_dates_json) = 'array'
+          AND EXISTS (
+            SELECT 1
+            FROM json_each(
+              CASE
+                WHEN json_valid(o.resolved_dates_json) = 1 AND json_type(o.resolved_dates_json) = 'array'
+                THEN o.resolved_dates_json
+                ELSE '[]'
+              END
+            ) je
+            WHERE je.type = 'object'
+              AND COALESCE(
+                    CASE WHEN je.type = 'object' THEN json_extract(je.value, '$.window_start') END,
+                    CASE WHEN je.type = 'object' THEN json_extract(je.value, '$.resolved_date') END
+                  ) <= ?
+              AND COALESCE(
+                    CASE WHEN je.type = 'object' THEN json_extract(je.value, '$.window_end') END,
+                    CASE WHEN je.type = 'object' THEN json_extract(je.value, '$.resolved_date') END
+                  ) >= ?
+          )
+        ORDER BY o.created_at DESC
+        LIMIT 100
+      `;
+      const resolvedRows = db
+        .prepare(resolvedOverlapSql)
+        .all(...built.queryParams, windowEndDate, windowStartDate) as any[];
+      out.push(...spec.hydrate(db, resolvedRows));
+    }
+  }
+
+  return out;
+}
+
+const TEMPORAL_RECALL_META_VERBS = new Set([
+  'mention',
+  'mentioned',
+  'mentions',
+  'say',
+  'said',
+  'tell',
+  'told',
+  'happen',
+  'happened',
+  'happening',
+  'talk',
+  'talked',
+  'discuss',
+  'discussed',
+  'remember',
+  'recall',
+  'log',
+  'logged',
+  'record',
+  'recorded',
+  'occur',
+  'occurred',
+]);
+
+const EXPLICIT_CALENDAR_TOKEN_RE =
+  /^(?:\d{4}|\d{1,2}|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|q[1-4])$/i;
+
 function computeTemporalMultiplier(
   c: CandidateDoc,
   params: SearchRequest,
-  nowMs: number
+  nowMs: number,
+  parsedWindow: ParsedTemporalWindow | null
 ): number {
   let mult = 1.0;
 
@@ -1217,6 +1429,21 @@ function computeTemporalMultiplier(
     const validUntilMs = parseTimestampMs(c.record.valid_until);
     if (validUntilMs !== null && validUntilMs < nowMs) {
       mult *= 0.75;
+    }
+  }
+
+  if (parsedWindow) {
+    const distMs = getBestTemporalWindowDistanceMs(c, parsedWindow);
+    if (distMs !== null) {
+      const hw = Math.max(parsedWindow.halfWidthMs, 1);
+      if (distMs <= hw) {
+        // Inside [windowStart, windowEnd]: 1.40x at window center down to 1.22x at window edge
+        mult *= 1.22 + 0.18 * Math.cos((Math.PI / 2) * (distMs / hw));
+      } else if (distMs <= 2 * hw) {
+        // 1x halfWidthMs grace zone: smooth cosine taper from 1.22x down to 1.0x
+        const t = (distMs - hw) / hw;
+        mult *= 1.0 + 0.22 * Math.cos((Math.PI / 2) * t);
+      }
     }
   }
 
@@ -1280,11 +1507,25 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
   const afterIso = normalizeUtcIso(params.after, 'after');
   const beforeIso = normalizeUtcIso(params.before, 'before');
   const asOfIso = normalizeUtcIso(params.as_of, 'as_of');
+  const referenceIso = normalizeUtcIso(params.reference_date, 'reference_date');
+  const nowMs = referenceIso ? Date.parse(referenceIso) : Date.now();
+  const parsedWindow = parseTemporalQueryWindow(q, referenceIso ?? new Date(nowMs).toISOString());
+  const temporalWindowMeta = parsedWindow
+    ? {
+        start: parsedWindow.windowStartIso,
+        end: parsedWindow.windowEndIso,
+        expressions: parsedWindow.expressions,
+      }
+    : undefined;
 
   const db = getDb();
 
   if (recordTypes.length === 0) {
-    return { results: [], mode: 'bm25' };
+    return {
+      results: [],
+      mode: 'bm25',
+      ...(temporalWindowMeta ? { temporal_window: temporalWindowMeta } : {}),
+    };
   }
 
   const ctx: FilterContext = {
@@ -1304,8 +1545,16 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     const existing = candidateMap.get(key);
     if (!existing) {
       candidateMap.set(key, doc);
-    } else if (doc.bm25Score !== undefined && (existing.bm25Score ?? 0) < doc.bm25Score) {
-      existing.bm25Score = doc.bm25Score;
+    } else {
+      if (doc.bm25Score !== undefined && (existing.bm25Score ?? 0) < doc.bm25Score) {
+        existing.bm25Score = doc.bm25Score;
+      }
+      if (
+        doc.temporalRecallScore !== undefined &&
+        (existing.temporalRecallScore ?? 0) < doc.temporalRecallScore
+      ) {
+        existing.temporalRecallScore = doc.temporalRecallScore;
+      }
     }
   };
 
@@ -1317,6 +1566,13 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
       for (const doc of queryTypeFts(db, recordType, ctx, safeFtsQuery, ftsLimit)) {
         addCandidate(doc);
       }
+    }
+  }
+
+  // 1b. Auxiliary Temporal Window Recall (when query expresses a temporal window)
+  if (parsedWindow) {
+    for (const doc of queryTemporalWindowCandidates(db, recordTypes, ctx, parsedWindow)) {
+      addCandidate(doc);
     }
   }
 
@@ -1503,6 +1759,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
       results: [],
       mode,
       degraded: degradedMessage,
+      ...(temporalWindowMeta ? { temporal_window: temporalWindowMeta } : {}),
     };
   }
 
@@ -1518,6 +1775,59 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
       }
     }
   }
+
+  // Score auxiliary temporal recall for candidates inside [windowStart, windowEnd]
+  let residualTopicalTokens: string[] = [];
+  let residualPhrases: string[] = [];
+  let explicitCalendarTokens: string[] = [];
+  if (parsedWindow) {
+    const residualSignals = parseQuerySignals(parsedWindow.residualQuery);
+    residualPhrases = residualSignals.phrases;
+    residualTopicalTokens = residualSignals.contentTokens.filter(
+      (tok) => !TEMPORAL_RECALL_META_VERBS.has(tok)
+    );
+    const exprWords = parsedWindow.expressions.join(' ').toLowerCase().match(/[a-z0-9]+/g) ?? [];
+    explicitCalendarTokens = Array.from(
+      new Set(exprWords.filter((w) => EXPLICIT_CALENDAR_TOKEN_RE.test(w)))
+    );
+
+    const hw = Math.max(parsedWindow.halfWidthMs, 1);
+    for (const c of candidates) {
+      const distMs = getBestTemporalWindowDistanceMs(c, parsedWindow);
+      if (distMs !== null && distMs <= hw) {
+        const proximity = 0.35 + 0.65 * Math.cos((Math.PI / 2) * (distMs / hw));
+        let residualOverlap = 0;
+        if (residualTopicalTokens.length > 0) {
+          const lower = c.text.toLowerCase();
+          let matched = 0;
+          for (const tok of residualTopicalTokens) {
+            if (lower.includes(tok)) matched++;
+          }
+          residualOverlap = matched / residualTopicalTokens.length;
+        }
+        c.temporalRecallScore = proximity + 1.5 * residualOverlap;
+      }
+    }
+  }
+
+  const hasSubstantiveTemporalQueryLexicalMatch = (c: CandidateDoc): boolean => {
+    if (!parsedWindow) return true;
+    const lower = c.text.toLowerCase();
+    for (const phrase of residualPhrases) {
+      if (lower.includes(phrase)) return true;
+    }
+    for (const tok of residualTopicalTokens) {
+      if (lower.includes(tok)) return true;
+    }
+    if (explicitCalendarTokens.length >= 2) {
+      let calMatches = 0;
+      for (const calTok of explicitCalendarTokens) {
+        if (lower.includes(calTok)) calMatches++;
+      }
+      if (calMatches >= 2) return true;
+    }
+    return false;
+  };
 
   // 4. Rank each signal independently (competition ranking prevents arbitrary tie skew)
   const bm25Matched = candidates.filter((c) => (c.bm25Score ?? 0) > 0);
@@ -1542,6 +1852,14 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     (c) => c.entityLinkScore ?? 0
   );
 
+  const temporalRankMap = parsedWindow
+    ? assignCompetitionRanks(
+        candidates.filter((c) => (c.temporalRecallScore ?? 0) > 0),
+        (c) => docKey(c.record_type, c.id),
+        (c) => c.temporalRecallScore ?? 0
+      )
+    : new Map<string, number>();
+
   const maxBm25 = bm25Matched.reduce((m, c) => Math.max(m, c.bm25Score ?? 0), 0);
 
   const queryProjectRaw = params.project_id?.trim() || null;
@@ -1551,7 +1869,6 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     queryProjectNorm = res.ok ? res.projectId : queryProjectRaw;
   }
 
-  const nowMs = Date.now();
   const hasFileFilter = Boolean(params.filters?.file_path?.trim());
   const intent = detectQueryKindIntent(q, hasFileFilter);
   const kindWeights = resolveKindWeights(intent, params.kind_weights);
@@ -1572,17 +1889,26 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     const rankDense = denseRankMap.get(key);
     const rankBm25 = bm25RankMap.get(key);
     const rankEntity = entityRankMap.get(key);
+    const rankTemporal = temporalRankMap.get(key);
+    const bm25LexicalScale =
+      rankBm25 !== undefined && parsedWindow && !hasSubstantiveTemporalQueryLexicalMatch(c)
+        ? 0.2
+        : 1.0;
 
     let baseScore = 0;
     if (mode === 'hybrid') {
       if (rankDense !== undefined) baseScore += 1 / (RRF_K + rankDense);
-      if (rankBm25 !== undefined) baseScore += 1 / (RRF_K + rankBm25);
+      if (rankBm25 !== undefined) baseScore += bm25LexicalScale / (RRF_K + rankBm25);
       if (rankEntity !== undefined) baseScore += 1 / (RRF_K + rankEntity);
+      if (rankTemporal !== undefined) baseScore += 0.75 / (RRF_K + rankTemporal);
     } else {
-      const bm25Norm = maxBm25 > 0 && (c.bm25Score ?? 0) > 0 ? c.bm25Score! / maxBm25 : 0;
+      const bm25Norm =
+        maxBm25 > 0 && (c.bm25Score ?? 0) > 0 ? (c.bm25Score! / maxBm25) * bm25LexicalScale : 0;
       const entityBoost =
         rankEntity !== undefined ? 0.25 * ((RRF_K + 1) / (RRF_K + rankEntity)) : 0;
-      baseScore = bm25Norm + entityBoost;
+      const temporalBoost =
+        rankTemporal !== undefined ? 0.35 * ((RRF_K + 1) / (RRF_K + rankTemporal)) : 0;
+      baseScore = bm25Norm + entityBoost + temporalBoost;
     }
 
     const tierInfo = classifyMatchTier(c.record.scope, c.record.project_id, queryProjectNorm);
@@ -1594,7 +1920,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
         tierInfo.ancestor_distance,
         queryProjectNorm !== null
       );
-      const temporalMult = computeTemporalMultiplier(c, params, nowMs);
+      const temporalMult = computeTemporalMultiplier(c, params, nowMs, parsedWindow);
       let obsMult = 1.0;
       if (c.record_type === 'observation') {
         const obsKind = c.record.kind as ObservationSearchKind;
@@ -1664,7 +1990,8 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
         q,
         querySignals,
         snippetMode,
-        explicitMaxChars
+        explicitMaxChars,
+        parsedWindow
       );
       recordOut = formatted.record;
       snippetOut = formatted.snippet;
@@ -1706,6 +2033,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     results,
     mode,
     degraded: degradedMessage,
+    ...(temporalWindowMeta ? { temporal_window: temporalWindowMeta } : {}),
   };
 }
 

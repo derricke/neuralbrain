@@ -216,6 +216,7 @@ const OBSERVATIONS_DDL = `
     input          TEXT,
     output         TEXT,
     condensed_text TEXT,
+    resolved_dates_json TEXT,
     duration_ms    INTEGER NOT NULL DEFAULT 0,
     failed       INTEGER NOT NULL DEFAULT 0,     -- set by the failure hook, never inferred
     event_at     TEXT,                           -- optional UTC ISO-8601 when event occurred
@@ -257,6 +258,7 @@ const OBSERVATIONS_ARCHIVE_DDL = `
     input                   TEXT,
     output                  TEXT,
     condensed_text          TEXT,
+    resolved_dates_json     TEXT,
     duration_ms             INTEGER NOT NULL DEFAULT 0,
     failed                  INTEGER NOT NULL DEFAULT 0,
     event_at                TEXT,
@@ -293,6 +295,7 @@ function alignObservationsSchema(db: Database): void {
       { name: 'agent_id', ddl: 'TEXT' },
       { name: 'event_at', ddl: 'TEXT' },
       { name: 'condensed_text', ddl: 'TEXT' },
+      { name: 'resolved_dates_json', ddl: 'TEXT' },
     ]);
 
     const row = db

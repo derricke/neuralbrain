@@ -108,6 +108,7 @@ export function createDirectBrainMcpHandlers(
           ...(args.after !== undefined ? { after: args.after } : {}),
           ...(args.before !== undefined ? { before: args.before } : {}),
           ...(args.as_of !== undefined ? { as_of: args.as_of } : {}),
+          ...(args.reference_date !== undefined ? { reference_date: args.reference_date } : {}),
           ...(args.temporal_bias !== undefined ? { temporal_bias: args.temporal_bias } : {}),
           ...(args.snippet_mode !== undefined ? { snippet_mode: args.snippet_mode } : {}),
           ...(args.max_record_chars !== undefined ? { max_record_chars: args.max_record_chars } : {}),

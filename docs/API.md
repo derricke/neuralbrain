@@ -49,7 +49,7 @@ The hot path. Accepts one observation or a batch.
 
 **Rules this endpoint must obey:**
 
-- **Optional `event_at` timestamp.** Accepts an ISO-8601 date/time string (normalized to UTC ISO-8601) or finite numeric Unix epoch seconds. Omitted, `null`, or empty string stores `NULL`. Malformed values are dead-lettered as `schema_invalid`. Used by `/search` `after`/`before` and `temporal_bias` (falling back to `created_at` when `NULL`).
+- **Optional `event_at` timestamp & deterministic relative-date anchoring.** `event_at` accepts an ISO-8601 date/time string (normalized to UTC ISO-8601) or finite numeric Unix epoch seconds. Omitted, `null`, or empty string stores `NULL`. Malformed values are dead-lettered as `schema_invalid`. At ingest, relative date phrases in `input`/`output` (`yesterday`, `last Saturday`, `two weeks ago`, `last month`, etc.) are deterministically anchored in UTC against `event_at ?? created_at` into `resolved_dates_json` and inline `[YYYY-MM-DD]` annotations inside `condensed_text`, while raw `observations.input` and `observations.output` remain 100% verbatim.
 
 - **Exempt from rate limiting.** Hook-driven capture exceeds 100/min in seconds,
   and rule 3 forbids rejecting a write for volume.
@@ -107,6 +107,7 @@ and temporal bias/validity adjustments.
   "after": "2026-01-01T00:00:00Z",
   "before": "2026-12-31T23:59:59Z",
   "as_of": "2026-06-01T00:00:00Z",
+  "reference_date": "2026-06-20T12:00:00Z",
   "temporal_bias": "recent",
   "snippet_mode": "query_focused",
   "max_record_chars": 600,
@@ -126,13 +127,15 @@ and temporal bias/validity adjustments.
 (`exact | ancestor | child | global | unknown`), optional `matched_entities`
 (when matched/boosted via `entity_edges`), optional `snippet` (populated on
 `observation` results), `record`, and `claims` / `sources`
-for derived rows.
+for derived rows. When `q` expresses a natural-language or calendar temporal
+window, the response also includes `temporal_window: { start, end, expressions }`.
 
 - `record_types` supports `'note' | 'trajectory' | 'observation' | 'summary' | 'entity' | 'action'` (default `['note', 'trajectory']`; legacy `grains` alias still accepted).
+- `reference_date` (optional UTC ISO-8601 timestamp; defaults to server `now`) anchors natural-language temporal query parsing (`"four weeks ago"`, `"in the past two weeks"`, `"last Saturday"`, `"in March"`, `"May 20, 2023"`, `"Q2 2024"`, `"between March and May 2023"`) and `temporal_bias`. When a temporal window is detected, search performs auxiliary SQLite recall over in-window notes/observations and `resolved_dates_json` overlaps, applies a soft cosine temporal boost (`1.22x..1.40x` inside the window, tapering to `1.0x` across a 1x half-width grace zone without hard-dropping out-of-window context), and returns `temporal_window`.
 - `snippet_mode` (`'query_focused' | 'condensed' | 'raw'`, default `'query_focused'`) controls how `observation` records are windowed at read time without mutating stored `input`/`output`:
-  - `'query_focused'` (default): scans the full untruncated `input`/`output` to extract query-matching passages (joining non-adjacent spans with ` [...] `) within `max_record_chars` (default `1000` for `prompt`, `600` for `response`/`tool_call`) and populates `snippet`.
-  - `'condensed'`: uses `condensed_text` (or computes extractive condensation on the fly) capped at `max_record_chars` (default `600`).
-  - `'raw'`: returns raw `record.input` and `record.output` (respecting explicit `max_record_chars` if supplied, else 32,000-char safety bound) while still attaching a query-focused `snippet`.
+  - `'query_focused'` (default): annotates relative dates inline (`[YYYY-MM-DD]`) and scans the full untruncated `input`/`output` to extract query-matching passages (joining non-adjacent spans with ` [...] `) within `max_record_chars` (default `1000` for `prompt`, `600` for `response`/`tool_call`) and populates `snippet`.
+  - `'condensed'`: uses `condensed_text` (or computes extractive condensation with inline `[YYYY-MM-DD]` annotations on the fly) capped at `max_record_chars` (default `600`).
+  - `'raw'`: returns verbatim raw `record.input` and `record.output` (respecting explicit `max_record_chars` if supplied, else 32,000-char safety bound) while still attaching an inline-annotated query-focused `snippet`.
 - `kind_weights` (`Partial<Record<'prompt' | 'response' | 'tool_call', number>>`, clamped to `[0.1, 5.0]`) overrides automatic query-intent observation weighting (`assistant` recall queries boost `response`, code/path/error `tool` queries boost `tool_call`, and `general` recall queries boost `prompt` while damping verbose low-density essays).
 - `max_kind_share` (`Partial<Record<'prompt' | 'response' | 'tool_call', number>>` in `(0, 1]`) caps any single observation `kind` in pass 1 (default `{ "response": 0.6 }` when searching observations with `limit >= 5`, no `filters.kind`, and non-assistant intent) and backfills in score order in pass 2 when fewer alternatives exist.
 - `include_ancestors: true` (default) inherits ancestor projects (`acme`, `acme/socials`) while isolating sibling subprojects (`acme/socials/generator`, `acme/cogs`).
@@ -140,7 +143,7 @@ for derived rows.
 - `include_global: true` merges `scope='global'` with the named project. It
   never includes `scope='unknown'` — those are surfaced only by an explicit
   `scope: "unknown"` query, which doubles as the repair list.
-- `as_of` filters notes by validity window (`valid_from <= as_of <= valid_until`). Invalid ISO timestamps on `after`/`before`/`as_of` return `400 SCHEMA_INVALID`.
+- `as_of` filters notes by validity window (`valid_from <= as_of <= valid_until`). Invalid ISO timestamps on `after`/`before`/`as_of`/`reference_date` return `400 SCHEMA_INVALID`.
 - If `store_meta` mismatches config, this returns `200` with
   `"degraded": "vector search unavailable: <what differs>"` and BM25 + Entity-Graph
   results. **It does not pretend to be healthy and does not silently drop the

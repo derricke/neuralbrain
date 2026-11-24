@@ -7,6 +7,7 @@ import { buildHierarchicalScopeSql, resolveScope } from '../lib/scope';
 import { normalizeUtcIso } from '../lib/recurrence';
 import { redactOptional } from '../lib/redactSecrets';
 import { condenseObservation } from '../lib/condenser';
+import { resolveRelativeDates } from '../lib/temporal';
 import { transaction } from '../lib/sqlite';
 
 export type ObservationScope = 'project' | 'global' | 'unknown';
@@ -28,6 +29,7 @@ export interface ObservationRecord {
   input: string | null;
   output: string | null;
   condensed_text?: string | null;
+  resolved_dates_json?: string | null;
   duration_ms: number;
   failed: number;
   event_at: string | null;
@@ -227,9 +229,9 @@ export function captureObservations(rawItems: unknown[]): CaptureResult {
     const insertStmt = db.prepare(`
       INSERT INTO observations (
         id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, agent,
-        kind, tool_name, file_path, input, output, condensed_text, duration_ms, failed,
-        event_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        kind, tool_name, file_path, input, output, condensed_text, resolved_dates_json,
+        duration_ms, failed, event_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const reactivateSessionStmt = db.prepare(`
@@ -243,12 +245,29 @@ export function captureObservations(rawItems: unknown[]): CaptureResult {
     // If insertSingle throws, its savepoint is rolled back without aborting the outer transaction.
     const insertSingle = transaction(db, (entry: { item: ValidatedObservation; index: number; raw: unknown }) => {
       const item = entry.item;
+      const anchorIso = item.eventAt ?? new Date(item.createdAt * 1000).toISOString();
+      const inputTemporal = item.input ? resolveRelativeDates(item.input, anchorIso) : null;
+      const outputTemporal = item.output ? resolveRelativeDates(item.output, anchorIso) : null;
+
+      const combinedResolved = [
+        ...(inputTemporal
+          ? inputTemporal.resolved.map((ann) => ({ field: 'input' as const, ...ann }))
+          : []),
+        ...(outputTemporal
+          ? outputTemporal.resolved.map((ann) => ({ field: 'output' as const, ...ann }))
+          : []),
+      ];
+      const resolvedDatesJson =
+        combinedResolved.length > 0 ? JSON.stringify(combinedResolved) : null;
+
+      // Raw item.input and item.output stay 100% verbatim in SQLite;
+      // inline [YYYY-MM-DD] annotations feed additive condensed_text.
       const condensedText = condenseObservation({
         kind: item.kind,
         toolName: item.toolName,
         filePath: item.filePath,
-        input: item.input,
-        output: item.output,
+        input: inputTemporal ? inputTemporal.annotatedText : item.input,
+        output: outputTemporal ? outputTemporal.annotatedText : item.output,
       });
       insertStmt.run(
         item.id,
@@ -266,6 +285,7 @@ export function captureObservations(rawItems: unknown[]): CaptureResult {
         item.input,
         item.output,
         condensedText,
+        resolvedDatesJson,
         item.durationMs,
         item.failed,
         item.eventAt,

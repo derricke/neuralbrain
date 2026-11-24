@@ -57,6 +57,8 @@ export interface SearchRequest {
   after?: string;
   before?: string;
   as_of?: string;
+  /** Optional UTC ISO-8601 reference date/time used to anchor relative temporal expressions in `q` and `temporal_bias`. */
+  reference_date?: string;
   temporal_bias?: 'none' | 'recent' | 'upcoming';
   /** Observation snippet formatting mode (default: 'query_focused'). */
   snippet_mode?: SnippetMode;
@@ -125,6 +127,11 @@ export interface SearchResponse {
   results: SearchResultItem[];
   mode: 'hybrid' | 'bm25';
   degraded?: string;
+  temporal_window?: {
+    start: string;
+    end: string;
+    expressions: string[];
+  };
 }
 
 export type AgentProvider = string;

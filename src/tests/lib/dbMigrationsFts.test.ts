@@ -36,10 +36,22 @@ describe('db migrations, entities/edges DDL, and FTS5 sync', () => {
       expect.arrayContaining(['user_id', 'agent_id', 'event_at', 'valid_from', 'valid_until'])
     );
     expect(colNames('observations')).toEqual(
-      expect.arrayContaining(['user_id', 'agent_id', 'event_at', 'condensed_text'])
+      expect.arrayContaining([
+        'user_id',
+        'agent_id',
+        'event_at',
+        'condensed_text',
+        'resolved_dates_json',
+      ])
     );
     expect(colNames('observations_archive')).toEqual(
-      expect.arrayContaining(['user_id', 'agent_id', 'event_at', 'condensed_text'])
+      expect.arrayContaining([
+        'user_id',
+        'agent_id',
+        'event_at',
+        'condensed_text',
+        'resolved_dates_json',
+      ])
     );
     const obsIndexes = (
       db.prepare(`PRAGMA index_list(observations)`).all() as Array<{ name: string }>
@@ -443,8 +455,10 @@ describe('db migrations, entities/edges DDL, and FTS5 sync', () => {
     ).map((c) => c.name);
     expect(migratedObsCols).toContain('event_at');
     expect(migratedObsCols).toContain('condensed_text');
+    expect(migratedObsCols).toContain('resolved_dates_json');
     expect(migratedObsArcCols).toContain('event_at');
     expect(migratedObsArcCols).toContain('condensed_text');
+    expect(migratedObsArcCols).toContain('resolved_dates_json');
     const migratedObsIndexes = (
       db.prepare(`PRAGMA index_list(observations)`).all() as Array<{ name: string }>
     ).map((i) => i.name);

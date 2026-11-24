@@ -33,6 +33,7 @@ user_id           string   optional user_id filter
 after             string   optional ISO-8601 lower bound timestamp filter
 before            string   optional ISO-8601 upper bound timestamp filter
 as_of             string   optional ISO-8601 validity filter for notes (valid_from <= as_of <= valid_until)
+reference_date    string   optional ISO-8601 reference timestamp used to resolve relative temporal phrases in q (defaults to now)
 temporal_bias     string   none|recent|upcoming (optional)
 snippet_mode      string   query_focused|condensed|raw (default: query_focused for observation hits)
 max_record_chars  integer  optional character cap for observation fields and snippet
@@ -50,7 +51,9 @@ limit             integer  default 10 (1..100)
 
 Returns records with `record_type`, `score`, `project_id`, `match_tier`, optional
 `matched_entities` (for Entity-Graph hits), optional `snippet` (query-focused or
-condensed passage preview on `observation` hits), and for derived rows `claims` /
+condensed passage preview with inline `[YYYY-MM-DD]` relative-date annotations on
+`observation` hits), optional top-level `temporal_window` (`{ start, end, expressions }`
+when `q` contains a temporal constraint), and for derived rows `claims` /
 `sources` so the agent can verify a claim against what it cites.
 
 Surfaces `"degraded"` verbatim when vector search is unavailable. An agent must
