@@ -1,5 +1,5 @@
 /**
- * One AI ecosystem, chosen once (CLAUDE.md).
+ * One AI ecosystem, chosen once.
  *
  * This module is the single place that turns environment variables into a
  * resolved generative producer. It holds no network code and no database
@@ -249,7 +249,7 @@ function resolveFallbackTiers(fn: GenerativeFunction, primary: GenerativeTier): 
   }
 
   // A fallback is only legitimate because every derived row records which
-  // producer actually wrote it (CLAUDE.md, "A deliberate asymmetry"). Drop any
+  // producer actually wrote it. Drop any
   // tier that cannot be resolved rather than failing the primary path.
   return tiers.filter((tier) => {
     try {

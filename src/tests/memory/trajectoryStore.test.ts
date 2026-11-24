@@ -515,3 +515,46 @@ describe('trajectoryStore', () => {
     deleteSpy.mockRestore();
   });
 });
+
+describe('captureTrajectories wire format', () => {
+  it('accepts the snake_case payload the Stop hook sends (regression: was dead-lettered)', () => {
+    const { captureTrajectories } = require('../../memory/trajectoryStore');
+    const payload = {
+      session_id: 'sess-hook-1',
+      scope: 'project',
+      project_id: 'neuralbrain',
+      rollup_source: 'signalled',
+      description: 'Agent session completed',
+      success: 1,
+    };
+
+    const result = captureTrajectories([payload]);
+    expect(result.rejected).toEqual([]);
+    expect(result.accepted).toBe(1);
+
+    const row = getDb()
+      .prepare('SELECT scope, project_id, session_id, rollup_source, success FROM trajectories WHERE id = ?')
+      .get(result.ids[0]) as any;
+    expect(row).toEqual({
+      scope: 'project',
+      project_id: 'neuralbrain',
+      session_id: 'sess-hook-1',
+      rollup_source: 'signalled',
+      success: 1,
+    });
+    const dl = getDb().prepare('SELECT COUNT(*) as c FROM dead_letters').get() as { c: number };
+    expect(dl.c).toBe(0);
+  });
+
+  it('maps snake_case counters and prefers camelCase when both are given', () => {
+    const { captureTrajectories } = require('../../memory/trajectoryStore');
+    const result = captureTrajectories([
+      { scope: 'project', project_id: 'snake', projectId: 'camel', task_type: 'build', tool_calls: 7, duration_ms: 1200 },
+    ]);
+    expect(result.accepted).toBe(1);
+    const row = getDb()
+      .prepare('SELECT project_id, task_type, tool_calls, duration_ms FROM trajectories WHERE id = ?')
+      .get(result.ids[0]) as any;
+    expect(row).toEqual({ project_id: 'camel', task_type: 'build', tool_calls: 7, duration_ms: 1200 });
+  });
+});

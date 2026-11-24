@@ -5,7 +5,7 @@
 > documents performance benchmarks, details Matryoshka Representation Learning math, explains `store_meta` verification,
 > and specifies the atomic re-embedding procedure.
 >
-> Master constitution: [CLAUDE.md](../CLAUDE.md). DDL: [docs/SCHEMA.md](SCHEMA.md). API: [docs/API.md](API.md).
+> DDL: [docs/SCHEMA.md](SCHEMA.md). API: [docs/API.md](API.md).
 
 ---
 

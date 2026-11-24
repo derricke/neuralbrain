@@ -108,6 +108,42 @@ export function resetDb(): void {
   }
 }
 
+/**
+ * Runs `fn` with `getDb()` pointed at a fresh, migrated database in a new temp
+ * directory, then restores the previous connection (open or not) and
+ * `DATABASE_URL`, and deletes the temp directory.
+ *
+ * This is how code outside the service exercises store logic that writes
+ * (the doctor's AI conformance fixtures) without becoming a second writer on
+ * the real database file.
+ */
+export function withIsolatedDb<T>(fn: () => T): T {
+  const previousDb = _db;
+  const hadUrl = Object.prototype.hasOwnProperty.call(process.env, 'DATABASE_URL');
+  const previousUrl = process.env.DATABASE_URL;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'brain-isolated-'));
+
+  _db = null;
+  process.env.DATABASE_URL = path.join(dir, 'isolated.db');
+  try {
+    return fn();
+  } finally {
+    // fn() may have opened the throwaway connection; TS cannot see that.
+    const opened = _db as Database | null;
+    if (opened) {
+      try {
+        opened.close();
+      } catch {
+        // ignore close errors on the throwaway connection
+      }
+    }
+    _db = previousDb;
+    if (hadUrl) process.env.DATABASE_URL = previousUrl;
+    else delete process.env.DATABASE_URL;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 export function initDb(): void {
   getDb();
   logger.info('database initialized');

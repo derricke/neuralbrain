@@ -69,7 +69,7 @@ export function l2Normalize(vec: number[]): number[] {
  * exists to remove.
  *
  * BRAIN_EMBED_MODEL already owns "which model" for every other embedder tier
- * (see CLAUDE.md, "Tier chooses where, BRAIN_EMBED_MODEL chooses which"), so the
+ * (the tier chooses where, BRAIN_EMBED_MODEL chooses which), so the
  * vendor tier uses it too. The tier-specific keywords `nomic` and `minilm` are
  * in-process model names and are ignored here, falling through to the vendor
  * default.

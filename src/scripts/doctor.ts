@@ -1,11 +1,24 @@
-import { getDb } from '../lib/db';
-import { logger } from '../lib/logger';
-import { verifyOrCreateStoreMeta } from '../learning/storeMeta';
+import fs from 'fs';
+import path from 'path';
+import { getDbPath, withIsolatedDb } from '../lib/db';
+import { loadBrainEnv } from '../lib/brainHome';
+import { openDatabase, type Database } from '../lib/sqlite';
+import { createLocalTlsFetch } from '../lib/tls';
+import {
+  countStoreRecords,
+  inspectDatabaseHealth,
+  inspectSchemaAlignment,
+  type StoreCounts,
+} from '../lib/storeDiagnostics';
+import { compareStoreMeta } from '../learning/storeMeta';
+import { resolveEmbedderRecipe } from '../learning/embedding';
+import type { StoreMetaRecord } from '../learning/types';
 import {
   runAiConformanceDiagnostics,
   AiDiagnosticsReport,
 } from '../consolidation/fixtures';
 import { describeAiConfig } from '../ai/config';
+import { resolveApiKey, resolveApiUrl } from './installAgent';
 
 export interface DoctorCheck {
   name: string;
@@ -13,8 +26,20 @@ export interface DoctorCheck {
   message: string;
 }
 
+/**
+ * Where the doctor's answers came from.
+ * - `service`: the running brain service, over HTTP. The doctor never opens the
+ *   database file, so the service stays its only writer.
+ * - `local`: the service was not reachable, so the database file was opened
+ *   read-only (the sanctioned read-only diagnosis) and the AI conformance
+ *   fixtures ran against a throwaway temp database.
+ */
+export type DoctorSource = 'service' | 'local';
+
 export interface DoctorReport {
   allPassing: boolean;
+  source: DoctorSource;
+  target: string;
   dbOk: boolean;
   schemaAligned: boolean;
   storeMetaMatch: boolean;
@@ -27,358 +52,476 @@ export interface DoctorReport {
   checks: DoctorCheck[];
 }
 
-export async function runDoctor(options: {
+export interface DoctorOptions {
   ai?: boolean;
   exitOnFinish?: boolean;
-} = {}): Promise<DoctorReport> {
-  const checks: DoctorCheck[] = [];
+  /** `auto` (default) uses the service when it answers /health, else `local`. */
+  mode?: 'auto' | 'service' | 'local';
+  apiUrl?: string;
+  apiKey?: string;
+  fetchFn?: typeof fetch;
+  /** Local mode: database file to open read-only (default: the configured path). */
+  dbPath?: string;
+  /** Local mode, tests only: inspect this already-open connection instead of opening dbPath. */
+  db?: Database;
+  /** Suppress the printed report (tests). */
+  quiet?: boolean;
+}
 
-  // 1. Database Health Check
-  let dbOk = false;
-  let journalMode = 'unknown';
+const HEALTH_TIMEOUT_MS = 3000;
+const REQUEST_TIMEOUT_MS = 60000;
+
+const SKIPPED_AI: AiDiagnosticsReport = {
+  status: 'ok',
+  all_passing: true,
+  passed_count: 0,
+  total_count: 0,
+  results: [],
+};
+
+const FAILED_AI: AiDiagnosticsReport = {
+  status: 'failed',
+  all_passing: false,
+  passed_count: 0,
+  total_count: 0,
+  results: [],
+};
+
+const ZERO_COUNTS: StoreCounts = {
+  dead_letters: 0,
+  unknown_scope_notes: 0,
+  notes: 0,
+  trajectories: 0,
+  observations: 0,
+};
+
+interface Findings {
+  dbOk: boolean;
+  schemaAligned: boolean;
+  storeMetaMatch: boolean;
+  counts: StoreCounts;
+  aiDiagnostics: AiDiagnosticsReport;
+  checks: DoctorCheck[];
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function packageRoot(): string {
+  return path.resolve(__dirname, '..', '..');
+}
+
+function describeGenerativeConfig(aiConfig: Record<string, any>): DoctorCheck {
+  const broken = (['summarize', 'consolidate'] as const).filter((fn) => !aiConfig[fn]?.ok);
+  if (broken.length > 0) {
+    return {
+      name: 'Generative Producer Config',
+      pass: false,
+      message: broken.map((fn) => `${fn}: ${aiConfig[fn]?.error ?? 'not resolved'}`).join(' | '),
+    };
+  }
+  const fmt = (fn: 'summarize' | 'consolidate') =>
+    `${aiConfig[fn].tier}${aiConfig[fn].model ? ` (${aiConfig[fn].model})` : ''}`;
+  return {
+    name: 'Generative Producer Config',
+    pass: true,
+    message: `summarize: ${fmt('summarize')}, consolidate: ${fmt('consolidate')}`,
+  };
+}
+
+function aiCheck(report: AiDiagnosticsReport): DoctorCheck {
+  return {
+    name: 'AI Conformance Diagnostics',
+    pass: report.all_passing,
+    message: `${report.passed_count}/${report.total_count} assertions passed`,
+  };
+}
+
+async function fetchWithTimeout(
+  fetchFn: typeof fetch,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const db = getDb();
-    const row = db.prepare('SELECT 1 as val').get() as { val: number } | undefined;
-    const pragmaRow = db.prepare('PRAGMA journal_mode').get() as { journal_mode: string } | undefined;
-    journalMode = pragmaRow?.journal_mode || 'unknown';
-    if (row?.val === 1) {
-      dbOk = true;
-      checks.push({
-        name: 'Database Health',
-        pass: true,
-        message: `Database accessible and functional (journal_mode: ${journalMode})`,
-      });
-    } else {
-      checks.push({
-        name: 'Database Health',
-        pass: false,
-        message: 'Database query returned unexpected result',
-      });
+    return await fetchFn(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Returns the parsed /health body, or null when nothing answered. */
+async function probeHealth(fetchFn: typeof fetch, apiUrl: string): Promise<Record<string, any> | null> {
+  try {
+    const res = await fetchWithTimeout(fetchFn, `${apiUrl}/health`, {}, HEALTH_TIMEOUT_MS);
+    const body = (await res.json().catch(() => null)) as Record<string, any> | null;
+    return body && typeof body === 'object' ? body : null;
+  } catch {
+    return null;
+  }
+}
+
+async function runServiceChecks(
+  fetchFn: typeof fetch,
+  apiUrl: string,
+  apiKey: string | undefined,
+  health: Record<string, any>,
+  runAi: boolean
+): Promise<Findings> {
+  const checks: DoctorCheck[] = [];
+  const headers: Record<string, string> = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
+
+  const getJson = async (
+    route: string
+  ): Promise<{ ok: true; body: any } | { ok: false; error: string; status?: number }> => {
+    try {
+      const res = await fetchWithTimeout(fetchFn, `${apiUrl}${route}`, { headers }, REQUEST_TIMEOUT_MS);
+      if (res.status === 401) {
+        return {
+          ok: false,
+          error: `GET ${route} was rejected (401): set BRAIN_API_KEY to a valid key for this service`,
+        };
+      }
+      const body = (await res.json().catch(() => null)) as any;
+      if (!res.ok || body === null) {
+        return {
+          ok: false,
+          status: res.status,
+          error: `GET ${route} returned ${res.status}${body?.error?.message ? `: ${body.error.message}` : ''}`,
+        };
+      }
+      return { ok: true, body };
+    } catch (err) {
+      return { ok: false, error: `GET ${route} failed: ${errorMessage(err)}` };
     }
-  } catch (err) {
+  };
+
+  // 1. Database health and schema, inspected by the service on its own connection.
+  let dbOk = false;
+  let schemaAligned = false;
+  let counts = ZERO_COUNTS;
+  const store = await getJson('/diagnostics/store');
+  if (!store.ok && store.status === 404) {
+    // A service older than this CLI: /health still answers for the database,
+    // but schema and counts need a restart on this version.
+    dbOk = health.db === 'ok';
     checks.push({
       name: 'Database Health',
-      pass: false,
-      message: `Database connection error: ${err instanceof Error ? err.message : String(err)}`,
+      pass: dbOk,
+      message: dbOk ? 'Database reported ok by /health' : `Database unhealthy: health reports db=${health.db}`,
     });
-  }
-
-  // 1b. Schema Alignment Check (Q27)
-  let schemaAligned = false;
-  if (dbOk) {
-    try {
-      const db = getDb();
-      const issues: string[] = [];
-
-      // Foreign keys pragma
-      const fkRow = db.prepare('PRAGMA foreign_keys').get() as { foreign_keys?: number } | undefined;
-      if (fkRow?.foreign_keys !== 1) {
-        issues.push('PRAGMA foreign_keys is not active');
-      }
-
-      const getTableColumns = (tableName: string): Map<string, { name: string; notnull: number; type: string }> => {
-        const rows = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string; notnull: number; type: string }>;
-        return new Map(rows.map((r) => [r.name, r]));
-      };
-
-      // trajectories check
-      const trajCols = getTableColumns('trajectories');
-      if (trajCols.size === 0) {
-        issues.push('table trajectories does not exist');
-      } else {
-        const successCol = trajCols.get('success');
-        if (!successCol) issues.push('trajectories.success missing');
-        else if (successCol.notnull !== 0) issues.push('trajectories.success is not nullable (notnull=1)');
-
-        const projCol = trajCols.get('project_id');
-        if (!projCol) issues.push('trajectories.project_id missing');
-        else if (projCol.notnull !== 0) issues.push('trajectories.project_id is not nullable (notnull=1)');
-
-        for (const col of ['session_id', 'rollup_source', 'tool_calls']) {
-          if (!trajCols.has(col)) issues.push(`trajectories.${col} missing`);
-        }
-      }
-
-      // trajectory_archive check
-      const trajArcCols = getTableColumns('trajectory_archive');
-      if (trajArcCols.size === 0) {
-        issues.push('table trajectory_archive does not exist');
-      } else {
-        const successCol = trajArcCols.get('success');
-        if (!successCol) issues.push('trajectory_archive.success missing');
-        else if (successCol.notnull !== 0) issues.push('trajectory_archive.success is not nullable (notnull=1)');
-
-        const projCol = trajArcCols.get('project_id');
-        if (!projCol) issues.push('trajectory_archive.project_id missing');
-        else if (projCol.notnull !== 0) issues.push('trajectory_archive.project_id is not nullable (notnull=1)');
-
-        for (const col of ['session_id', 'rollup_source', 'tool_calls']) {
-          if (!trajArcCols.has(col)) issues.push(`trajectory_archive.${col} missing`);
-        }
-      }
-
-      // observations and observations_archive project_id check
-      const obsCols = getTableColumns('observations');
-      if (obsCols.size === 0) {
-        issues.push('table observations does not exist');
-      } else {
-        const projCol = obsCols.get('project_id');
-        if (!projCol) issues.push('observations.project_id missing');
-        else if (projCol.notnull !== 0) issues.push('observations.project_id is not nullable (notnull=1)');
-      }
-
-      const obsArcCols = getTableColumns('observations_archive');
-      if (obsArcCols.size === 0) {
-        issues.push('table observations_archive does not exist');
-      } else {
-        const projCol = obsArcCols.get('project_id');
-        if (!projCol) issues.push('observations_archive.project_id missing');
-        else if (projCol.notnull !== 0) issues.push('observations_archive.project_id is not nullable (notnull=1)');
-      }
-
-      // entities & entity_edges tables check
-      const entitiesCols = getTableColumns('entities');
-      if (entitiesCols.size === 0) {
-        issues.push('table entities does not exist');
-      }
-      const entityEdgesCols = getTableColumns('entity_edges');
-      if (entityEdgesCols.size === 0) {
-        issues.push('table entity_edges does not exist');
-      }
-
-      // FTS5 virtual tables check
-      const ftsRows = db
-        .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('fts_notes', 'fts_entities', 'fts_actions')"
-        )
-        .all() as Array<{ name: string }>;
-      const ftsSet = new Set(ftsRows.map((r) => r.name));
-      for (const ftsName of ['fts_notes', 'fts_entities', 'fts_actions']) {
-        if (!ftsSet.has(ftsName)) {
-          issues.push(`FTS5 table ${ftsName} does not exist`);
-        }
-      }
-
-      // actions reminder/recurrence/user columns check
-      const actionCols = getTableColumns('actions');
-      if (actionCols.size === 0) {
-        issues.push('table actions does not exist');
-      } else {
-        for (const col of [
-          'due_at',
-          'remind_at',
-          'recurrence',
-          'last_reminded_at',
-          'snooze_until',
-          'user_id',
-        ]) {
-          if (!actionCols.has(col)) issues.push(`actions.${col} missing`);
-        }
-      }
-
-      // notes temporal/user columns check
-      const noteCols = getTableColumns('notes');
-      if (noteCols.size === 0) {
-        issues.push('table notes does not exist');
-      } else {
-        for (const col of ['event_at', 'valid_from', 'valid_until', 'user_id']) {
-          if (!noteCols.has(col)) issues.push(`notes.${col} missing`);
-        }
-      }
-
-      if (issues.length === 0) {
-        schemaAligned = true;
-        checks.push({
-          name: 'Schema Alignment',
-          pass: true,
-          message: 'Relational schema aligned and foreign keys enabled',
-        });
-      } else {
-        checks.push({
-          name: 'Schema Alignment',
-          pass: false,
-          message: `Schema misalignment detected: ${issues.join('; ')}`,
-        });
-      }
-    } catch (err) {
-      checks.push({
-        name: 'Schema Alignment',
-        pass: false,
-        message: `Failed to inspect schema: ${err instanceof Error ? err.message : String(err)}`,
-      });
-    }
-  } else {
     checks.push({
       name: 'Schema Alignment',
       pass: false,
-      message: 'Database inaccessible, skipping schema alignment check',
+      message: `The service at ${apiUrl} predates GET /diagnostics/store; restart it on this version to check the schema`,
     });
+  } else if (!store.ok) {
+    checks.push({ name: 'Database Health', pass: false, message: store.error });
+    checks.push({ name: 'Schema Alignment', pass: false, message: 'Skipped: store diagnostics unavailable' });
+  } else {
+    dbOk = store.body.db?.ok === true && health.db === 'ok';
+    checks.push(
+      dbOk
+        ? {
+            name: 'Database Health',
+            pass: true,
+            message: `Database accessible and functional (journal_mode: ${store.body.db.journal_mode})`,
+          }
+        : {
+            name: 'Database Health',
+            pass: false,
+            message: `Database unhealthy: ${store.body.db?.error || `health reports db=${health.db}`}`,
+          }
+    );
+    const issues: string[] = store.body.schema?.issues ?? [];
+    schemaAligned = store.body.schema?.aligned === true;
+    checks.push(
+      schemaAligned
+        ? { name: 'Schema Alignment', pass: true, message: 'Relational schema aligned and foreign keys enabled' }
+        : { name: 'Schema Alignment', pass: false, message: `Schema misalignment detected: ${issues.join('; ')}` }
+    );
+    counts = store.body.counts ?? ZERO_COUNTS;
   }
 
-  // 2. Store Meta Consistency Check
+  // 2. Store meta, as the service resolved it from its own environment. In
+  // Docker mode that environment is the container's, which can differ from the
+  // host shell the doctor runs in.
+  const meta = health.store_meta;
+  const storeMetaMatch = meta?.match === true;
+  checks.push(
+    storeMetaMatch
+      ? {
+          name: 'Store Meta Consistency',
+          pass: true,
+          message: `Consistent with active config (tier: ${meta.embed_tier}, dim: ${meta.embed_dim})`,
+        }
+      : {
+          name: 'Store Meta Consistency',
+          pass: false,
+          message: `Mismatch detected: ${meta?.mismatch_reason || 'service reports store_meta mismatch'}`,
+        }
+  );
+
+  // 3. Generative producer configuration, as the service resolved it.
+  const aiConfig = await getJson('/diagnostics/ai-config');
+  checks.push(
+    aiConfig.ok
+      ? describeGenerativeConfig(aiConfig.body)
+      : { name: 'Generative Producer Config', pass: false, message: aiConfig.error }
+  );
+
+  // 4. AI conformance fixtures, run by the service (the only writer) against its store.
+  let aiDiagnostics = SKIPPED_AI;
+  if (runAi) {
+    const ai = await getJson('/diagnostics/ai');
+    if (ai.ok) {
+      aiDiagnostics = ai.body as AiDiagnosticsReport;
+      checks.push(aiCheck(aiDiagnostics));
+    } else {
+      aiDiagnostics = FAILED_AI;
+      checks.push({ name: 'AI Conformance Diagnostics', pass: false, message: ai.error });
+    }
+  } else {
+    checks.push({ name: 'AI Conformance Diagnostics', pass: true, message: 'Skipped (--no-ai)' });
+  }
+
+  return { dbOk, schemaAligned, storeMetaMatch, counts, aiDiagnostics, checks };
+}
+
+function runLocalChecks(db: Database | null, dbLabel: string, openError: string | null, runAi: boolean): Findings {
+  const checks: DoctorCheck[] = [];
+  let dbOk = false;
+  let schemaAligned = false;
   let storeMetaMatch = false;
-  try {
-    const metaRes = verifyOrCreateStoreMeta();
-    storeMetaMatch = metaRes.match;
-    if (metaRes.match) {
-      checks.push({
-        name: 'Store Meta Consistency',
-        pass: true,
-        message: `Consistent with active config (tier: ${metaRes.recipe.embed_tier}, dim: ${metaRes.recipe.embed_dim})`,
-      });
+  let counts = ZERO_COUNTS;
+
+  if (!db) {
+    checks.push({ name: 'Database Health', pass: false, message: openError || `Could not open ${dbLabel}` });
+    checks.push({ name: 'Schema Alignment', pass: false, message: 'Database inaccessible, skipping schema alignment check' });
+    checks.push({ name: 'Store Meta Consistency', pass: false, message: 'Database inaccessible, skipping store_meta check' });
+  } else {
+    const health = inspectDatabaseHealth(db);
+    dbOk = health.ok;
+    checks.push(
+      dbOk
+        ? {
+            name: 'Database Health',
+            pass: true,
+            message: `Database accessible read-only (journal_mode: ${health.journal_mode})`,
+          }
+        : {
+            name: 'Database Health',
+            pass: false,
+            message: `Database connection error: ${health.error}`,
+          }
+    );
+
+    if (dbOk) {
+      try {
+        // foreign_keys is per-connection; this read-only handle says nothing about the service's.
+        const schema = inspectSchemaAlignment(db, { checkForeignKeys: false });
+        schemaAligned = schema.aligned;
+        checks.push(
+          schemaAligned
+            ? { name: 'Schema Alignment', pass: true, message: 'Relational schema aligned' }
+            : {
+                name: 'Schema Alignment',
+                pass: false,
+                message: `Schema misalignment detected: ${schema.issues.join('; ')} (the service migrates the schema on start)`,
+              }
+        );
+      } catch (err) {
+        checks.push({ name: 'Schema Alignment', pass: false, message: `Failed to inspect schema: ${errorMessage(err)}` });
+      }
+
+      try {
+        const existing = db.prepare('SELECT * FROM store_meta WHERE id = 1').get() as StoreMetaRecord | undefined;
+        const recipe = resolveEmbedderRecipe();
+        if (!existing) {
+          // A fresh store: the service commits store_meta on its first start.
+          storeMetaMatch = true;
+          checks.push({
+            name: 'Store Meta Consistency',
+            pass: true,
+            message: `Not yet initialized; the service will commit tier ${recipe.embed_tier}, dim ${recipe.embed_dim} on first start`,
+          });
+        } else {
+          const cmp = compareStoreMeta(existing, recipe);
+          storeMetaMatch = cmp.match;
+          checks.push(
+            cmp.match
+              ? {
+                  name: 'Store Meta Consistency',
+                  pass: true,
+                  message: `Consistent with active config (tier: ${recipe.embed_tier}, dim: ${recipe.embed_dim})`,
+                }
+              : { name: 'Store Meta Consistency', pass: false, message: `Mismatch detected: ${cmp.mismatchReason}` }
+          );
+        }
+      } catch (err) {
+        checks.push({ name: 'Store Meta Consistency', pass: false, message: `Failed to verify store_meta: ${errorMessage(err)}` });
+      }
+
+      counts = countStoreRecords(db);
     } else {
-      checks.push({
-        name: 'Store Meta Consistency',
-        pass: false,
-        message: `Mismatch detected: ${metaRes.mismatchReason || 'configuration differs from store_meta'}`,
-      });
+      checks.push({ name: 'Schema Alignment', pass: false, message: 'Database inaccessible, skipping schema alignment check' });
+      checks.push({ name: 'Store Meta Consistency', pass: false, message: 'Database inaccessible, skipping store_meta check' });
     }
-  } catch (err) {
-    checks.push({
-      name: 'Store Meta Consistency',
-      pass: false,
-      message: `Failed to verify store_meta: ${err instanceof Error ? err.message : String(err)}`,
-    });
   }
 
-  // 3. Operational Counts (Dead Letters, Notes, Trajectories, Observations)
-  let deadLetterCount = 0;
-  let unknownScopeCount = 0;
-  let noteCount = 0;
-  let trajectoryCount = 0;
-  let observationCount = 0;
-
-  if (dbOk) {
-    try {
-      const db = getDb();
-      const dl = db.prepare('SELECT COUNT(*) as count FROM dead_letters').get() as { count: number };
-      deadLetterCount = dl?.count ?? 0;
-
-      const unk = db.prepare("SELECT COUNT(*) as count FROM notes WHERE scope = 'unknown'").get() as { count: number };
-      unknownScopeCount = unk?.count ?? 0;
-
-      const notes = db.prepare('SELECT COUNT(*) as count FROM notes').get() as { count: number };
-      noteCount = notes?.count ?? 0;
-
-      const traj = db.prepare('SELECT COUNT(*) as count FROM trajectories').get() as { count: number };
-      trajectoryCount = traj?.count ?? 0;
-
-      const obs = db.prepare('SELECT COUNT(*) as count FROM observations').get() as { count: number };
-      observationCount = obs?.count ?? 0;
-    } catch (err) {
-      logger.warn({ error: err }, 'failed to query operational counts');
-    }
-  }
-
-  // 3b. Generative producer configuration. Resolving a tier is what surfaces
-  // an impossible combination (a `vendor` tier with no key, `local` named for
-  // a generative function), so it belongs in the doctor report rather than
-  // waiting for the first consolidation run.
+  // Generative config resolves from this process's environment (loadBrainEnv).
   try {
-    const aiConfig = describeAiConfig() as Record<string, any>;
-    const broken = (['summarize', 'consolidate'] as const).filter((fn) => !aiConfig[fn]?.ok);
-    if (broken.length === 0) {
-      checks.push({
-        name: 'Generative Producer Config',
-        pass: true,
-        message: `summarize: ${aiConfig.summarize.tier}${
-          aiConfig.summarize.model ? ` (${aiConfig.summarize.model})` : ''
-        }, consolidate: ${aiConfig.consolidate.tier}${
-          aiConfig.consolidate.model ? ` (${aiConfig.consolidate.model})` : ''
-        }`,
-      });
-    } else {
-      checks.push({
-        name: 'Generative Producer Config',
-        pass: false,
-        message: broken.map((fn) => `${fn}: ${aiConfig[fn].error}`).join(' | '),
-      });
-    }
+    checks.push(describeGenerativeConfig(describeAiConfig() as Record<string, any>));
   } catch (err) {
     checks.push({
       name: 'Generative Producer Config',
       pass: false,
-      message: `Failed to resolve generative config: ${err instanceof Error ? err.message : String(err)}`,
+      message: `Failed to resolve generative config: ${errorMessage(err)}`,
     });
   }
 
-  // 4. AI Conformance Diagnostics (runs conformance fixtures)
-  let aiDiagnostics: AiDiagnosticsReport;
-  const shouldRunAi = options?.ai !== false;
-  if (shouldRunAi) {
+  // The fixtures seed and delete rows, so they never touch the real file:
+  // they run against a throwaway temp database.
+  let aiDiagnostics = SKIPPED_AI;
+  if (runAi) {
     try {
-      aiDiagnostics = runAiConformanceDiagnostics();
-      checks.push({
-        name: 'AI Conformance Diagnostics',
-        pass: aiDiagnostics.all_passing,
-        message: `${aiDiagnostics.passed_count}/${aiDiagnostics.total_count} assertions passed`,
-      });
+      aiDiagnostics = withIsolatedDb(() => runAiConformanceDiagnostics());
+      checks.push(aiCheck(aiDiagnostics));
     } catch (err) {
-      aiDiagnostics = {
-        status: 'failed',
-        all_passing: false,
-        passed_count: 0,
-        total_count: 0,
-        results: [],
-      };
-      checks.push({
-        name: 'AI Conformance Diagnostics',
-        pass: false,
-        message: `Failed to run diagnostics: ${err instanceof Error ? err.message : String(err)}`,
-      });
+      aiDiagnostics = FAILED_AI;
+      checks.push({ name: 'AI Conformance Diagnostics', pass: false, message: `Failed to run diagnostics: ${errorMessage(err)}` });
     }
   } else {
-    aiDiagnostics = {
-      status: 'ok',
-      all_passing: true,
-      passed_count: 0,
-      total_count: 0,
-      results: [],
-    };
-    checks.push({
-      name: 'AI Conformance Diagnostics',
-      pass: true,
-      message: 'Skipped (--no-ai)',
-    });
+    checks.push({ name: 'AI Conformance Diagnostics', pass: true, message: 'Skipped (--no-ai)' });
   }
 
-  // Compute single definitive boolean to prevent contradiction
+  return { dbOk, schemaAligned, storeMetaMatch, counts, aiDiagnostics, checks };
+}
+
+function openReadOnly(dbPath: string): { db: Database | null; error: string | null } {
+  if (dbPath === ':memory:' || dbPath.startsWith('file::memory:')) {
+    return { db: null, error: 'DATABASE_URL is :memory:; there is no database file to inspect' };
+  }
+  const resolved = path.resolve(dbPath);
+  if (!fs.existsSync(resolved)) {
+    return {
+      db: null,
+      error: `No database at ${resolved}. Start the service once (neuralbrain start) to create it.`,
+    };
+  }
+  try {
+    return { db: openDatabase(resolved, { readOnly: true }), error: null };
+  } catch (err) {
+    return { db: null, error: `Could not open ${resolved} read-only: ${errorMessage(err)}` };
+  }
+}
+
+function isTestRun(): boolean {
+  return process.env.NODE_ENV === 'test' || Boolean(process.env.JEST_WORKER_ID);
+}
+
+export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorReport> {
+  const mode = options.mode ?? 'auto';
+  // Mirrors db.ts refusing real database paths under test: a test must name the
+  // service it talks to, or it would probe (and authenticate against) a real
+  // brain on the default port.
+  if (isTestRun() && mode !== 'local' && !options.apiUrl && !options.fetchFn) {
+    throw new Error(
+      "runDoctor() under test must pass mode: 'local' or an explicit apiUrl/fetchFn; refusing to probe a real service."
+    );
+  }
+  const runAi = options.ai !== false;
+  const fetchFn = options.fetchFn ?? createLocalTlsFetch();
+  const apiUrl = (options.apiUrl ?? resolveApiUrl({}, packageRoot(), process.cwd())).replace(/\/+$/, '');
+
+  let source: DoctorSource = 'local';
+  let target = '';
+  let findings: Findings;
+
+  const health = mode === 'local' ? null : await probeHealth(fetchFn, apiUrl);
+
+  if (health) {
+    source = 'service';
+    target = apiUrl;
+    const apiKey = options.apiKey ?? resolveApiKey({}, packageRoot(), process.cwd());
+    findings = await runServiceChecks(fetchFn, apiUrl, apiKey, health, runAi);
+  } else if (mode === 'service') {
+    source = 'service';
+    target = apiUrl;
+    findings = {
+      dbOk: false,
+      schemaAligned: false,
+      storeMetaMatch: false,
+      counts: ZERO_COUNTS,
+      aiDiagnostics: runAi ? FAILED_AI : SKIPPED_AI,
+      checks: [{ name: 'Service Reachable', pass: false, message: `No response from ${apiUrl}/health` }],
+    };
+  } else if (options.db) {
+    target = 'provided connection';
+    findings = runLocalChecks(options.db, target, null, runAi);
+  } else {
+    const dbPath = options.dbPath ?? getDbPath();
+    target = path.resolve(dbPath);
+    const { db, error } = openReadOnly(dbPath);
+    try {
+      findings = runLocalChecks(db, target, error, runAi);
+    } finally {
+      db?.close();
+    }
+  }
+
+  const { checks, aiDiagnostics, counts } = findings;
   const totalChecks = checks.length;
   const passedChecks = checks.filter((c) => c.pass).length;
-  const allPassing = passedChecks === totalChecks && dbOk && schemaAligned && storeMetaMatch && aiDiagnostics.all_passing;
+  // One verdict, computed once, so the report can never say "N/M passing" and
+  // "all checks passing" at the same time.
+  const allPassing =
+    passedChecks === totalChecks &&
+    findings.dbOk &&
+    findings.schemaAligned &&
+    findings.storeMetaMatch &&
+    aiDiagnostics.all_passing;
 
-  // Print Structured Report
-  console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║                      NEURALBRAIN DOCTOR                      ║');
-  console.log('╚══════════════════════════════════════════════════════════════╝\n');
+  if (!options.quiet) {
+    console.log('\n╔══════════════════════════════════════════════════════════════╗');
+    console.log('║                      NEURALBRAIN DOCTOR                      ║');
+    console.log('╚══════════════════════════════════════════════════════════════╝\n');
+    console.log(
+      source === 'service'
+        ? `  Source: running service at ${target}\n`
+        : `  Source: service not reachable at ${apiUrl}; inspected ${target} read-only\n`
+    );
 
-  for (const check of checks) {
-    const symbol = check.pass ? '✓ PASS' : '✗ FAIL';
-    console.log(`  [${symbol}] ${check.name.padEnd(28)} : ${check.message}`);
-  }
-
-  console.log('\n  Operational Metrics:');
-  console.log(`    - Dead Letters Recorded  : ${deadLetterCount}`);
-  console.log(`    - Unknown-Scope Notes    : ${unknownScopeCount}`);
-  console.log(`    - Total Notes            : ${noteCount}`);
-  console.log(`    - Trajectories Stored    : ${trajectoryCount}`);
-  console.log(`    - Observations Stored    : ${observationCount}`);
-
-  if (aiDiagnostics.results && aiDiagnostics.results.length > 0) {
-    console.log('\n  AI Diagnostics Breakdown:');
-    for (const r of aiDiagnostics.results) {
-      const sym = r.pass ? '✓' : '✗';
-      console.log(`    ${sym} ${r.name}`);
+    for (const check of checks) {
+      const symbol = check.pass ? '✓ PASS' : '✗ FAIL';
+      console.log(`  [${symbol}] ${check.name.padEnd(28)} : ${check.message}`);
     }
-  }
 
-  console.log('\n══════════════════════════════════════════════════════════════');
-  if (allPassing) {
-    console.log('  Final Verdict: PASS (All checks passing)');
-  } else {
-    console.log(`  Final Verdict: FAIL (${passedChecks}/${totalChecks} checks passing)`);
+    console.log('\n  Operational Metrics:');
+    console.log(`    - Dead Letters Recorded  : ${counts.dead_letters}`);
+    console.log(`    - Unknown-Scope Notes    : ${counts.unknown_scope_notes}`);
+    console.log(`    - Total Notes            : ${counts.notes}`);
+    console.log(`    - Trajectories Stored    : ${counts.trajectories}`);
+    console.log(`    - Observations Stored    : ${counts.observations}`);
+
+    if (aiDiagnostics.results && aiDiagnostics.results.length > 0) {
+      console.log('\n  AI Diagnostics Breakdown:');
+      for (const r of aiDiagnostics.results) {
+        console.log(`    ${r.pass ? '✓' : '✗'} ${r.name}`);
+      }
+    }
+
+    console.log('\n══════════════════════════════════════════════════════════════');
+    console.log(
+      allPassing
+        ? '  Final Verdict: PASS (All checks passing)'
+        : `  Final Verdict: FAIL (${passedChecks}/${totalChecks} checks passing)`
+    );
+    console.log('══════════════════════════════════════════════════════════════\n');
   }
-  console.log('══════════════════════════════════════════════════════════════\n');
 
   if (options.exitOnFinish) {
     process.exit(allPassing ? 0 : 1);
@@ -386,23 +529,29 @@ export async function runDoctor(options: {
 
   return {
     allPassing,
-    dbOk,
-    schemaAligned,
-    storeMetaMatch,
-    deadLetterCount,
-    unknownScopeCount,
-    noteCount,
-    trajectoryCount,
-    observationCount,
+    source,
+    target,
+    dbOk: findings.dbOk,
+    schemaAligned: findings.schemaAligned,
+    storeMetaMatch: findings.storeMetaMatch,
+    deadLetterCount: counts.dead_letters,
+    unknownScopeCount: counts.unknown_scope_notes,
+    noteCount: counts.notes,
+    trajectoryCount: counts.trajectories,
+    observationCount: counts.observations,
     aiDiagnostics,
     checks,
   };
 }
 
 if (require.main === module) {
+  // `npm run doctor` runs this file directly; `neuralbrain doctor` has already
+  // loaded the env, and loadBrainEnv never clobbers what is set.
+  loadBrainEnv();
   const isNoAi = process.argv.includes('--no-ai');
   const isAi = (process.argv.includes('--ai') || process.argv.includes('--consolidator')) && !isNoAi;
-  runDoctor({ ai: isNoAi ? false : isAi, exitOnFinish: true }).catch((err) => {
+  const mode = process.argv.includes('--local') ? 'local' : process.argv.includes('--service') ? 'service' : 'auto';
+  runDoctor({ ai: isNoAi ? false : isAi, exitOnFinish: true, mode }).catch((err) => {
     console.error('Doctor execution crashed:', err);
     process.exit(1);
   });

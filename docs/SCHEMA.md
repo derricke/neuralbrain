@@ -8,8 +8,7 @@ rebuildable from these tables at any time.
 > row lives in SQLite and never in Qdrant, invisible to search with nothing
 > reporting it. Read-only inspection (`file:...?mode=ro`) is fine for diagnosis;
 > repair goes through `POST /maintenance/*`. Tests use `:memory:` or a temp path,
-> and `getDb()` refuses anything else under a test run. Full reasoning in
-> [CLAUDE.md](../CLAUDE.md#database-access-one-process-one-connection).
+> and `getDb()` refuses anything else under a test run.
 
 Conventions: ids are TEXT (uuid), timestamps are INTEGER unix seconds
 (`unixepoch()`), booleans are INTEGER 0/1. No foreign keys to anything outside

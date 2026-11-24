@@ -6,6 +6,7 @@ import { parseDurationMs } from './lib/recurrence';
 import { getCorrelationId, requestTracing } from './middleware/tracing';
 import { createRateLimiter } from './middleware/rateLimiter';
 import { apiKeyAuth, hashApiKey, setDashboardSessionCookie } from './middleware/auth';
+import { countStoreRecords, inspectDatabaseHealth, inspectSchemaAlignment } from './lib/storeDiagnostics';
 import { captureObservations, getObservation, listObservations } from './memory/observationStore';
 import {
   captureTrajectories,
@@ -1399,6 +1400,19 @@ export function createApp(): express.Application {
   app.get('/diagnostics/ai', (_req: Request, res: Response) => {
     const diagnostics = runAiConformanceDiagnostics();
     res.json(diagnostics);
+  });
+
+  // Read-only store inspection for `neuralbrain doctor`. The doctor asks the
+  // service instead of opening the database file itself, so the service stays
+  // the only process with the file open for writing.
+  app.get('/diagnostics/store', (_req: Request, res: Response) => {
+    const db = getDb();
+    const health = inspectDatabaseHealth(db);
+    res.json({
+      db: health,
+      schema: health.ok ? inspectSchemaAlignment(db) : { aligned: false, issues: ['database unavailable'] },
+      counts: health.ok ? countStoreRecords(db) : null,
+    });
   });
 
   // Resolved generative configuration. Never includes an API key or any part

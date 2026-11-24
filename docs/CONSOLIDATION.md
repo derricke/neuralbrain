@@ -5,7 +5,7 @@
 > examines common failure modes of LLM summarisation pipelines in memory systems, compares Prompt A vs Prompt B contracts,
 > details the reasoning model token budget trap, and specifies invariants for derived rows.
 >
-> Master constitution: [CLAUDE.md](../CLAUDE.md). Contract schema: [docs/CONTRACTS.md](CONTRACTS.md). Verification gate: `src/consolidation/gate.ts`.
+> Contract schema: [docs/CONTRACTS.md](CONTRACTS.md). Verification gate: `src/consolidation/gate.ts`.
 
 ---
 

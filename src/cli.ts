@@ -843,7 +843,9 @@ async function cmdStart(): Promise<void> {
   const protocol = useHttps ? 'https' : 'http';
   console.log(`Starting neuralbrain (mode: ${mode})...`);
   startForMode(mode, envPath, packageRoot);
-  const healthy = await waitForHealth(port, 30000, useHttps);
+  // Docker mode builds the image first (`up --build`), so give it the same
+  // headroom install does.
+  const healthy = await waitForHealth(port, mode === 'docker' ? 90000 : 30000, useHttps);
   console.log(healthy ? `Ready at ${protocol}://127.0.0.1:${port}` : 'Started, waiting for health check...');
 }
 
@@ -873,6 +875,51 @@ function cmdStop(): void {
   if (!stoppedHost && !fs.existsSync(envPath)) {
     console.log('Nothing running.');
   }
+}
+
+/**
+ * Polls `isUp` until it reports false (the old service has let go of its port)
+ * or `timeoutMs` passes. Returns true once the service is down.
+ *
+ * `stop` returns as soon as SIGTERM is sent to a host daemon, which then takes
+ * a moment to drain and exit. Starting before it has gone would either fail on
+ * the port or, worse, let the new start's health wait be answered by the old
+ * process.
+ */
+export async function waitForShutdown(
+  isUp: () => Promise<boolean>,
+  timeoutMs = 15000,
+  intervalMs = 250
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    if (!(await isUp())) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
+async function cmdRestart(): Promise<void> {
+  loadBrainEnv();
+  const envPath = getBrainEnvPath();
+  if (!fs.existsSync(envPath)) {
+    throw new Error(`Not initialized. Run \`neuralbrain install\` first (missing ${envPath}).`);
+  }
+  const port = parseInt(process.env.PORT || '3737', 10);
+  const useHttps = isHttpsEnabled();
+
+  console.log('Stopping neuralbrain...');
+  cmdStop();
+
+  const down = await waitForShutdown(async () => (await checkHealth(port, useHttps)) !== null);
+  if (!down) {
+    throw new Error(
+      `Something is still answering on port ${port} after stopping. ` +
+        'Not starting a second copy; check `neuralbrain status`.'
+    );
+  }
+
+  await cmdStart();
 }
 
 async function cmdStatus(): Promise<void> {
@@ -1355,6 +1402,7 @@ Commands:
     --no-agents     Skip configuring coding agents
   start           Start the configured Brain service
   stop            Stop running Brain / Docker containers
+  restart         Stop, wait for the port to free, then start (docker mode rebuilds the image)
   status          Show service and health status
   logs            Tail Brain service logs
   doctor          Run health and AI conformance diagnostics
@@ -1398,6 +1446,10 @@ async function main(): Promise<void> {
   }
   if (sub === 'stop') {
     cmdStop();
+    return;
+  }
+  if (sub === 'restart') {
+    await cmdRestart();
     return;
   }
   if (sub === 'status') {

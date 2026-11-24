@@ -2,7 +2,7 @@
 
 > **Purpose:** Engineering roadmap to raise Neuralbrain's real-world memory retrieval accuracy and context efficiency across coding agents, assistants, and long-horizon evaluations (targeting **92%+ on LongMemEval** without adding a generative extractor LLM).
 >
-> **Architectural Guardrails (from `CLAUDE.md`):**
+> **Architectural Guardrails:**
 > - **Rule 1 (No LLM in the capture path):** All ingest-time processing must be deterministic (structural parsing, rule-based NLP, or local discriminative encoders/NER—never a generative LLM rewriting records).
 > - **Rule 2 (SQLite is source of truth):** Raw `input` / `output` stay verbatim and unmutated in SQLite. Any condensed text, extracted dates, entities, or chunks are **additive and disposable** (Rule 6).
 > - **Rule 3–7:** Never reject writes for capacity; preserve explicit scope; never filter by `agent_id`; keep `user_id` filtering opt-in.

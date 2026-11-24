@@ -7,8 +7,7 @@
  * unparseable JSON are all *verification* outcomes, handled by the gate so
  * they land in `dead_letters` attributed to the producer that caused them.
  *
- * The asymmetry with the embedder is intentional (CLAUDE.md, "A deliberate
- * asymmetry"): a consolidator may fall back because every derived row records
+ * The asymmetry with the embedder is intentional: a consolidator may fall back because every derived row records
  * which producer actually wrote it and can be deleted and regenerated. The
  * embedder may not, because a different vector space is not recoverable.
  */

@@ -378,6 +378,29 @@ export function logTrajectory(record: TrajectoryRecord): string {
   return id;
 }
 
+/**
+ * Maps the wire format's snake_case fields (what docs/API.md documents and the
+ * plugin's Stop hook sends) onto TrajectoryRecord's camelCase ones. Without
+ * this, a `{scope: 'project', project_id: ...}` item passed the checks above
+ * and then failed inside logTrajectory, which only read `projectId`, so every
+ * hook-signalled session outcome was dead-lettered. camelCase wins when both
+ * are present.
+ */
+function normalizeTrajectoryItem(item: Record<string, unknown>): TrajectoryRecord {
+  const pick = (camel: string, snake: string): unknown => item[camel] ?? item[snake];
+  return {
+    ...(item as TrajectoryRecord),
+    projectId: (pick('projectId', 'project_id') ?? item.swarm_id ?? item.swarmId) as string | null | undefined,
+    sessionId: pick('sessionId', 'session_id') as string | null | undefined,
+    taskType: pick('taskType', 'task_type') as string | null | undefined,
+    taskRef: pick('taskRef', 'task_ref') as string | null | undefined,
+    noteRef: pick('noteRef', 'note_ref') as string | null | undefined,
+    rollupSource: pick('rollupSource', 'rollup_source') as RollupSource | undefined,
+    toolCalls: pick('toolCalls', 'tool_calls') as number | undefined,
+    durationMs: pick('durationMs', 'duration_ms') as number | undefined,
+  };
+}
+
 export function captureTrajectories(rawItems: unknown[]): CaptureTrajectoriesResult {
   if (!Array.isArray(rawItems)) {
     throw new Error('captureTrajectories expects an array of trajectory items');
@@ -448,7 +471,7 @@ export function captureTrajectories(rawItems: unknown[]): CaptureTrajectoriesRes
     }
 
     try {
-      const id = logTrajectory(item as TrajectoryRecord);
+      const id = logTrajectory(normalizeTrajectoryItem(item));
       ids.push(id);
     } catch (err) {
       recordDeadLetter({

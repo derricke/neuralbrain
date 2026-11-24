@@ -493,10 +493,24 @@ The raw key is returned only upon creation and cannot be retrieved again.
 Revokes/deletes an active API key by its `id`. Subsequent requests using this key
 fail with `401 Unauthorized`.
 
+### `GET /diagnostics/store`
+
+Read-only inspection of the service's own connection, so `neuralbrain doctor`
+never has to open the database file:
+
+```json
+{"db":{"ok":true,"journal_mode":"wal"},
+ "schema":{"aligned":true,"issues":[]},
+ "counts":{"dead_letters":0,"unknown_scope_notes":0,"notes":84,"trajectories":118,"observations":6742}}
+```
+
+`schema.issues` includes `PRAGMA foreign_keys is not active` when the service
+connection runs without foreign keys.
+
 ### `GET /diagnostics/ai`
 
 Runs the conformance fixtures against each configured function and reports
-pass/fail per assertion with offending values. Backs `brain doctor --ai`.
+pass/fail per assertion with offending values. Backs `neuralbrain doctor --ai`.
 
 Must never be able to report "N/M passing" and "all checks passing" in the same
 response, a failure common to memory-tool health checks. One verdict, computed once.

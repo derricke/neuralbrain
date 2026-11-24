@@ -136,9 +136,10 @@ Install flags: `--mode`, `--port`, `--https`, `--gpu`, `--yes`, `--no-global`, `
 ```bash
 neuralbrain start          # start whatever mode you installed
 neuralbrain stop
+neuralbrain restart        # stop, wait for the port to free, start (docker rebuilds the image)
 neuralbrain status         # BRAIN_HOME, mode, daemon PID, /health
 neuralbrain logs
-neuralbrain doctor         # health checks plus the AI conformance tests
+neuralbrain doctor         # health checks via the running service (--ai adds the AI conformance tests)
 neuralbrain install-agent  # wire up your agents
 neuralbrain init           # write .brainrc here: one project_id for this folder and below
 neuralbrain mcp            # run the stdio MCP server
@@ -302,13 +303,12 @@ It doesn't use `innerHTML` or `localStorage`, and it runs under a strict CSP. Lo
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run mcp` | stdio MCP server |
 | `npm run install-agent` | wire up agents |
-| `npm run doctor` | health checks and AI conformance tests |
+| `npm run doctor` | health checks (`-- --ai` adds the AI conformance tests) |
 | `npm run smoke` | end-to-end check against a live service and Qdrant |
 | `npm run api-key:create` | make a new API key |
 
 ## Docs
 
-- [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md): the rules, for agents working on this repo
 - [docs/API.md](docs/API.md): HTTP endpoints
 - [docs/MCP.md](docs/MCP.md): MCP tools
 - [docs/SCHEMA.md](docs/SCHEMA.md): SQLite schema and Qdrant payloads

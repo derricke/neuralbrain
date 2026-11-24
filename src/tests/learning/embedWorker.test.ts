@@ -4,6 +4,7 @@ import { verifyOrCreateStoreMeta } from '../../learning/storeMeta';
 import {
   createQdrantCollectionWithIndexes,
   drainEmbedQueue,
+  ensureInitialEmbeddingsSync,
   getReembedStatus,
   startReembed,
 } from '../../learning/embedWorker';
@@ -34,6 +35,25 @@ describe('embedWorker single-flight and re-embed yield', () => {
     resetDb();
     setCustomEmbedder(null);
     process.env = { ...originalEnv };
+  });
+
+  it('ensureInitialEmbeddingsSync treats a Qdrant alias as an existing collection (re-embedded store)', async () => {
+    const mockQdrant = {
+      // After a re-embed only the versioned collection is listed; `brain` is an alias.
+      getCollections: jest.fn().mockResolvedValue({ collections: [{ name: 'brain_v_1795324181' }] }),
+      getAliases: jest.fn().mockResolvedValue({
+        aliases: [{ alias_name: 'brain', collection_name: 'brain_v_1795324181' }],
+      }),
+      getCollection: jest.fn().mockResolvedValue({ points_count: 42 }),
+      createCollection: jest.fn().mockRejectedValue(new Error('Bad Request')),
+      createPayloadIndex: jest.fn().mockResolvedValue(true),
+    } as any;
+
+    const res = await ensureInitialEmbeddingsSync({ client: mockQdrant });
+    expect(mockQdrant.createCollection).not.toHaveBeenCalled();
+    expect(mockQdrant.getCollection).toHaveBeenCalledWith('brain');
+    expect(res.reason).not.toContain('Bad Request');
+    expect(res.reason).toContain('pointCount=42');
   });
 
   it('prevents concurrent drainEmbedQueue execution via single-flight lock and releases in finally', async () => {

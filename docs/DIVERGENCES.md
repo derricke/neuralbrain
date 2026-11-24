@@ -4,8 +4,6 @@
 > what was decoupled, and every intentional divergence made from the legacy schema and architecture.
 > "The copy did it this way" is never accepted as an engineering rationale; every divergence is recorded here
 > with its underlying justification.
->
-> Master constitution: [CLAUDE.md](../CLAUDE.md).
 
 ---
 

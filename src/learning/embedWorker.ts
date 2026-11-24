@@ -641,7 +641,16 @@ export async function ensureInitialEmbeddingsSync(options?: {
   try {
     const targetCollection = getStoreMeta()?.qdrant_alias || 'brain';
     const collections = await qdrant.getCollections();
-    const collectionExists = collections.collections.some((c) => c.name === targetCollection);
+    // After a re-embed, `brain` is an alias onto brain_v_<ts>, and
+    // getCollections lists only real collections. Treat an alias as existing:
+    // creating a collection under an alias's name is a 400 from Qdrant, which
+    // used to abort this whole probe on every start of a re-embedded store.
+    const aliasesRes = typeof (qdrant as any).getAliases === 'function'
+      ? await (qdrant as any).getAliases().catch(() => null)
+      : null;
+    const collectionExists =
+      collections.collections.some((c) => c.name === targetCollection) ||
+      Boolean(aliasesRes?.aliases?.some((a: any) => a.alias_name === targetCollection));
 
     if (!collectionExists) {
       await createQdrantCollectionWithIndexes(qdrant, targetCollection, recipe.embed_dim);

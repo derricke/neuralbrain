@@ -1036,7 +1036,9 @@ describe('Build Order Acceptance & Standing Invariants Suite (Steps 1–10 & Inv
       }
 
       // Also verify runDoctor script logic
-      const docResult = await runDoctor({ ai: true, exitOnFinish: false });
+      // Local mode on this suite's own connection: auto mode would probe a real
+      // service on the default port.
+      const docResult = await runDoctor({ mode: 'local', db: getDb(), ai: true, exitOnFinish: false, quiet: true });
       expect(docResult.allPassing).toBe(true);
       expect(docResult.aiDiagnostics?.all_passing).toBe(
         docResult.aiDiagnostics?.passed_count === docResult.aiDiagnostics?.total_count

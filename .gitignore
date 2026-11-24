@@ -28,3 +28,7 @@ BRANDING.md
 graphify-out/
 .agents/rules/graphify.md
 .agents/workflows/graphify.md
+
+# Local agent constitution (not published)
+/CLAUDE.md
+/AGENTS.md

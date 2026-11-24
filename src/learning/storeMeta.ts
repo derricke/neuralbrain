@@ -57,26 +57,8 @@ export function verifyOrCreateStoreMeta(
     };
   }
 
-  // If configured as 'none', we are deliberately running in bm25-only mode without error
-  if (recipe.embed_tier === 'none') {
-    return {
-      match: true,
-      meta: existing,
-      recipe,
-    };
-  }
-
-  // Compare both embed_model_id and embed_dim, as well as tier and prefixes
-  const isMatch =
-    existing.embed_tier === recipe.embed_tier &&
-    existing.embed_model_id === recipe.embed_model_id &&
-    existing.embed_dim === recipe.embed_dim &&
-    existing.doc_prefix === recipe.doc_prefix &&
-    existing.query_prefix === recipe.query_prefix;
-
-  if (!isMatch) {
-    const mismatchReason = `vector search unavailable: store_meta expects embed_model_id=${existing.embed_model_id} (dim=${existing.embed_dim}, tier=${existing.embed_tier}), but config resolved embed_model_id=${recipe.embed_model_id} (dim=${recipe.embed_dim}, tier=${recipe.embed_tier}). Run POST /maintenance/reembed to rebuild the index.`;
-
+  const comparison = compareStoreMeta(existing, recipe);
+  if (!comparison.match) {
     logger.error(
       {
         expected: {
@@ -89,23 +71,48 @@ export function verifyOrCreateStoreMeta(
           embed_model_id: recipe.embed_model_id,
           embed_dim: recipe.embed_dim,
         },
-        reason: mismatchReason,
+        reason: comparison.mismatchReason,
       },
       'store_meta mismatch detected'
     );
-
-    return {
-      match: false,
-      meta: existing,
-      recipe,
-      mismatchReason,
-    };
   }
 
   return {
-    match: true,
+    match: comparison.match,
     meta: existing,
     recipe,
+    ...(comparison.mismatchReason ? { mismatchReason: comparison.mismatchReason } : {}),
+  };
+}
+
+/**
+ * Pure comparison of a committed store_meta row against a resolved embedder
+ * recipe. Reads nothing and writes nothing, so the doctor can use it against a
+ * read-only connection.
+ */
+export function compareStoreMeta(
+  existing: StoreMetaRecord,
+  recipe: ResolvedEmbedderRecipe
+): { match: boolean; mismatchReason?: string } {
+  // If configured as 'none', we are deliberately running in bm25-only mode without error
+  if (recipe.embed_tier === 'none') {
+    return { match: true };
+  }
+
+  // Compare both embed_model_id and embed_dim, as well as tier and prefixes
+  const isMatch =
+    existing.embed_tier === recipe.embed_tier &&
+    existing.embed_model_id === recipe.embed_model_id &&
+    existing.embed_dim === recipe.embed_dim &&
+    existing.doc_prefix === recipe.doc_prefix &&
+    existing.query_prefix === recipe.query_prefix;
+
+  if (isMatch) {
+    return { match: true };
+  }
+  return {
+    match: false,
+    mismatchReason: `vector search unavailable: store_meta expects embed_model_id=${existing.embed_model_id} (dim=${existing.embed_dim}, tier=${existing.embed_tier}), but config resolved embed_model_id=${recipe.embed_model_id} (dim=${recipe.embed_dim}, tier=${recipe.embed_tier}). Run POST /maintenance/reembed to rebuild the index.`,
   };
 }
 
