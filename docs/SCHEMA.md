@@ -129,8 +129,9 @@ spans in `resolved_dates_json` (`NULL` when none match), and feeds inline
 conversational boilerplate, deduplicates near-identical lines, preserves concise
 `prompt` observations (`<= 500` chars), and extracts high-signal passages for
 verbose `response` and `tool_call` rows. `trg_fts_observations_au` is scoped to
-`AFTER UPDATE OF id, tool_name, file_path, input, output` so updating non-FTS
-columns never re-indexes `fts_observations`.
+`AFTER UPDATE OF id, tool_name, file_path, input, output, condensed_text` so updating
+non-FTS columns (`resolved_dates_json`, `archived_at`, etc.) never re-indexes
+`fts_observations`.
 `file_path` is defined narrowly: the path a tool acted on. A path merely
 mentioned in command output does not count. (Testing showed two producers
 disagreeing on this exact point with nothing to flag it.)
@@ -522,16 +523,40 @@ process" from a bare file read. Deliberate prose is a `note`, authored on purpos
 
 Six FTS5 virtual tables (`tokenize='porter unicode61'`) kept synchronized by
 `AFTER INSERT` / `AFTER UPDATE` / `AFTER DELETE` triggers (plus `note_concepts`,
-`note_files`, and `summary_claims` triggers) and backfilled on migration:
+`note_files`, and `summary_claims` triggers) and backfilled on migration (legacy
+5-column `fts_observations` tables without `condensed_text` are automatically
+recreated and backfilled):
 
 ```sql
 fts_notes(record_id UNINDEXED, title, content, extra, tokenize='porter unicode61')
 fts_trajectories(record_id UNINDEXED, description, result, task_type, tokenize='porter unicode61')
-fts_observations(record_id UNINDEXED, tool_name, file_path, input, output, tokenize='porter unicode61')
+fts_observations(record_id UNINDEXED, tool_name, file_path, input, output, condensed_text, tokenize='porter unicode61')
 fts_summaries(record_id UNINDEXED, text, tokenize='porter unicode61')
 fts_entities(record_id UNINDEXED, name, entity_type, description, external_ref, tokenize='porter unicode61')
 fts_actions(record_id UNINDEXED, title, description, blocked_reason, tokenize='porter unicode61')
 ```
+
+### Two-Tier FTS5 Querying & Explicit BM25 Column Weights
+
+Lexical search (`src/learning/search.ts`) bounds query scans (`MAX_FTS_QUERY_CHARS = 4000`,
+`MAX_FTS_TOKENS = 48` so AST depth never approaches `SQLITE_MAX_EXPR_DEPTH`), filters
+high-frequency English stopwords (with automatic fallback to unfiltered tokens on
+pure-stopword queries), and executes two FTS5 tiers:
+1. **Tier 1 (Strict `AND` / `NEAR`)**: Runs over top high-specificity content terms
+   (and `NEAR(..., 6)` on quoted multi-word titles) when `>= 2` content tokens exist,
+   applying a `1.6x` BM25 multiplier (`max(strictBm25 * 1.6, relaxedBm25 * 1.35)`).
+2. **Tier 2 (Relaxed `OR`)**: Broad lexical recall over quoted tokens.
+
+Every FTS5 query uses explicit per-column `bm25(...)` weights (`0.0` on `UNINDEXED` `record_id`):
+- `fts_observations` (`record_id, tool_name, file_path, input, output, condensed_text`):
+  - `'general'` intent: `bm25(fts_observations, 0.0, 1.5, 1.6, 1.6, 0.75, 1.8)`
+  - `'assistant'` intent: `bm25(fts_observations, 0.0, 1.2, 1.2, 1.0, 1.4, 1.6)`
+  - `'tool'` intent: `bm25(fts_observations, 0.0, 2.0, 2.2, 1.4, 1.0, 1.5)`
+- `fts_notes` (`record_id, title, content, extra`): `bm25(fts_notes, 0.0, 2.2, 1.0, 1.6)`
+- `fts_trajectories` (`record_id, description, result, task_type`): `bm25(fts_trajectories, 0.0, 1.6, 1.0, 1.4)`
+- `fts_summaries` (`record_id, text`): `bm25(fts_summaries, 0.0, 1.0)`
+- `fts_entities` (`record_id, name, entity_type, description, external_ref`): `bm25(fts_entities, 0.0, 2.5, 1.4, 1.0, 1.8)`
+- `fts_actions` (`record_id, title, description, blocked_reason`): `bm25(fts_actions, 0.0, 2.0, 1.0, 1.2)`
 
 ---
 

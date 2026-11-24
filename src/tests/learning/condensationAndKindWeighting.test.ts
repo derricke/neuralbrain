@@ -258,7 +258,7 @@ describe('Task 1: Extractive Condensation, Query-Focused Snippets, and Intent-Aw
         scope: 'project',
         project_id: 'nb-general',
         kind: 'prompt',
-        input: 'velvet roast espresso beans',
+        input: 'velvet roast coffee beans',
       },
       {
         id: 'obs-gen-response',

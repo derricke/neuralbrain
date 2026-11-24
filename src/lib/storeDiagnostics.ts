@@ -116,16 +116,28 @@ export function inspectSchemaAlignment(
     }
   }
 
+  const requiredFtsTables = [
+    'fts_notes',
+    'fts_trajectories',
+    'fts_observations',
+    'fts_summaries',
+    'fts_entities',
+    'fts_actions',
+  ];
   const ftsRows = db
     .prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('fts_notes', 'fts_entities', 'fts_actions')"
+      "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name IN ('fts_notes', 'fts_trajectories', 'fts_observations', 'fts_summaries', 'fts_entities', 'fts_actions')"
     )
-    .all() as Array<{ name: string }>;
-  const ftsSet = new Set(ftsRows.map((r) => r.name));
-  for (const ftsName of ['fts_notes', 'fts_entities', 'fts_actions']) {
-    if (!ftsSet.has(ftsName)) {
+    .all() as Array<{ name: string; sql?: string }>;
+  const ftsMap = new Map(ftsRows.map((r) => [r.name, r.sql || '']));
+  for (const ftsName of requiredFtsTables) {
+    if (!ftsMap.has(ftsName)) {
       issues.push(`FTS5 table ${ftsName} does not exist`);
     }
+  }
+  const ftsObsSql = ftsMap.get('fts_observations');
+  if (ftsObsSql !== undefined && !ftsObsSql.includes('condensed_text')) {
+    issues.push('fts_observations.condensed_text missing');
   }
 
   const actionCols = getTableColumns('actions');

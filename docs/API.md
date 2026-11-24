@@ -88,7 +88,9 @@ failed source, `1` only for a client-signalled rollup with no failure, and `NULL
 
 ### `POST /search`
 
-3-signal hybrid retrieval: Qdrant dense vectors + SQLite FTS5 BM25 + Entity-Graph
+3-signal hybrid retrieval: Qdrant dense vectors + two-tier SQLite FTS5 BM25
+(stopword-filtered relaxed `OR` + boosted strict `AND`/`NEAR` with explicit
+per-column BM25 weights, including `observations.condensed_text`) + Entity-Graph
 1-hop expansion (`entity_edges`), fused with RRF ($1 / (60 + \text{rank})$) and
 scaled by hierarchical tier multipliers (`exact > parent > grandparent > global > child`)
 and temporal bias/validity adjustments.

@@ -426,8 +426,9 @@ describe('hybridSearch', () => {
     expect(buildSafeFtsQuery('')).toBeNull();
     expect(buildSafeFtsQuery('   --- /// ::: *** "" ')).toBeNull();
     expect(buildSafeFtsQuery('AND OR NOT "src/lib/db.ts" foo:bar* foo')).toBe(
-      '"and" OR "or" OR "not" OR "src" OR "lib" OR "db" OR "ts" OR "foo" OR "bar"'
+      '"src" OR "lib" OR "db" OR "ts" OR "foo" OR "bar"'
     );
+    expect(buildSafeFtsQuery('AND OR NOT')).toBe('"and" OR "or" OR "not"');
 
     verifyOrCreateStoreMeta();
     process.env.BRAIN_EMBED = 'none';

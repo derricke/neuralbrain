@@ -497,4 +497,95 @@ describe('db migrations, entities/edges DDL, and FTS5 sync', () => {
     expect((db2.prepare(`SELECT COUNT(*) AS n FROM fts_notes`).get() as { n: number }).n).toBe(2);
     expect((db2.prepare(`SELECT COUNT(*) AS n FROM fts_actions`).get() as { n: number }).n).toBe(1);
   });
+
+  it('upgrades a legacy 5-column fts_observations virtual table to 6 columns (condensed_text) and backfills existing rows', () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nb-legacy-fts-obs-'));
+    const dbFile = path.join(tmpDir, 'brain.db');
+
+    // First create a migrated DB, then downgrade fts_observations and its triggers back to the 5-column DDL
+    process.env.DATABASE_URL = dbFile;
+    const initialDb = getDb();
+    initialDb
+      .prepare(
+        `INSERT INTO notes (id, scope, project_id, type, title, content)
+         VALUES ('note-preexisting-1', 'project', 'acme/cogs', 'fact', 'Preexisting note', 'Already indexed in fts_notes')`
+      )
+      .run();
+    initialDb
+      .prepare(
+        `INSERT INTO observations (id, scope, project_id, kind, tool_name, file_path, input, output, condensed_text)
+         VALUES ('obs-legacy-fts-1', 'project', 'acme/cogs', 'response', 'assistant', 'src/index.ts', 'deployed yesterday', 'verbose log', 'deployed yesterday [2026-05-14] crisp summary')`
+      )
+      .run();
+    resetDb();
+
+    const rawDb = openDatabase(dbFile);
+    rawDb.exec(`
+      DROP TRIGGER IF EXISTS trg_fts_observations_ai;
+      DROP TRIGGER IF EXISTS trg_fts_observations_au;
+      DROP TRIGGER IF EXISTS trg_fts_observations_ad;
+      DROP TABLE IF EXISTS fts_observations;
+
+      CREATE VIRTUAL TABLE fts_observations USING fts5(
+        record_id UNINDEXED, tool_name, file_path, input, output, tokenize='porter unicode61'
+      );
+      CREATE TRIGGER trg_fts_observations_ai AFTER INSERT ON observations BEGIN
+        DELETE FROM fts_observations WHERE record_id = new.id;
+        INSERT INTO fts_observations(record_id, tool_name, file_path, input, output)
+        VALUES (new.id, COALESCE(new.tool_name, ''), COALESCE(new.file_path, ''), COALESCE(new.input, ''), COALESCE(new.output, ''));
+      END;
+      INSERT INTO fts_observations(record_id, tool_name, file_path, input, output)
+      SELECT id, COALESCE(tool_name, ''), COALESCE(file_path, ''), COALESCE(input, ''), COALESCE(output, '')
+      FROM observations;
+    `);
+    // Before upgrade, '2026' (only in condensed_text) is NOT in 5-col fts_observations
+    expect(
+      rawDb.prepare(`SELECT record_id FROM fts_observations WHERE fts_observations MATCH '"2026"'`).all()
+    ).toEqual([]);
+    rawDb.close();
+
+    // Reopen via getDb() -> upgrades fts_observations to 6 columns and backfills condensed_text
+    const upgradedDb = getDb();
+    const ftsDdl = upgradedDb
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_observations'")
+      .get() as { sql: string };
+    expect(ftsDdl.sql).toContain('condensed_text');
+    expect(
+      (upgradedDb.prepare('SELECT COUNT(*) AS n FROM fts_notes').get() as { n: number }).n
+    ).toBe(1);
+
+    // Backfilled condensed_text is now searchable and 6-arg bm25() works without error
+    const hits = upgradedDb
+      .prepare(
+        `SELECT record_id, -bm25(fts_observations, 0.0, 1.5, 1.6, 1.6, 0.75, 1.8) AS score
+         FROM fts_observations
+         WHERE fts_observations MATCH '"2026" AND "crisp"'`
+      )
+      .all() as Array<{ record_id: string; score: number }>;
+    expect(hits).toHaveLength(1);
+    expect(hits[0].record_id).toBe('obs-legacy-fts-1');
+    expect(hits[0].score).toBeGreaterThan(0);
+
+    // Subsequent INSERT and UPDATE of condensed_text keep all 6 columns in sync
+    upgradedDb
+      .prepare(
+        `INSERT INTO observations (id, scope, project_id, kind, input, condensed_text)
+         VALUES ('obs-legacy-fts-2', 'project', 'acme/cogs', 'prompt', 'raw prompt', 'unique_condensed_marker_99')`
+      )
+      .run();
+    expect(
+      upgradedDb
+        .prepare(`SELECT record_id FROM fts_observations WHERE fts_observations MATCH '"unique_condensed_marker_99"'`)
+        .all()
+    ).toEqual([{ record_id: 'obs-legacy-fts-2' }]);
+
+    upgradedDb
+      .prepare(`UPDATE observations SET condensed_text = 'updated_condensed_marker_100' WHERE id = 'obs-legacy-fts-2'`)
+      .run();
+    expect(
+      upgradedDb
+        .prepare(`SELECT record_id FROM fts_observations WHERE fts_observations MATCH '"updated_condensed_marker_100"'`)
+        .all()
+    ).toEqual([{ record_id: 'obs-legacy-fts-2' }]);
+  });
 });

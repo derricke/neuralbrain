@@ -421,19 +421,347 @@ function parseTimestampMs(raw: unknown): number | null {
   return null;
 }
 
+const MAX_FTS_QUERY_CHARS = 4_000;
+const MAX_FTS_TOKENS = 48;
+const FTS_TOKEN_RE = /[\p{L}\p{N}_]+/gu;
+const FTS_HAS_ALNUM_RE = /[\p{L}\p{N}]/u;
+const FTS_DIGIT_OR_UNDERSCORE_RE = /[0-9_]/;
+const FTS_INTERNAL_UPPER_RE = /\p{Ll}\p{Lu}|\p{Lu}{2,}/u;
+const FTS_INITIAL_UPPER_RE = /^\p{Lu}/u;
+const FTS_TRAILING_LETTER_RE = /\p{L}$/u;
+const FTS_PURE_CJK_RE =
+  /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\u30fc\u3005]{2,}$/u;
+const FTS_DOUBLE_QUOTED_RE = /"([^"\r\n]*)"/g;
+const FTS_SINGLE_QUOTED_RE = /(?:^|[^\p{L}\p{N}_])'([^'\r\n]*)'(?=$|[^\p{L}\p{N}_])/gu;
+const FTS_APOSTROPHE_CLITICS = new Set(['s', 't', 'm', 'd', 're', 've', 'll']);
+
+const FTS_STOPWORDS = new Set([
+  'i',
+  'me',
+  'my',
+  'you',
+  'your',
+  'we',
+  'our',
+  'he',
+  'him',
+  'his',
+  'she',
+  'her',
+  'hers',
+  'they',
+  'them',
+  'their',
+  'theirs',
+  'the',
+  'a',
+  'an',
+  'to',
+  'of',
+  'in',
+  'on',
+  'at',
+  'for',
+  'with',
+  'from',
+  'by',
+  'about',
+  'as',
+  'into',
+  'is',
+  'am',
+  'are',
+  'was',
+  'were',
+  'be',
+  'been',
+  'being',
+  'do',
+  'does',
+  'did',
+  'have',
+  'has',
+  'had',
+  'can',
+  'could',
+  'will',
+  'would',
+  'should',
+  'may',
+  'might',
+  'don',
+  'doesn',
+  'didn',
+  'isn',
+  'aren',
+  'wasn',
+  'weren',
+  'hasn',
+  'haven',
+  'hadn',
+  'won',
+  'wouldn',
+  'couldn',
+  'shouldn',
+  'mustn',
+  'ain',
+  'how',
+  'what',
+  'when',
+  'where',
+  'who',
+  'which',
+  'why',
+  'many',
+  'much',
+  'some',
+  'any',
+  'this',
+  'that',
+  'these',
+  'those',
+  'it',
+  'its',
+  'and',
+  'or',
+  'not',
+  'but',
+  'if',
+  'so',
+  'than',
+  'then',
+  'there',
+  'here',
+]);
+
+const STRICT_QUERY_META_VERBS = new Set([
+  'mention',
+  'mentioned',
+  'mentions',
+  'say',
+  'said',
+  'tell',
+  'told',
+  'talk',
+  'talked',
+  'discuss',
+  'discussed',
+  'remember',
+  'recall',
+  'happen',
+  'happened',
+  'recommend',
+  'recommended',
+  'recommends',
+  'suggest',
+  'suggested',
+  'suggestions',
+]);
+
+interface ScannedFtsToken {
+  tok: string;
+  firstIndex: number;
+  hasDigitOrUnderscore: boolean;
+  hasInternalUpper: boolean;
+  isMidSentenceCap: boolean;
+  isInitialCap: boolean;
+}
+
+function quoteFtsToken(tok: string): string {
+  return `"${tok.replace(/"/g, '""')}"`;
+}
+
+function scoreFtsTokenSpecificity(info: ScannedFtsToken): number {
+  let score = 0;
+  if (info.hasDigitOrUnderscore) score += 5.0;
+  if (info.hasInternalUpper) score += 4.0;
+  else if (info.isMidSentenceCap) score += 3.5;
+  else if (info.isInitialCap) score += 1.5;
+
+  if (info.tok.length >= 4) {
+    score += Math.min(info.tok.length, 16) * 0.35;
+  } else if (info.tok.length === 3) {
+    score += 0.3;
+  } else {
+    score -= 1.0;
+  }
+  return score;
+}
+
+function isApostropheClitic(text: string, matchIndex: number, lowerTok: string): boolean {
+  if (!FTS_APOSTROPHE_CLITICS.has(lowerTok) || matchIndex < 2) return false;
+  const quoteChar = text[matchIndex - 1];
+  if (quoteChar !== "'" && quoteChar !== '\u2019' && quoteChar !== '\u2018') return false;
+  const beforeQuote = text.slice(Math.max(0, matchIndex - 3), matchIndex - 1);
+  return FTS_TRAILING_LETTER_RE.test(beforeQuote);
+}
+
+function scanBoundedFtsTokens(q: string): {
+  sample: string;
+  allTokens: ScannedFtsToken[];
+  contentTokens: ScannedFtsToken[];
+} {
+  const sample = q.length > MAX_FTS_QUERY_CHARS ? safeUtf16Slice(q, 0, MAX_FTS_QUERY_CHARS) : q;
+  const byTok = new Map<string, ScannedFtsToken>();
+  const tokenRe = new RegExp(FTS_TOKEN_RE.source, 'gu');
+  let match: RegExpExecArray | null;
+  let ordinal = 0;
+
+  while ((match = tokenRe.exec(sample)) !== null) {
+    const surface = match[0];
+    if (!FTS_HAS_ALNUM_RE.test(surface)) continue;
+    const lower = surface.toLowerCase();
+    if (isApostropheClitic(sample, match.index, lower)) continue;
+    const isUpperStart = FTS_INITIAL_UPPER_RE.test(surface);
+    const hasInternalUpper = FTS_INTERNAL_UPPER_RE.test(surface);
+    const existing = byTok.get(lower);
+    if (!existing) {
+      byTok.set(lower, {
+        tok: lower,
+        firstIndex: ordinal,
+        hasDigitOrUnderscore: FTS_DIGIT_OR_UNDERSCORE_RE.test(lower),
+        hasInternalUpper,
+        isMidSentenceCap: ordinal > 0 && isUpperStart,
+        isInitialCap: ordinal === 0 && isUpperStart,
+      });
+    } else {
+      if (hasInternalUpper) existing.hasInternalUpper = true;
+      if (ordinal > 0 && isUpperStart) existing.isMidSentenceCap = true;
+    }
+    ordinal++;
+  }
+
+  const allTokens = Array.from(byTok.values());
+  const contentTokens = allTokens.filter((t) => !FTS_STOPWORDS.has(t.tok));
+  return { sample, allTokens, contentTokens };
+}
+
 /**
- * Safely convert an arbitrary user query string into an FTS5 MATCH expression.
- * Extracts deduplicated lowercase alphanumeric/underscore tokens, quotes each as
- * an explicit string literal, and joins with OR so FTS5 operators or punctuation
- * (`"`, `-`, `/`, `:`, `*`, `AND`/`OR`/`NOT`) can never cause syntax errors.
+ * Safely convert an arbitrary user query string into a stopword-filtered FTS5 OR
+ * expression. Bounds scan length to 4,000 chars and token count to <= 48 so huge
+ * pasted stack traces run in linear O(N) time and never approach SQLite's
+ * SQLITE_MAX_EXPR_DEPTH limit. Falls back to unfiltered tokens on pure-stopword queries.
  */
 export function buildSafeFtsQuery(q: string): string | null {
   if (typeof q !== 'string') return null;
-  const matches = q.toLowerCase().match(/[a-z0-9_]+/g);
-  if (!matches || matches.length === 0) return null;
-  const unique = Array.from(new Set(matches.filter(Boolean)));
-  if (unique.length === 0) return null;
-  return unique.map((tok) => `"${tok}"`).join(' OR ');
+  const { allTokens, contentTokens } = scanBoundedFtsTokens(q);
+  if (allTokens.length === 0) return null;
+
+  const active = contentTokens.length > 0 ? contentTokens : allTokens;
+  let selected: ScannedFtsToken[];
+  if (active.length <= MAX_FTS_TOKENS) {
+    selected = active;
+  } else {
+    selected = [...active]
+      .sort((a, b) => {
+        const diff = scoreFtsTokenSpecificity(b) - scoreFtsTokenSpecificity(a);
+        return Math.abs(diff) > 1e-6 ? diff : a.firstIndex - b.firstIndex;
+      })
+      .slice(0, MAX_FTS_TOKENS)
+      .sort((a, b) => a.firstIndex - b.firstIndex);
+  }
+
+  return selected
+    .map((t) =>
+      FTS_PURE_CJK_RE.test(t.tok) ? `${quoteFtsToken(t.tok)}*` : quoteFtsToken(t.tok)
+    )
+    .join(' OR ');
+}
+
+function extractQuotedPhraseClauses(
+  sample: string
+): { clauses: string[]; coveredTokens: Set<string> } {
+  const clauses: string[] = [];
+  const coveredTokens = new Set<string>();
+  const seenClause = new Set<string>();
+
+  const collectFromRegex = (re: RegExp) => {
+    re.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(sample)) !== null && clauses.length < 2) {
+      const inner = m[1];
+      if (inner.length < 3 || inner.length > 120) continue;
+      const innerTokenRe = new RegExp(FTS_TOKEN_RE.source, 'gu');
+      const phraseToks: string[] = [];
+      const seenInPhrase = new Set<string>();
+      let rawTokenCount = 0;
+      let tokMatch: RegExpExecArray | null;
+      while ((tokMatch = innerTokenRe.exec(inner)) !== null) {
+        const raw = tokMatch[0];
+        if (!FTS_HAS_ALNUM_RE.test(raw)) continue;
+        const lower = raw.toLowerCase();
+        if (isApostropheClitic(inner, tokMatch.index, lower)) continue;
+        rawTokenCount++;
+        if (FTS_STOPWORDS.has(lower) || seenInPhrase.has(lower)) continue;
+        seenInPhrase.add(lower);
+        phraseToks.push(lower);
+        if (phraseToks.length > 4) break;
+      }
+      if (rawTokenCount < 2) continue;
+      if (phraseToks.length >= 2 && phraseToks.length <= 4) {
+        const clause = `NEAR(${phraseToks.map(quoteFtsToken).join(' ')}, 6)`;
+        if (!seenClause.has(clause)) {
+          seenClause.add(clause);
+          clauses.push(clause);
+          for (const pt of phraseToks) {
+            coveredTokens.add(pt);
+          }
+        }
+      }
+    }
+  };
+
+  collectFromRegex(FTS_DOUBLE_QUOTED_RE);
+  if (clauses.length < 2) {
+    collectFromRegex(FTS_SINGLE_QUOTED_RE);
+  }
+
+  return { clauses, coveredTokens };
+}
+
+/**
+ * Build a Tier-1 strict FTS5 query (`AND` over top specific content terms plus
+ * `NEAR(..., 6)` on explicit quoted multi-word titles/phrases) when >= 2 content
+ * tokens exist. Returns null for empty, pure-stopword, or single-token queries.
+ */
+export function buildStrictFtsQuery(q: string): string | null {
+  if (typeof q !== 'string') return null;
+  const { sample, contentTokens } = scanBoundedFtsTokens(q);
+  if (contentTokens.length < 2) return null;
+
+  const { clauses: nearClauses, coveredTokens } = extractQuotedPhraseClauses(sample);
+  const remaining = contentTokens.filter((t) => !coveredTokens.has(t.tok));
+
+  const withoutMeta = remaining.filter((t) => !STRICT_QUERY_META_VERBS.has(t.tok));
+  const pool =
+    coveredTokens.size + withoutMeta.length >= 2 ? withoutMeta : remaining;
+
+  const maxTotalClauses = contentTokens.length > 5 && nearClauses.length === 0 ? 3 : 4;
+  const slotsLeft = Math.max(0, maxTotalClauses - nearClauses.length);
+
+  let chosenTerms: ScannedFtsToken[] = [];
+  if (slotsLeft > 0 && pool.length > 0) {
+    if (pool.length <= slotsLeft) {
+      chosenTerms = pool;
+    } else {
+      chosenTerms = [...pool]
+        .sort((a, b) => {
+          const diff = scoreFtsTokenSpecificity(b) - scoreFtsTokenSpecificity(a);
+          return Math.abs(diff) > 1e-6 ? diff : a.firstIndex - b.firstIndex;
+        })
+        .slice(0, slotsLeft)
+        .sort((a, b) => a.firstIndex - b.firstIndex);
+    }
+  }
+
+  const allClauses = [
+    ...nearClauses,
+    ...chosenTerms.map((t) => quoteFtsToken(t.tok)),
+  ];
+  if (allClauses.length === 0) return null;
+  if (nearClauses.length === 0 && chosenTerms.length < 2) return null;
+
+  return allClauses.join(' AND ');
 }
 
 function resolveEffectiveNoteTypes(params: SearchRequest): string[] | null {
@@ -601,6 +929,7 @@ interface CandidateDoc {
 
 interface FilterContext {
   params: SearchRequest;
+  queryIntent: QueryKindIntent;
   includeGlobal: boolean;
   includeAncestors: boolean;
   includeChildren: boolean;
@@ -844,7 +1173,7 @@ const RECORD_SPECS: Record<MemoryRecordType, RecordTypeSpec> = {
     hydrate: (_db, rows) =>
       rows.map((row) => {
         const { fts_bm25, ...record } = row;
-        const text = `${row.tool_name || ''}\n${row.file_path || ''}\n${row.input || ''}\n${row.output || ''}`;
+        const text = `${row.tool_name || ''}\n${row.file_path || ''}\n${row.input || ''}\n${row.output || ''}\n${row.condensed_text || ''}`;
         return {
           id: row.id,
           record_type: 'observation' as const,
@@ -995,11 +1324,35 @@ function buildWhereForType(
   return { conditions, queryParams };
 }
 
+function getBm25Expr(recordType: MemoryRecordType, queryIntent: QueryKindIntent): string {
+  switch (recordType) {
+    case 'observation':
+      if (queryIntent === 'assistant') {
+        return '-bm25(fts_observations, 0.0, 1.2, 1.2, 1.0, 1.4, 1.6)';
+      }
+      if (queryIntent === 'tool') {
+        return '-bm25(fts_observations, 0.0, 2.0, 2.2, 1.4, 1.0, 1.5)';
+      }
+      return '-bm25(fts_observations, 0.0, 1.5, 1.6, 1.6, 0.75, 1.8)';
+    case 'note':
+      return '-bm25(fts_notes, 0.0, 2.2, 1.0, 1.6)';
+    case 'trajectory':
+      return '-bm25(fts_trajectories, 0.0, 1.6, 1.0, 1.4)';
+    case 'summary':
+      return '-bm25(fts_summaries, 0.0, 1.0)';
+    case 'entity':
+      return '-bm25(fts_entities, 0.0, 2.5, 1.4, 1.0, 1.8)';
+    case 'action':
+      return '-bm25(fts_actions, 0.0, 2.0, 1.0, 1.2)';
+  }
+}
+
 function queryTypeFts(
   db: ReturnType<typeof getDb>,
   recordType: MemoryRecordType,
   ctx: FilterContext,
   safeFtsQuery: string,
+  strictFtsQuery: string | null,
   ftsLimit: number
 ): CandidateDoc[] {
   const spec = RECORD_SPECS[recordType];
@@ -1007,16 +1360,52 @@ function queryTypeFts(
   const built = buildWhereForType(spec, ctx);
   if (built.impossible) return [];
 
+  const bm25Expr = getBm25Expr(recordType, ctx.queryIntent);
   const sql = `
-    SELECT ${spec.alias}.*, -bm25(${spec.ftsTable}) AS fts_bm25
+    SELECT ${spec.alias}.*, ${bm25Expr} AS fts_bm25
     FROM ${spec.ftsTable}
     JOIN ${spec.table} ${spec.alias} ON ${spec.alias}.id = ${spec.ftsTable}.record_id
     WHERE ${spec.ftsTable} MATCH ? AND ${built.conditions.join(' AND ')}
     ORDER BY fts_bm25 DESC
     LIMIT ?
   `;
-  const rows = db.prepare(sql).all(safeFtsQuery, ...built.queryParams, ftsLimit) as any[];
-  return spec.hydrate(db, rows);
+  const stmt = db.prepare(sql);
+  const relaxedRows = stmt.all(safeFtsQuery, ...built.queryParams, ftsLimit) as any[];
+
+  if (!strictFtsQuery) {
+    return spec.hydrate(db, relaxedRows);
+  }
+
+  const strictLimit = Math.min(ftsLimit, 100);
+  const strictRows = stmt.all(strictFtsQuery, ...built.queryParams, strictLimit) as any[];
+  if (strictRows.length === 0) {
+    return spec.hydrate(db, relaxedRows);
+  }
+
+  const mergedById = new Map<string, any>();
+  for (const r of relaxedRows) {
+    mergedById.set(r.id, r);
+  }
+
+  for (const sRow of strictRows) {
+    const strictBm25 = Math.max(Number(sRow.fts_bm25) || 0, 1e-6);
+    const existing = mergedById.get(sRow.id);
+    if (existing) {
+      const relaxedBm25 = Math.max(Number(existing.fts_bm25) || 0, 1e-6);
+      existing.fts_bm25 = Math.max(strictBm25 * 1.6, relaxedBm25 * 1.35);
+    } else {
+      mergedById.set(sRow.id, {
+        ...sRow,
+        fts_bm25: strictBm25 * 1.6,
+      });
+    }
+  }
+
+  const mergedRows = Array.from(mergedById.values())
+    .sort((a, b) => (Number(b.fts_bm25) || 0) - (Number(a.fts_bm25) || 0))
+    .slice(0, ftsLimit);
+
+  return spec.hydrate(db, mergedRows);
 }
 
 function queryTypeEmbeddedScan(
@@ -1091,6 +1480,7 @@ function findEntitySeeds(
   db: ReturnType<typeof getDb>,
   ctx: FilterContext,
   safeFtsQuery: string | null,
+  strictFtsQuery: string | null,
   mode: 'hybrid' | 'bm25',
   queryVec: number[],
   denseScoresMap: Map<string, number>
@@ -1113,26 +1503,46 @@ function findEntitySeeds(
   }
 
   const nameById = new Map<string, string>();
-  const ftsHits: Array<{ id: string; score: number }> = [];
+  const ftsScoreById = new Map<string, number>();
   if (safeFtsQuery) {
-    const ftsRows = db
-      .prepare(
-        `
-        SELECT e.id, e.name, -bm25(fts_entities) AS fts_bm25
-        FROM fts_entities
-        JOIN entities e ON e.id = fts_entities.record_id
-        WHERE fts_entities MATCH ? AND ${conditions.join(' AND ')}
-        ORDER BY fts_bm25 DESC
-        LIMIT 30
-        `
-      )
-      .all(safeFtsQuery, ...queryParams) as Array<{ id: string; name: string; fts_bm25: number }>;
+    const entFtsStmt = db.prepare(
+      `
+      SELECT e.id, e.name, -bm25(fts_entities, 0.0, 2.5, 1.4, 1.0, 1.8) AS fts_bm25
+      FROM fts_entities
+      JOIN entities e ON e.id = fts_entities.record_id
+      WHERE fts_entities MATCH ? AND ${conditions.join(' AND ')}
+      ORDER BY fts_bm25 DESC
+      LIMIT 30
+      `
+    );
+    const ftsRows = entFtsStmt.all(safeFtsQuery, ...queryParams) as Array<{
+      id: string;
+      name: string;
+      fts_bm25: number;
+    }>;
 
     for (const r of ftsRows) {
       nameById.set(r.id, r.name);
-      ftsHits.push({ id: r.id, score: Math.max(Number(r.fts_bm25) || 0, 1e-6) });
+      ftsScoreById.set(r.id, Math.max(Number(r.fts_bm25) || 0, 1e-6));
+    }
+
+    if (strictFtsQuery) {
+      const strictEntRows = entFtsStmt.all(strictFtsQuery, ...queryParams) as Array<{
+        id: string;
+        name: string;
+        fts_bm25: number;
+      }>;
+      for (const r of strictEntRows) {
+        nameById.set(r.id, r.name);
+        const strictBm25 = Math.max(Number(r.fts_bm25) || 0, 1e-6);
+        const relaxedBm25 = ftsScoreById.get(r.id) ?? 0;
+        ftsScoreById.set(r.id, Math.max(strictBm25 * 1.6, relaxedBm25 * 1.35));
+      }
     }
   }
+  const ftsHits: Array<{ id: string; score: number }> = Array.from(ftsScoreById.entries()).map(
+    ([id, score]) => ({ id, score })
+  );
 
   const denseHitsMap = new Map<string, number>();
   if (mode === 'hybrid' && queryVec.length > 0) {
@@ -1528,8 +1938,12 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     };
   }
 
+  const hasFileFilter = Boolean(params.filters?.file_path?.trim());
+  const intent = detectQueryKindIntent(q, hasFileFilter);
+
   const ctx: FilterContext = {
     params,
+    queryIntent: intent,
     includeGlobal,
     includeAncestors,
     includeChildren,
@@ -1558,12 +1972,13 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     }
   };
 
-  // 1. Signal 1: SQLite FTS5 BM25 retrieval across all requested record types
+  // 1. Signal 1: Two-tier SQLite FTS5 BM25 retrieval across all requested record types
   const safeFtsQuery = buildSafeFtsQuery(q);
+  const strictFtsQuery = buildStrictFtsQuery(q);
   const ftsLimit = Math.max(limit * 10, 200);
   if (safeFtsQuery) {
     for (const recordType of recordTypes) {
-      for (const doc of queryTypeFts(db, recordType, ctx, safeFtsQuery, ftsLimit)) {
+      for (const doc of queryTypeFts(db, recordType, ctx, safeFtsQuery, strictFtsQuery, ftsLimit)) {
         addCandidate(doc);
       }
     }
@@ -1680,7 +2095,15 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
   }
 
   // 3. Signal 3: Entity-Graph 1-hop discovery & boosting
-  const entitySeeds = findEntitySeeds(db, ctx, safeFtsQuery, mode, queryVec, denseScoresMap);
+  const entitySeeds = findEntitySeeds(
+    db,
+    ctx,
+    safeFtsQuery,
+    strictFtsQuery,
+    mode,
+    queryVec,
+    denseScoresMap
+  );
   if (entitySeeds.size > 0) {
     const seedIds = Array.from(entitySeeds.keys());
     const seedPlaceholders = seedIds.map(() => '?').join(',');
@@ -1869,8 +2292,6 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     queryProjectNorm = res.ok ? res.projectId : queryProjectRaw;
   }
 
-  const hasFileFilter = Boolean(params.filters?.file_path?.trim());
-  const intent = detectQueryKindIntent(q, hasFileFilter);
   const kindWeights = resolveKindWeights(intent, params.kind_weights);
   const querySignals = parseQuerySignals(q);
   const snippetMode: SnippetMode =

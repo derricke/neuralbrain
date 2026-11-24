@@ -617,6 +617,23 @@ const SUMMARIES_TEXT_EXPR = `
  * dropped by ALTER/DROP TABLE operations.
  */
 function alignFtsSchema(db: Database): void {
+  const obsFtsRow = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_observations'")
+    .get() as { sql?: string } | undefined;
+
+  if (obsFtsRow?.sql && !obsFtsRow.sql.includes('condensed_text')) {
+    db.exec(`
+      DROP TRIGGER IF EXISTS trg_fts_observations_ai;
+      DROP TRIGGER IF EXISTS trg_fts_observations_au;
+      DROP TRIGGER IF EXISTS trg_fts_observations_ad;
+      DROP TABLE IF EXISTS fts_observations;
+    `);
+    logger.info(
+      { table: 'fts_observations' },
+      'fts_observations schema: upgraded to include condensed_text'
+    );
+  }
+
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(
       record_id UNINDEXED, title, content, extra, tokenize='porter unicode61'
@@ -625,7 +642,7 @@ function alignFtsSchema(db: Database): void {
       record_id UNINDEXED, description, result, task_type, tokenize='porter unicode61'
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_observations USING fts5(
-      record_id UNINDEXED, tool_name, file_path, input, output, tokenize='porter unicode61'
+      record_id UNINDEXED, tool_name, file_path, input, output, condensed_text, tokenize='porter unicode61'
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_summaries USING fts5(
       record_id UNINDEXED, text, tokenize='porter unicode61'
@@ -637,10 +654,11 @@ function alignFtsSchema(db: Database): void {
       record_id UNINDEXED, title, description, blocked_reason, tokenize='porter unicode61'
     );
 
-    -- Drop legacy unscoped AFTER UPDATE triggers so existing databases upgrade
-    -- to column-scoped triggers (avoiding FTS5 re-indexing on embedding/status/last_reminded_at writes).
+    -- Drop legacy unscoped AFTER UPDATE triggers (and observations AI trigger) so existing
+    -- databases upgrade cleanly to column-scoped 6-column triggers.
     DROP TRIGGER IF EXISTS trg_fts_notes_au;
     DROP TRIGGER IF EXISTS trg_fts_trajectories_au;
+    DROP TRIGGER IF EXISTS trg_fts_observations_ai;
     DROP TRIGGER IF EXISTS trg_fts_observations_au;
     DROP TRIGGER IF EXISTS trg_fts_summaries_au;
     DROP TRIGGER IF EXISTS trg_fts_summary_claims_au;
@@ -710,13 +728,13 @@ function alignFtsSchema(db: Database): void {
     -- observations triggers
     CREATE TRIGGER IF NOT EXISTS trg_fts_observations_ai AFTER INSERT ON observations BEGIN
       DELETE FROM fts_observations WHERE record_id = new.id;
-      INSERT INTO fts_observations(record_id, tool_name, file_path, input, output)
-      VALUES (new.id, COALESCE(new.tool_name, ''), COALESCE(new.file_path, ''), COALESCE(new.input, ''), COALESCE(new.output, ''));
+      INSERT INTO fts_observations(record_id, tool_name, file_path, input, output, condensed_text)
+      VALUES (new.id, COALESCE(new.tool_name, ''), COALESCE(new.file_path, ''), COALESCE(new.input, ''), COALESCE(new.output, ''), COALESCE(new.condensed_text, ''));
     END;
-    CREATE TRIGGER trg_fts_observations_au AFTER UPDATE OF id, tool_name, file_path, input, output ON observations BEGIN
+    CREATE TRIGGER trg_fts_observations_au AFTER UPDATE OF id, tool_name, file_path, input, output, condensed_text ON observations BEGIN
       DELETE FROM fts_observations WHERE record_id = old.id;
-      INSERT INTO fts_observations(record_id, tool_name, file_path, input, output)
-      VALUES (new.id, COALESCE(new.tool_name, ''), COALESCE(new.file_path, ''), COALESCE(new.input, ''), COALESCE(new.output, ''));
+      INSERT INTO fts_observations(record_id, tool_name, file_path, input, output, condensed_text)
+      VALUES (new.id, COALESCE(new.tool_name, ''), COALESCE(new.file_path, ''), COALESCE(new.input, ''), COALESCE(new.output, ''), COALESCE(new.condensed_text, ''));
     END;
     CREATE TRIGGER IF NOT EXISTS trg_fts_observations_ad AFTER DELETE ON observations BEGIN
       DELETE FROM fts_observations WHERE record_id = old.id;
@@ -813,8 +831,8 @@ function alignFtsSchema(db: Database): void {
       source: 'observations',
       fts: 'fts_observations',
       sql: `
-        INSERT INTO fts_observations(record_id, tool_name, file_path, input, output)
-        SELECT id, COALESCE(tool_name, ''), COALESCE(file_path, ''), COALESCE(input, ''), COALESCE(output, '')
+        INSERT INTO fts_observations(record_id, tool_name, file_path, input, output, condensed_text)
+        SELECT id, COALESCE(tool_name, ''), COALESCE(file_path, ''), COALESCE(input, ''), COALESCE(output, ''), COALESCE(condensed_text, '')
         FROM observations
       `,
     },
