@@ -14,6 +14,7 @@ import {
   loadBrainEnv,
 } from '../../lib/brainHome';
 import {
+  initializeAgentClientHome,
   initializeBrainHome,
   parseInstallArgs,
   readRuntimeMode,
@@ -141,7 +142,55 @@ describe('brainHome and CLI user-directory setup', () => {
       agents: false,
     });
     expect(parseInstallArgs(['--mode', 'docker', '--gpu']).gpu).toBe(true);
+    expect(parseInstallArgs(['--agents-only', '-y'])).toMatchObject({ agentsOnly: true, yes: true });
+    expect(parseInstallArgs(['--agents-only', '--api-url', 'http://10.0.0.5:3737/'])).toMatchObject({
+      agentsOnly: true,
+      apiUrl: 'http://10.0.0.5:3737',
+    });
+    expect(() => parseInstallArgs(['--api-url'])).toThrow(/Missing value for --api-url/);
+    expect(() => parseInstallArgs(['--api-url', 'ftp://bad'])).toThrow(/Invalid --api-url/);
     expect(() => parseInstallArgs(['--mode', 'invalid'])).toThrow(/Invalid --mode/);
+  });
+
+  test('initializeAgentClientHome reads .env defaults without creating local DB/Docker dirs', () => {
+    // 1. No .env yet -> falls back to http://127.0.0.1:3737 and creates only home + spool + .env
+    const emptyHome = path.join(tmpHome, 'client-empty');
+    const res1 = initializeAgentClientHome({ homeDir: emptyHome, cwd: emptyHome });
+    expect(res1.createdEnv).toBe(true);
+    expect(res1.apiUrl).toBe('http://127.0.0.1:3737');
+    expect(fs.existsSync(res1.envPath)).toBe(true);
+    expect(fs.existsSync(path.join(res1.brainHome, 'spool'))).toBe(true);
+    expect(fs.existsSync(path.join(res1.brainHome, 'data'))).toBe(false);
+    expect(fs.existsSync(path.join(res1.brainHome, 'qdrant'))).toBe(false);
+    expect(fs.existsSync(path.join(res1.brainHome, 'mode'))).toBe(false);
+
+    // 2. Existing .env with BRAIN_API_URL + BRAIN_API_KEY + custom key -> preserves all when --api-url omitted
+    const existingHome = path.join(tmpHome, 'client-existing');
+    const existingBrainHome = path.join(existingHome, '.neuralbrain');
+    fs.mkdirSync(existingBrainHome, { recursive: true });
+    fs.writeFileSync(
+      path.join(existingBrainHome, '.env'),
+      'BRAIN_API_URL=http://192.168.1.50:3737\nBRAIN_API_KEY=secret-abc\nCUSTOM_FLAG=keep\n',
+      'utf8'
+    );
+    const res2 = initializeAgentClientHome({ homeDir: existingHome, cwd: existingHome });
+    expect(res2.createdEnv).toBe(false);
+    expect(res2.apiUrl).toBe('http://192.168.1.50:3737');
+    expect(res2.apiKey).toBe('secret-abc');
+    const envRaw = fs.readFileSync(res2.envPath, 'utf8');
+    expect(envRaw).toContain('BRAIN_API_URL=http://192.168.1.50:3737');
+    expect(envRaw).toContain('BRAIN_API_KEY=secret-abc');
+    expect(envRaw).toContain('CUSTOM_FLAG=keep');
+
+    // 3. Explicit apiUrl overrides .env URL while preserving existing BRAIN_API_KEY
+    const res3 = initializeAgentClientHome({
+      homeDir: existingHome,
+      cwd: existingHome,
+      apiUrl: 'https://brain.internal:3737/',
+    });
+    expect(res3.apiUrl).toBe('https://brain.internal:3737');
+    expect(res3.apiKey).toBe('secret-abc');
+    expect(fs.readFileSync(res3.envPath, 'utf8')).toContain('BRAIN_API_URL=https://brain.internal:3737');
   });
 
   test('initializeBrainHome writes BRAIN_EMBED=local-gpu when gpu=true and rejects local-only + gpu', () => {

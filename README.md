@@ -126,7 +126,9 @@ brain.pid, brain.log   host daemon (qdrant-docker and local-only)
 
 Config is read from `./.env.local`, `./.env`, `~/.neuralbrain/.env.local` and `~/.neuralbrain/.env`, in that order. Anything already set in the environment wins.
 
-Install flags: `--mode`, `--port`, `--https`, `--gpu`, `--yes`, `--no-global`, `--no-agents`.
+Install flags: `--mode`, `--agents-only`, `--api-url`, `--port`, `--https`, `--gpu`, `--yes`, `--no-global`, `--no-agents`.
+
+- `--agents-only` installs the CLI globally and configures coding agents to talk to an existing/remote/WSL Brain (reads `BRAIN_API_URL` / `BRAIN_API_KEY` from `.env` or defaults to `http://127.0.0.1:3737`, with no local DB or Docker).
 
 - `--https` (or `BRAIN_HTTPS=1`) generates a local certificate in `~/.neuralbrain/certs/` with OpenSSL and serves over HTTPS.
 - `--gpu` sets `BRAIN_EMBED=local-gpu`. See [GPU embeddings](#gpu-embeddings).

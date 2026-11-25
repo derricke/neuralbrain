@@ -53,12 +53,31 @@ export interface InitializeBrainHomeResult {
 
 export interface InstallCliOptions {
   mode?: RuntimeMode;
+  agentsOnly?: boolean;
+  apiUrl?: string;
+  apiKey?: string;
   yes: boolean;
   global?: boolean;
   agents?: boolean;
   port?: number;
   https?: boolean;
   gpu?: boolean;
+}
+
+export interface InitializeAgentClientHomeOptions {
+  homeDir?: string;
+  apiUrl?: string;
+  apiKey?: string;
+  packageRoot?: string;
+  cwd?: string;
+}
+
+export interface InitializeAgentClientHomeResult {
+  brainHome: string;
+  envPath: string;
+  apiUrl: string;
+  apiKey?: string;
+  createdEnv: boolean;
 }
 
 const COMPOSE_PROJECT_NAME = 'neuralbrain';
@@ -203,6 +222,67 @@ export function initializeBrainHome(options: InitializeBrainHomeOptions): Initia
   };
 }
 
+/**
+ * Initializes a lightweight client-only ~/.neuralbrain/ setup (no local DB,
+ * Qdrant, or daemon). Resolves BRAIN_API_URL / BRAIN_API_KEY from explicit
+ * options, existing .env files, or defaults (http://127.0.0.1:3737).
+ */
+export function initializeAgentClientHome(
+  options: InitializeAgentClientHomeOptions = {}
+): InitializeAgentClientHomeResult {
+  const brainHome = getBrainHomeDir(options.homeDir);
+  const spoolDir = getDefaultSpoolDir(options.homeDir);
+  const envPath = getBrainEnvPath(options.homeDir);
+  const packageRoot = options.packageRoot ?? getPackageRoot();
+  const cwd = options.cwd ?? process.cwd();
+  const homeDir = options.homeDir ?? os.homedir();
+
+  for (const dir of [brainHome, spoolDir]) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
+  const createdEnv = !fs.existsSync(envPath);
+  const existingRaw = createdEnv ? '' : fs.readFileSync(envPath, 'utf8');
+  const parsed = existingRaw ? dotenv.parse(existingRaw) : {};
+
+  const resolvedUrl = (
+    options.apiUrl?.trim() ||
+    parsed.BRAIN_API_URL?.trim() ||
+    resolveApiUrl({}, packageRoot, cwd, homeDir)
+  ).replace(/\/+$/, '');
+
+  const resolvedKey =
+    options.apiKey?.trim() ||
+    parsed.BRAIN_API_KEY?.trim() ||
+    resolveApiKey({}, packageRoot, cwd, homeDir) ||
+    undefined;
+
+  const updates: Record<string, string> = {
+    BRAIN_API_URL: resolvedUrl,
+  };
+  if (resolvedKey) {
+    updates.BRAIN_API_KEY = resolvedKey;
+  }
+
+  const nextContent = createdEnv
+    ? [
+        '# neuralbrain agent client configuration (~/.neuralbrain/.env)',
+        upsertEnvContent('', updates).trimEnd(),
+        '',
+      ].join('\n')
+    : upsertEnvContent(existingRaw, updates);
+
+  fs.writeFileSync(envPath, nextContent, { mode: 0o600, encoding: 'utf8' });
+
+  return {
+    brainHome,
+    envPath,
+    apiUrl: resolvedUrl,
+    apiKey: resolvedKey,
+    createdEnv,
+  };
+}
+
 export function parseInstallArgs(argv: string[]): InstallCliOptions {
   const opts: InstallCliOptions = { yes: false };
 
@@ -210,6 +290,23 @@ export function parseInstallArgs(argv: string[]): InstallCliOptions {
     const arg = argv[i];
     if (arg === '--yes' || arg === '-y') {
       opts.yes = true;
+    } else if (arg === '--agents-only') {
+      opts.agentsOnly = true;
+    } else if (arg === '--api-url' || arg.startsWith('--api-url=')) {
+      const val = arg.startsWith('--api-url=') ? arg.slice('--api-url='.length) : argv[++i];
+      if (!val || val.startsWith('--')) {
+        throw new Error('Missing value for --api-url');
+      }
+      if (!/^https?:\/\//i.test(val.trim())) {
+        throw new Error(`Invalid --api-url '${val}': must start with http:// or https://`);
+      }
+      opts.apiUrl = val.trim().replace(/\/+$/, '');
+    } else if (arg === '--api-key' || arg.startsWith('--api-key=')) {
+      const val = arg.startsWith('--api-key=') ? arg.slice('--api-key='.length) : argv[++i];
+      if (!val || val.startsWith('--')) {
+        throw new Error('Missing value for --api-key');
+      }
+      opts.apiKey = val.trim();
     } else if (arg === '--mode') {
       const val = argv[++i];
       if (!val || val.startsWith('--')) {
@@ -411,18 +508,20 @@ async function waitForHealth(
   return false;
 }
 
-async function promptMode(rl: readline.Interface): Promise<RuntimeMode> {
+async function promptMode(rl: readline.Interface): Promise<RuntimeMode | 'agents-only'> {
   console.log('\nChoose how to run neuralbrain:');
   console.log('  1) Full Docker stack (Brain + Qdrant in Docker)');
   console.log('  2) Qdrant in Docker + Brain on host (Node.js)');
   console.log('  3) Brain only on host, no Qdrant (SQLite + BM25, 0 MB vector RAM)');
+  console.log('  4) Agents only (connect to a remote or WSL Brain — no local DB or Docker)');
 
   while (true) {
-    const answer = (await rl.question('\nSelect mode [1/2/3] (default: 1): ')).trim();
+    const answer = (await rl.question('\nSelect mode [1/2/3/4] (default: 1): ')).trim();
     if (!answer || answer === '1') return 'docker';
     if (answer === '2') return 'qdrant-docker';
     if (answer === '3') return 'local-only';
-    console.log('Please enter 1, 2, or 3.');
+    if (answer === '4') return 'agents-only';
+    console.log('Please enter 1, 2, 3, or 4.');
   }
 }
 
@@ -745,33 +844,114 @@ async function cmdInstall(argv: string[]): Promise<void> {
   const packageRoot = getPackageRoot();
   const isInteractive = !opts.yes && process.stdin.isTTY;
 
+  let agentsOnly = Boolean(opts.agentsOnly);
   let mode: RuntimeMode = opts.mode || 'docker';
   let installGlobal = opts.global ?? true;
   let installAgents = opts.agents ?? true;
+  let clientApiUrl = opts.apiUrl;
+  let clientApiKey = opts.apiKey;
 
   if (isInteractive) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     try {
-      if (!opts.mode) {
-        mode = await promptMode(rl);
+      if (!agentsOnly && !opts.mode) {
+        const picked = await promptMode(rl);
+        if (picked === 'agents-only') {
+          agentsOnly = true;
+        } else {
+          mode = picked;
+        }
       }
-      if (opts.global === undefined) {
-        installGlobal = await promptYesNo(
-          rl,
-          '\nInstall `neuralbrain` globally so it works in any shell?',
-          true
-        );
-      }
-      if (opts.agents === undefined) {
-        installAgents = await promptYesNo(
-          rl,
-          'Configure coding agents (Antigravity, Claude Code, Cursor)?',
-          true
-        );
+
+      if (agentsOnly) {
+        const defaultUrl = resolveApiUrl({}, packageRoot, process.cwd(), os.homedir()).replace(/\/+$/, '');
+        const existingKey = resolveApiKey({}, packageRoot, process.cwd(), os.homedir());
+        if (!clientApiUrl) {
+          const urlAnswer = (await rl.question(`\nBrain API URL [${defaultUrl}]: `)).trim();
+          clientApiUrl = (urlAnswer || defaultUrl).replace(/\/+$/, '');
+        }
+        if (!clientApiKey) {
+          const keyPrompt = existingKey
+            ? 'Brain API key [keep existing from .env]: '
+            : 'Brain API key (optional, press Enter to skip): ';
+          const keyAnswer = (await rl.question(keyPrompt)).trim();
+          if (keyAnswer) clientApiKey = keyAnswer;
+        }
+      } else {
+        if (opts.global === undefined) {
+          installGlobal = await promptYesNo(
+            rl,
+            '\nInstall `neuralbrain` globally so it works in any shell?',
+            true
+          );
+        }
+        if (opts.agents === undefined) {
+          installAgents = await promptYesNo(
+            rl,
+            'Configure coding agents (Antigravity, Claude Code, Cursor)?',
+            true
+          );
+        }
       }
     } finally {
       rl.close();
     }
+  }
+
+  if (agentsOnly) {
+    console.log(`\nConfiguring neuralbrain agent client in ${getBrainHomeDir()}...`);
+    const clientInit = initializeAgentClientHome({
+      apiUrl: clientApiUrl,
+      apiKey: clientApiKey,
+      packageRoot,
+    });
+    console.log(`  Config: ${clientInit.envPath}${clientInit.createdEnv ? ' (created)' : ' (updated)'}`);
+    console.log(`  API:    ${clientInit.apiUrl}`);
+
+    console.log('\nInstalling `neuralbrain` globally...');
+    let runtimeRoot = packageRoot;
+    const res = installGlobalPackage(packageRoot);
+    if (res.ok && res.installedRoot) {
+      runtimeRoot = res.installedRoot;
+      console.log(
+        res.alreadyInstalled
+          ? `  Already running from the installed copy at ${res.installedRoot}`
+          : `  Installed to ${res.installedRoot}`
+      );
+    } else {
+      console.warn(
+        `  Warning: global install failed (${res.error}). You may need to fix npm permissions. Using ${packageRoot} for now.`
+      );
+    }
+
+    console.log('\nConfiguring coding agents...');
+    const report = installAgentIntegration({
+      homeDir: os.homedir(),
+      brainRepoDir: runtimeRoot,
+      apiUrl: clientInit.apiUrl,
+      apiKey: clientInit.apiKey,
+    });
+    console.log(`  Configured targets: ${report.configuredTargets.join(', ') || 'none'}`);
+
+    let healthLabel = 'unreachable';
+    try {
+      const tlsFetch = createLocalTlsFetch();
+      const healthRes = await tlsFetch(`${clientInit.apiUrl}/health`, {
+        signal: AbortSignal.timeout(3000),
+      });
+      healthLabel = healthRes.ok ? `healthy (${healthRes.status})` : `unhealthy (${healthRes.status})`;
+    } catch {
+      healthLabel = 'unreachable (ensure the remote Brain service is running)';
+    }
+
+    console.log('\n┌──────────────────────────────────────────────────────────────┐');
+    console.log('│  neuralbrain agent client ready                              │');
+    console.log(`│  Home       ${clientInit.brainHome.padEnd(48)} │`);
+    console.log(`│  Mode       ${'agents-only (remote client)'.padEnd(48)} │`);
+    console.log(`│  REST API   ${clientInit.apiUrl.padEnd(48)} │`);
+    console.log(`│  Health     ${healthLabel.slice(0, 48).padEnd(48)} │`);
+    console.log('└──────────────────────────────────────────────────────────────┘\n');
+    return;
   }
 
   console.log(`\nInitializing ${getBrainHomeDir()} (mode: ${mode})...`);
@@ -1395,6 +1575,8 @@ Usage: neuralbrain <command> [options]
 Commands:
   install         Interactive setup in ~/.neuralbrain/ (default)
     --mode <m>      docker | qdrant-docker | local-only
+    --agents-only   Install CLI globally & configure agents for a remote/WSL Brain (no local DB/Docker)
+    --api-url <url> Remote Brain URL for --agents-only (defaults to .env or http://127.0.0.1:3737)
     --port <n>      API port (default: 3737)
     --https         Enable local HTTPS with self-signed cert
     --gpu           Use BRAIN_EMBED=local-gpu (spawns Docker Compose gpu profile)
