@@ -101,6 +101,7 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
     max_kind_share?: Partial<Record<'prompt' | 'response' | 'tool_call', number>>;
     entity_type?: string;
     memory_layer?: 'semantic' | 'procedural';
+    signal_tag?: 'preference' | 'state_update' | 'completed_action' | 'planned_action';
     type?: string[];
     file_path?: string;
     include_sources?: boolean;
@@ -150,6 +151,9 @@ export function createBrainMcpHandlers(options: BrainMcpServerOptions = {}) {
     }
     if (args.memory_layer) {
       filters.memory_layer = args.memory_layer;
+    }
+    if (args.signal_tag) {
+      filters.signal_tag = args.signal_tag;
     }
     if (args.user_id) {
       filters.user_id = args.user_id;
@@ -879,6 +883,12 @@ export function createBrainMcpServer(options: BrainMcpServerOptions = {}): McpSe
         .enum(['semantic', 'procedural'])
         .optional()
         .describe("Optional note layer filter: 'semantic' (fact/architecture/preference) or 'procedural' (workflow/pattern/lesson/bug)"),
+      signal_tag: z
+        .enum(['preference', 'state_update', 'completed_action', 'planned_action'])
+        .optional()
+        .describe(
+          "Optional observation linguistic signal tag filter ('preference', 'state_update', 'completed_action', or 'planned_action')"
+        ),
       type: z.array(z.string()).optional().describe('Note type filter (fact, architecture, pattern, workflow, bug, preference, lesson)'),
       file_path: z.string().optional().describe('File path filter ("what do we know about this file?")'),
       include_sources: z

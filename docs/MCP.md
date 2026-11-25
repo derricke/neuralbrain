@@ -41,6 +41,7 @@ kind_weights      object   optional { prompt?, response?, tool_call? } multiplie
 max_kind_share    object   optional { prompt?, response?, tool_call? } result-set share caps in (0, 1]
 entity_type       string   optional entity_type filter (e.g. brand, person, asset, metric, document, tool)
 memory_layer      string   semantic|procedural (optional note layer filter)
+signal_tag        string   preference|state_update|completed_action|planned_action (optional observation signal filter)
 type              string[] fact|architecture|pattern|workflow|bug|preference|lesson
 file_path         string   "what do we know about this file?"
 include_sources   boolean  default false (summary source provenance)

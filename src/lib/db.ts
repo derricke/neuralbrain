@@ -217,6 +217,7 @@ const OBSERVATIONS_DDL = `
     output         TEXT,
     condensed_text TEXT,
     resolved_dates_json TEXT,
+    signal_tags    TEXT,
     duration_ms    INTEGER NOT NULL DEFAULT 0,
     failed       INTEGER NOT NULL DEFAULT 0,     -- set by the failure hook, never inferred
     event_at     TEXT,                           -- optional UTC ISO-8601 when event occurred
@@ -259,6 +260,7 @@ const OBSERVATIONS_ARCHIVE_DDL = `
     output                  TEXT,
     condensed_text          TEXT,
     resolved_dates_json     TEXT,
+    signal_tags             TEXT,
     duration_ms             INTEGER NOT NULL DEFAULT 0,
     failed                  INTEGER NOT NULL DEFAULT 0,
     event_at                TEXT,
@@ -296,6 +298,7 @@ function alignObservationsSchema(db: Database): void {
       { name: 'event_at', ddl: 'TEXT' },
       { name: 'condensed_text', ddl: 'TEXT' },
       { name: 'resolved_dates_json', ddl: 'TEXT' },
+      { name: 'signal_tags', ddl: 'TEXT' },
     ]);
 
     const row = db

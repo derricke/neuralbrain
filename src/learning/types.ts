@@ -80,6 +80,7 @@ export interface SearchRequest {
     entity_type?: string;
     memory_layer?: 'semantic' | 'procedural';
     user_id?: string;
+    signal_tag?: string;
   };
   /** Include summary_sources provenance entries on summary results (default false). */
   include_sources?: boolean;

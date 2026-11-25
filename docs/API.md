@@ -49,7 +49,7 @@ The hot path. Accepts one observation or a batch.
 
 **Rules this endpoint must obey:**
 
-- **Optional `event_at` timestamp & deterministic relative-date anchoring.** `event_at` accepts an ISO-8601 date/time string (normalized to UTC ISO-8601) or finite numeric Unix epoch seconds. Omitted, `null`, or empty string stores `NULL`. Malformed values are dead-lettered as `schema_invalid`. At ingest, relative date phrases in `input`/`output` (`yesterday`, `last Saturday`, `two weeks ago`, `last month`, etc.) are deterministically anchored in UTC against `event_at ?? created_at` into `resolved_dates_json` and inline `[YYYY-MM-DD]` annotations inside `condensed_text`, while raw `observations.input` and `observations.output` remain 100% verbatim.
+- **Optional `event_at` timestamp, deterministic relative-date anchoring & signal tagging.** `event_at` accepts an ISO-8601 date/time string (normalized to UTC ISO-8601) or finite numeric Unix epoch seconds. Omitted, `null`, or empty string stores `NULL`. Malformed values are dead-lettered as `schema_invalid`. At ingest, relative date phrases in `input`/`output` (`yesterday`, `last Saturday`, `two weeks ago`, `last month`, etc.) are deterministically anchored in UTC against `event_at ?? created_at` into `resolved_dates_json` and inline `[YYYY-MM-DD]` annotations inside `condensed_text`, and deterministic linguistic signal tags (`preference`, `state_update`, `completed_action`, `planned_action`) are persisted as a JSON array in `signal_tags` (`NULL` when none match), while raw `observations.input` and `observations.output` remain 100% verbatim.
 
 - **Exempt from rate limiting.** Hook-driven capture exceeds 100/min in seconds,
   and rule 3 forbids rejecting a write for volume.
@@ -119,7 +119,8 @@ and temporal bias/validity adjustments.
     "type": ["bug", "pattern"],
     "file_path": "src/lib/db.ts",
     "entity_type": "asset",
-    "memory_layer": "procedural"
+    "memory_layer": "procedural",
+    "signal_tag": "preference"
   },
   "limit": 10
 }
@@ -138,7 +139,7 @@ window, the response also includes `temporal_window: { start, end, expressions }
   - `'query_focused'` (default): annotates relative dates inline (`[YYYY-MM-DD]`) and scans the full untruncated `input`/`output` to extract query-matching passages (joining non-adjacent spans with ` [...] `) within `max_record_chars` (default `1000` for `prompt`, `600` for `response`/`tool_call`) and populates `snippet`.
   - `'condensed'`: uses `condensed_text` (or computes extractive condensation with inline `[YYYY-MM-DD]` annotations on the fly) capped at `max_record_chars` (default `600`).
   - `'raw'`: returns verbatim raw `record.input` and `record.output` (respecting explicit `max_record_chars` if supplied, else 32,000-char safety bound) while still attaching an inline-annotated query-focused `snippet`.
-- `kind_weights` (`Partial<Record<'prompt' | 'response' | 'tool_call', number>>`, clamped to `[0.1, 5.0]`) overrides automatic query-intent observation weighting (`assistant` recall queries boost `response`, code/path/error `tool` queries boost `tool_call`, and `general` recall queries boost `prompt` while damping verbose low-density essays).
+- `kind_weights` (`Partial<Record<'prompt' | 'response' | 'tool_call', number>>`, clamped to `[0.1, 5.0]`) overrides automatic query-intent observation weighting (`assistant` recall queries boost `response`, code/path/error `tool` queries boost `tool_call`, and `general` recall queries boost `prompt` while damping verbose low-density essays). Recommendation/preference queries automatically boost `'preference'`-tagged observations (`1.22x`), current-state queries boost `'state_update'`-tagged observations (`1.18x` plus a gentle recency nudge so newer updates outrank superseded observations), and `filters.signal_tag` optionally filters observations by tag (`'preference' | 'state_update' | 'completed_action' | 'planned_action'`).
 - `max_kind_share` (`Partial<Record<'prompt' | 'response' | 'tool_call', number>>` in `(0, 1]`) caps any single observation `kind` in pass 1 (default `{ "response": 0.6 }` when searching observations with `limit >= 5`, no `filters.kind`, and non-assistant intent) and backfills in score order in pass 2 when fewer alternatives exist.
 - `include_ancestors: true` (default) inherits ancestor projects (`acme`, `acme/socials`) while isolating sibling subprojects (`acme/socials/generator`, `acme/cogs`).
 - `include_children: true` rolls up all strict descendant subprojects (`acme/*`).

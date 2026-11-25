@@ -10,6 +10,7 @@ import {
 } from '../lib/condenser';
 import { logger } from '../lib/logger';
 import { normalizeUtcIso } from '../lib/recurrence';
+import { detectQuerySignalIntent } from '../lib/signalTags';
 import {
   parseTemporalQueryWindow,
   resolveRelativeDates,
@@ -48,7 +49,7 @@ export type QueryKindIntent = 'assistant' | 'tool' | 'general';
 const OBSERVATION_KINDS: readonly ObservationSearchKind[] = ['prompt', 'response', 'tool_call'];
 
 const ASSISTANT_INTENT_RE =
-  /\b(?:did you|what did you|you (?:suggest\w*|recommend\w*|say|said|mention\w*|tell|told|give|gave|advis\w*|explain\w*|list\w*|provid\w*|wrote|write|share\w*|show\w*)|your (?:recipe|advice|recommendation\w*|suggestion\w*|list|explanation|answer|response|plan|outline|summary))\b/i;
+  /\b(?:did\s{1,3}you|what\s{1,3}did\s{1,3}you|have\s{1,3}you\s{1,3}(?:suggest\w{0,10}|recommend\w{0,10}|said|mention\w{0,10}|told|given|advis\w{0,10}|explain\w{0,10}|list\w{0,10}|provid\w{0,10}|written|share\w{0,10}|shown)|you\s{1,3}(?:suggested|recommended|said|mentioned|told|gave|advised|explained|listed|provided|wrote|shared|showed)|your\s{1,3}(?:recipe|advice|recommendation\w{0,10}|suggestion\w{0,10}|list|explanation|answer|response|plan|outline|summary))\b/i;
 
 const TOOL_FILE_OR_SYMBOL_RE =
   /(?:(?:^|[\s"'`(])(?:\.{0,2}\/)?[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_./-]+|\b[a-zA-Z0-9_-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|py|rs|go|java|rb|php|sh|bash|zsh|yml|yaml|toml|sql|md|css|scss|html|lock|env|conf|ini|xml|c|cpp|h|hpp)\b|\b[a-z0-9]+_[a-z0-9_]+\b|\b[a-z]+[A-Z][a-zA-Z0-9]*\b)/;
@@ -99,6 +100,10 @@ function resolveKindWeights(
   return weights;
 }
 
+function cleanOptionalString(v: unknown): string | null {
+  return typeof v === 'string' && v.trim() !== '' ? v.trim() : null;
+}
+
 function resolveMaxKindShare(
   params: SearchRequest,
   recordTypes: MemoryRecordType[],
@@ -130,7 +135,7 @@ function resolveMaxKindShare(
 
   if (
     recordTypes.includes('observation') &&
-    !params.filters?.kind &&
+    !cleanOptionalString(params.filters?.kind) &&
     intent !== 'assistant' &&
     limit >= 5
   ) {
@@ -768,7 +773,7 @@ function resolveEffectiveNoteTypes(params: SearchRequest): string[] | null {
   const layer = params.filters?.memory_layer;
   const rawTypeParam = params.filters?.type;
   const rawTypes = Array.isArray(rawTypeParam)
-    ? rawTypeParam.filter((t): t is string => typeof t === 'string' && t.trim() !== '')
+    ? rawTypeParam.map(cleanOptionalString).filter((t): t is string => t !== null)
     : undefined;
 
   let layerSet: Set<string> | null = null;
@@ -804,7 +809,7 @@ export function buildQdrantFilter(
     must.push({ key: 'record_type', match: { any: recordTypes } });
   }
 
-  const cleanProjectId = typeof params.project_id === 'string' ? params.project_id.trim() : '';
+  const cleanProjectId = cleanOptionalString(params.project_id) ?? '';
 
   if (params.scope === 'unknown') {
     must.push({ key: 'scope', match: { value: 'unknown' } });
@@ -852,19 +857,23 @@ export function buildQdrantFilter(
     }
   }
 
-  const userId = (params.user_id ?? params.filters?.user_id)?.trim();
+  const userId = cleanOptionalString(params.user_id) ?? cleanOptionalString(params.filters?.user_id);
   if (userId) {
     must.push({ key: 'user_id', match: { value: userId } });
   }
 
-  if (params.filters?.entity_type?.trim()) {
-    must.push({ key: 'entity_type', match: { value: params.filters.entity_type.trim() } });
+  const entityType = cleanOptionalString(params.filters?.entity_type);
+  if (entityType) {
+    must.push({ key: 'entity_type', match: { value: entityType } });
   }
 
+  const cleanFilterTypes = Array.isArray(params.filters?.type)
+    ? params.filters.type.map(cleanOptionalString).filter((t): t is string => t !== null)
+    : [];
   const effectiveNoteTypes = resolveEffectiveNoteTypes(params);
-  if (Array.isArray(params.filters?.type) && params.filters.type.length > 0) {
+  if (cleanFilterTypes.length > 0) {
     const typesToFilter =
-      params.filters.memory_layer && effectiveNoteTypes ? effectiveNoteTypes : params.filters.type;
+      params.filters?.memory_layer && effectiveNoteTypes ? effectiveNoteTypes : cleanFilterTypes;
     if (typesToFilter.length === 0) {
       must.push({ key: 'type', match: { value: '__none__' } });
     } else {
@@ -882,29 +891,36 @@ export function buildQdrantFilter(
     );
   }
 
-  if (params.filters?.kind) {
-    must.push({ key: 'kind', match: { value: params.filters.kind.trim() } });
+  const kind = cleanOptionalString(params.filters?.kind);
+  if (kind) {
+    must.push({ key: 'kind', match: { value: kind } });
   }
-  if (params.filters?.task_type) {
-    must.push({ key: 'task_type', match: { value: params.filters.task_type.trim() } });
+  const taskType = cleanOptionalString(params.filters?.task_type);
+  if (taskType) {
+    must.push({ key: 'task_type', match: { value: taskType } });
   }
-  if (params.filters?.file_path) {
-    must.push({ key: 'file_path', match: { value: params.filters.file_path.trim() } });
+  const filePath = cleanOptionalString(params.filters?.file_path);
+  if (filePath) {
+    must.push({ key: 'file_path', match: { value: filePath } });
   }
-  if (params.filters?.agent) {
-    must.push({ key: 'agent', match: { value: params.filters.agent.trim() } });
+  const agent = cleanOptionalString(params.filters?.agent);
+  if (agent) {
+    must.push({ key: 'agent', match: { value: agent } });
   }
   if (params.filters?.success !== undefined) {
     must.push({ key: 'success', match: { value: !!params.filters.success } });
   }
-  if (params.filters?.note_ref) {
-    must.push({ key: 'note_ref', match: { value: params.filters.note_ref.trim() } });
+  const noteRef = cleanOptionalString(params.filters?.note_ref);
+  if (noteRef) {
+    must.push({ key: 'note_ref', match: { value: noteRef } });
   }
-  if (params.filters?.task_ref) {
-    must.push({ key: 'task_ref', match: { value: params.filters.task_ref.trim() } });
+  const taskRef = cleanOptionalString(params.filters?.task_ref);
+  if (taskRef) {
+    must.push({ key: 'task_ref', match: { value: taskRef } });
   }
-  if ((params.filters as any)?.session_id) {
-    must.push({ key: 'session_id', match: { value: (params.filters as any).session_id.trim() } });
+  const sessionId = cleanOptionalString((params.filters as any)?.session_id);
+  if (sessionId) {
+    must.push({ key: 'session_id', match: { value: sessionId } });
   }
 
   if (must.length === 0) return undefined;
@@ -1066,13 +1082,15 @@ const RECORD_SPECS: Record<MemoryRecordType, RecordTypeSpec> = {
         conditions.push(`n.type IN (${effectiveTypes.map(() => '?').join(',')})`);
         queryParams.push(...effectiveTypes);
       }
-      if (params.filters?.file_path) {
+      const filePath = cleanOptionalString(params.filters?.file_path);
+      if (filePath) {
         conditions.push('EXISTS (SELECT 1 FROM note_files nf WHERE nf.note_id = n.id AND nf.file_path = ?)');
-        queryParams.push(params.filters.file_path.trim());
+        queryParams.push(filePath);
       }
-      if (params.filters?.agent) {
+      const agent = cleanOptionalString(params.filters?.agent);
+      if (agent) {
         conditions.push('n.author = ?');
-        queryParams.push(params.filters.agent.trim());
+        queryParams.push(agent);
       }
       return { conditions, queryParams };
     },
@@ -1089,29 +1107,34 @@ const RECORD_SPECS: Record<MemoryRecordType, RecordTypeSpec> = {
     buildExtraConditions: ({ params }) => {
       const conditions: string[] = [];
       const queryParams: unknown[] = [];
-      if (params.filters?.task_type) {
+      const taskType = cleanOptionalString(params.filters?.task_type);
+      if (taskType) {
         conditions.push('t.task_type = ?');
-        queryParams.push(params.filters.task_type.trim());
+        queryParams.push(taskType);
       }
-      if (params.filters?.agent) {
+      const agent = cleanOptionalString(params.filters?.agent);
+      if (agent) {
         conditions.push('t.agent = ?');
-        queryParams.push(params.filters.agent.trim());
+        queryParams.push(agent);
       }
       if (params.filters?.success !== undefined) {
         conditions.push('t.success = ?');
         queryParams.push(params.filters.success ? 1 : 0);
       }
-      if (params.filters?.note_ref) {
+      const noteRef = cleanOptionalString(params.filters?.note_ref);
+      if (noteRef) {
         conditions.push('t.note_ref = ?');
-        queryParams.push(params.filters.note_ref.trim());
+        queryParams.push(noteRef);
       }
-      if (params.filters?.task_ref) {
+      const taskRef = cleanOptionalString(params.filters?.task_ref);
+      if (taskRef) {
         conditions.push('t.task_ref = ?');
-        queryParams.push(params.filters.task_ref.trim());
+        queryParams.push(taskRef);
       }
-      if ((params.filters as any)?.session_id) {
+      const sessionId = cleanOptionalString((params.filters as any)?.session_id);
+      if (sessionId) {
         conditions.push('t.session_id = ?');
-        queryParams.push((params.filters as any).session_id.trim());
+        queryParams.push(sessionId);
       }
       return { conditions, queryParams };
     },
@@ -1140,33 +1163,46 @@ const RECORD_SPECS: Record<MemoryRecordType, RecordTypeSpec> = {
     buildExtraConditions: ({ params }) => {
       const conditions: string[] = [];
       const queryParams: unknown[] = [];
-      if (params.filters?.kind) {
+      const kind = cleanOptionalString(params.filters?.kind);
+      if (kind) {
         conditions.push('o.kind = ?');
-        queryParams.push(params.filters.kind.trim());
+        queryParams.push(kind);
       }
-      if (params.filters?.file_path) {
+      const filePath = cleanOptionalString(params.filters?.file_path);
+      if (filePath) {
         conditions.push('o.file_path = ?');
-        queryParams.push(params.filters.file_path.trim());
+        queryParams.push(filePath);
       }
-      if (params.filters?.agent) {
+      const agent = cleanOptionalString(params.filters?.agent);
+      if (agent) {
         conditions.push('o.agent = ?');
-        queryParams.push(params.filters.agent.trim());
+        queryParams.push(agent);
       }
       if (params.filters?.success !== undefined) {
         conditions.push('o.failed = ?');
         queryParams.push(params.filters.success ? 0 : 1);
       }
-      if (params.filters?.note_ref) {
+      const noteRef = cleanOptionalString(params.filters?.note_ref);
+      if (noteRef) {
         conditions.push('o.note_ref = ?');
-        queryParams.push(params.filters.note_ref.trim());
+        queryParams.push(noteRef);
       }
-      if (params.filters?.task_ref) {
+      const taskRef = cleanOptionalString(params.filters?.task_ref);
+      if (taskRef) {
         conditions.push('o.task_ref = ?');
-        queryParams.push(params.filters.task_ref.trim());
+        queryParams.push(taskRef);
       }
-      if ((params.filters as any)?.session_id) {
+      const sessionId = cleanOptionalString((params.filters as any)?.session_id);
+      if (sessionId) {
         conditions.push('o.session_id = ?');
-        queryParams.push((params.filters as any).session_id.trim());
+        queryParams.push(sessionId);
+      }
+      const signalTag = cleanOptionalString(params.filters?.signal_tag);
+      if (signalTag) {
+        conditions.push(
+          "o.signal_tags IS NOT NULL AND json_valid(o.signal_tags) = 1 AND json_type(o.signal_tags) = 'array' AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(o.signal_tags) = 1 AND json_type(o.signal_tags) = 'array' THEN o.signal_tags ELSE '[]' END) je WHERE je.type = 'text' AND je.value = ?)"
+        );
+        queryParams.push(signalTag);
       }
       return { conditions, queryParams };
     },
@@ -1198,13 +1234,15 @@ const RECORD_SPECS: Record<MemoryRecordType, RecordTypeSpec> = {
       if (params.include_history !== true) {
         conditions.push('s.is_latest = 1');
       }
-      if (params.filters?.kind) {
+      const kind = cleanOptionalString(params.filters?.kind);
+      if (kind) {
         conditions.push('s.kind = ?');
-        queryParams.push(params.filters.kind.trim());
+        queryParams.push(kind);
       }
-      if (params.filters?.agent) {
+      const agent = cleanOptionalString(params.filters?.agent);
+      if (agent) {
         conditions.push('(s.producer_model = ? OR s.producer_tier = ?)');
-        queryParams.push(params.filters.agent.trim(), params.filters.agent.trim());
+        queryParams.push(agent, agent);
       }
       if (params.filters?.success !== undefined) {
         conditions.push('s.outcome = ?');
@@ -1225,9 +1263,10 @@ const RECORD_SPECS: Record<MemoryRecordType, RecordTypeSpec> = {
     buildExtraConditions: ({ params }) => {
       const conditions: string[] = [];
       const queryParams: unknown[] = [];
-      if (params.filters?.entity_type?.trim()) {
+      const entityType = cleanOptionalString(params.filters?.entity_type);
+      if (entityType) {
         conditions.push('e.entity_type = ?');
-        queryParams.push(params.filters.entity_type.trim());
+        queryParams.push(entityType);
       }
       return { conditions, queryParams };
     },
@@ -1258,17 +1297,22 @@ const RECORD_SPECS: Record<MemoryRecordType, RecordTypeSpec> = {
     buildExtraConditions: ({ params }) => {
       const conditions: string[] = [];
       const queryParams: unknown[] = [];
-      if (params.filters?.kind) {
+      const kind = cleanOptionalString(params.filters?.kind);
+      if (kind) {
         conditions.push('a.status = ?');
-        queryParams.push(params.filters.kind.trim());
+        queryParams.push(kind);
       }
-      if (Array.isArray(params.filters?.type) && params.filters.type.length > 0) {
-        conditions.push(`a.priority IN (${params.filters.type.map(() => '?').join(',')})`);
-        queryParams.push(...params.filters.type);
+      const cleanPriorities = Array.isArray(params.filters?.type)
+        ? params.filters.type.map(cleanOptionalString).filter((t): t is string => t !== null)
+        : [];
+      if (cleanPriorities.length > 0) {
+        conditions.push(`a.priority IN (${cleanPriorities.map(() => '?').join(',')})`);
+        queryParams.push(...cleanPriorities);
       }
-      if ((params.filters as any)?.session_id) {
+      const sessionId = cleanOptionalString((params.filters as any)?.session_id);
+      if (sessionId) {
         conditions.push('a.session_id = ?');
-        queryParams.push((params.filters as any).session_id.trim());
+        queryParams.push(sessionId);
       }
       return { conditions, queryParams };
     },
@@ -1295,7 +1339,7 @@ function buildWhereForType(
   const scopeSql = buildHierarchicalScopeSql({
     tableAlias: spec.alias,
     scope: ctx.params.scope,
-    projectId: ctx.params.project_id,
+    projectId: cleanOptionalString(ctx.params.project_id),
     includeAncestors: ctx.includeAncestors,
     includeChildren: ctx.includeChildren,
     includeGlobal: ctx.includeGlobal,
@@ -1488,7 +1532,7 @@ function findEntitySeeds(
   const scopeSql = buildHierarchicalScopeSql({
     tableAlias: 'e',
     scope: ctx.params.scope,
-    projectId: ctx.params.project_id,
+    projectId: cleanOptionalString(ctx.params.project_id),
     includeAncestors: ctx.includeAncestors,
     includeChildren: ctx.includeChildren,
     includeGlobal: ctx.includeGlobal,
@@ -1497,9 +1541,10 @@ function findEntitySeeds(
 
   const conditions: string[] = [scopeSql.clause];
   const queryParams: unknown[] = [...scopeSql.params];
-  if (ctx.params.filters?.entity_type?.trim()) {
+  const entityType = cleanOptionalString(ctx.params.filters?.entity_type);
+  if (entityType) {
     conditions.push('e.entity_type = ?');
-    queryParams.push(ctx.params.filters.entity_type.trim());
+    queryParams.push(entityType);
   }
 
   const nameById = new Map<string, string>();
@@ -1675,6 +1720,20 @@ function parseResolvedDateAnnotations(rawJson: unknown): ResolvedDateAnnotation[
         !Array.isArray(el) &&
         typeof (el as Record<string, unknown>).resolved_date === 'string'
     );
+  } catch {
+    return [];
+  }
+}
+
+export function parseSignalTags(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    return raw.filter((el): el is string => typeof el === 'string' && el.length > 0);
+  }
+  if (typeof raw !== 'string' || raw.trim() === '') return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((el): el is string => typeof el === 'string' && el.length > 0);
   } catch {
     return [];
   }
@@ -1912,7 +1971,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
   const includeGlobal = params.include_global !== false;
   const includeAncestors = params.include_ancestors !== false;
   const includeChildren = params.include_children === true;
-  const userId = (params.user_id ?? params.filters?.user_id)?.trim() || null;
+  const userId = cleanOptionalString(params.user_id) ?? cleanOptionalString(params.filters?.user_id);
 
   const afterIso = normalizeUtcIso(params.after, 'after');
   const beforeIso = normalizeUtcIso(params.before, 'before');
@@ -1938,7 +1997,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
     };
   }
 
-  const hasFileFilter = Boolean(params.filters?.file_path?.trim());
+  const hasFileFilter = cleanOptionalString(params.filters?.file_path) !== null;
   const intent = detectQueryKindIntent(q, hasFileFilter);
 
   const ctx: FilterContext = {
@@ -2020,9 +2079,10 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
           const alias = verification.meta?.qdrant_alias || 'brain';
           try {
             let childProjectIds: string[] | undefined;
-            if (includeChildren && params.project_id?.trim()) {
-              const normRes = normalizeProjectId(params.project_id.trim());
-              const norm = normRes.ok ? normRes.projectId : params.project_id.trim();
+            const rawChildProject = cleanOptionalString(params.project_id);
+            if (includeChildren && rawChildProject) {
+              const normRes = normalizeProjectId(rawChildProject);
+              const norm = normRes.ok ? normRes.projectId : rawChildProject;
               childProjectIds = collectChildProjectIds(db, norm);
             }
             const filter = buildQdrantFilter(params, recordTypes, includeGlobal, childProjectIds);
@@ -2285,7 +2345,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
 
   const maxBm25 = bm25Matched.reduce((m, c) => Math.max(m, c.bm25Score ?? 0), 0);
 
-  const queryProjectRaw = params.project_id?.trim() || null;
+  const queryProjectRaw = cleanOptionalString(params.project_id);
   let queryProjectNorm: string | null = null;
   if (queryProjectRaw && params.scope !== 'global' && params.scope !== 'unknown') {
     const res = normalizeProjectId(queryProjectRaw);
@@ -2294,6 +2354,7 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
 
   const kindWeights = resolveKindWeights(intent, params.kind_weights);
   const querySignals = parseQuerySignals(q);
+  const signalIntent = detectQuerySignalIntent(q);
   const snippetMode: SnippetMode =
     params.snippet_mode === 'condensed' || params.snippet_mode === 'raw'
       ? params.snippet_mode
@@ -2350,7 +2411,28 @@ export async function hybridSearch(params: SearchRequest): Promise<SearchRespons
             ? kindWeights[obsKind]
             : 1.0;
         const densityMult = computeObservationDensityMultiplier(c.record, querySignals);
-        obsMult = kindMult * densityMult;
+        let signalMult = 1.0;
+        if (signalIntent.wantsPreference || signalIntent.wantsStateUpdate) {
+          const tags = parseSignalTags(c.record.signal_tags);
+          if (tags.length > 0) {
+            if (
+              intent !== 'assistant' &&
+              signalIntent.wantsPreference &&
+              tags.includes('preference')
+            ) {
+              signalMult *= 1.22;
+            }
+            if (signalIntent.wantsStateUpdate && tags.includes('state_update')) {
+              signalMult *= 1.18;
+              const createdMs = getCandidateCreatedMs(c);
+              if (createdMs !== null) {
+                const ageDays = Math.max(0, (nowMs - createdMs) / 86_400_000);
+                signalMult *= 1.0 + 0.06 / (1 + ageDays / 60);
+              }
+            }
+          }
+        }
+        obsMult = kindMult * densityMult * signalMult;
       }
       c.rrfScore = baseScore * tierMult * temporalMult * obsMult;
     } else {

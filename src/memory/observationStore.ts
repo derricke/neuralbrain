@@ -7,6 +7,7 @@ import { buildHierarchicalScopeSql, resolveScope } from '../lib/scope';
 import { normalizeUtcIso } from '../lib/recurrence';
 import { redactOptional } from '../lib/redactSecrets';
 import { condenseObservation } from '../lib/condenser';
+import { extractSignalTags } from '../lib/signalTags';
 import { resolveRelativeDates } from '../lib/temporal';
 import { transaction } from '../lib/sqlite';
 
@@ -30,6 +31,7 @@ export interface ObservationRecord {
   output: string | null;
   condensed_text?: string | null;
   resolved_dates_json?: string | null;
+  signal_tags?: string | null;
   duration_ms: number;
   failed: number;
   event_at: string | null;
@@ -229,9 +231,9 @@ export function captureObservations(rawItems: unknown[]): CaptureResult {
     const insertStmt = db.prepare(`
       INSERT INTO observations (
         id, scope, project_id, user_id, agent_id, note_ref, task_ref, session_id, agent,
-        kind, tool_name, file_path, input, output, condensed_text, resolved_dates_json,
+        kind, tool_name, file_path, input, output, condensed_text, resolved_dates_json, signal_tags,
         duration_ms, failed, event_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const reactivateSessionStmt = db.prepare(`
@@ -269,6 +271,12 @@ export function captureObservations(rawItems: unknown[]): CaptureResult {
         input: inputTemporal ? inputTemporal.annotatedText : item.input,
         output: outputTemporal ? outputTemporal.annotatedText : item.output,
       });
+      const tags = extractSignalTags({
+        kind: item.kind,
+        input: item.input,
+        output: item.output,
+      });
+      const signalTagsJson = tags.length > 0 ? JSON.stringify(tags) : null;
       insertStmt.run(
         item.id,
         item.scope,
@@ -286,6 +294,7 @@ export function captureObservations(rawItems: unknown[]): CaptureResult {
         item.output,
         condensedText,
         resolvedDatesJson,
+        signalTagsJson,
         item.durationMs,
         item.failed,
         item.eventAt,

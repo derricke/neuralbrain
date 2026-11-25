@@ -90,6 +90,7 @@ export function createDirectBrainMcpHandlers(
         if (args.file_path) filters.file_path = args.file_path;
         if (args.entity_type) filters.entity_type = args.entity_type;
         if (args.memory_layer) filters.memory_layer = args.memory_layer;
+        if (args.signal_tag) filters.signal_tag = args.signal_tag;
         if (args.user_id) filters.user_id = args.user_id;
 
         const requestedTypes =

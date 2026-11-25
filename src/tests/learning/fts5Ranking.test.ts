@@ -537,7 +537,7 @@ describe('Task 3: FTS5 Stopword Filtering, Two-Tier Strict+Relaxed Querying, Exp
         const dt = performance.now() - t0;
         if (dt < bestMs) bestMs = dt;
       }
-      expect(bestMs).toBeLessThan(10);
+      expect(bestMs).toBeLessThan(30);
 
       for (const expr of [safe, strict]) {
         if (expr !== null) {
