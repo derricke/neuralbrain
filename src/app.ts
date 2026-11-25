@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { getDb, isDatabaseUnavailableError } from './lib/db';
 import { logger } from './lib/logger';
 import { parseDurationMs } from './lib/recurrence';
+import { getAppVersion } from './lib/version';
 import { getCorrelationId, requestTracing } from './middleware/tracing';
 import { createRateLimiter } from './middleware/rateLimiter';
 import { apiKeyAuth, hashApiKey, setDashboardSessionCookie } from './middleware/auth';
@@ -165,6 +166,7 @@ export function createApp(): express.Application {
 
     res.json({
       status,
+      version: getAppVersion(),
       db: dbStatus,
       qdrant: qdrantStatus,
       embed_queue_pending: pendingEmbedCount,

@@ -1028,6 +1028,11 @@ export const dashboardJs = `
     const storeMeta = health.store_meta || {};
 
     // 1. Header Badges
+    const versionBadge = document.getElementById('versionBadge');
+    if (versionBadge && typeof health.version === 'string' && health.version) {
+      versionBadge.textContent = 'v' + health.version;
+    }
+
     const healthBadge = document.getElementById('healthBadge');
     const healthText = document.getElementById('healthText');
     if (healthBadge && healthText) {

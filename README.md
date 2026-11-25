@@ -143,6 +143,7 @@ neuralbrain doctor         # health checks via the running service (--ai adds th
 neuralbrain install-agent  # wire up your agents
 neuralbrain init           # write .brainrc here: one project_id for this folder and below
 neuralbrain mcp            # run the stdio MCP server
+neuralbrain -v             # show CLI version (--version, version)
 ```
 
 Check it's up:

@@ -1,4 +1,24 @@
-export function getDashboardHtml(): string {
+import { getAppVersion } from '../lib/version';
+
+function escapeHtmlText(value: string): string {
+  return value.replace(/[&<>"']/g, (ch) => {
+    switch (ch) {
+      case '&':
+        return '&amp;';
+      case '<':
+        return '&lt;';
+      case '>':
+        return '&gt;';
+      case '"':
+        return '&quot;';
+      default:
+        return '&#39;';
+    }
+  });
+}
+
+export function getDashboardHtml(version: string = getAppVersion()): string {
+  const safeVersion = escapeHtmlText(version);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -48,6 +68,7 @@ export function getDashboardHtml(): string {
               <path d="M16 10h3a2 2 0 0 1 2 2v1a2 2 0 0 1-2 2h-3"></path>
             </svg>
             neuralbrain
+            <span id="versionBadge" class="badge badge-subtle badge-mono" title="neuralbrain version">v${safeVersion}</span>
           </span>
           <span class="brand-subtitle">Memory for agents that holds up · Layered and recalled when it counts</span>
         </div>
@@ -58,11 +79,11 @@ export function getDashboardHtml(): string {
           <span class="badge-dot"></span>
           <span id="healthText">HEALTH: OK</span>
         </div>
-        <div id="storeMetaBadge" class="badge badge-subtle badge-mono">
-          <span id="storeMetaText">STORE: loading...</span>
-        </div>
         <div id="qdrantBadge" class="badge badge-subtle badge-mono">
           <span id="qdrantText">QDRANT: ...</span>
+        </div>
+        <div id="storeMetaBadge" class="badge badge-subtle badge-mono">
+          <span id="storeMetaText">STORE: loading...</span>
         </div>
         <div id="reembedBadge" class="badge badge-subtle badge-mono hidden">
           <span id="reembedText">REEMBED: idle</span>

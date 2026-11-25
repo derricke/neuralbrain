@@ -5,6 +5,11 @@ import { loadBrainEnv } from '../lib/brainHome';
 import { openDatabase, type Database } from '../lib/sqlite';
 import { createLocalTlsFetch } from '../lib/tls';
 import {
+  formatVersionSummary,
+  getInstallInfo,
+  type InstallInfo,
+} from '../lib/version';
+import {
   countStoreRecords,
   inspectDatabaseHealth,
   inspectSchemaAlignment,
@@ -38,6 +43,9 @@ export type DoctorSource = 'service' | 'local';
 
 export interface DoctorReport {
   allPassing: boolean;
+  version: string;
+  install: InstallInfo;
+  serviceVersion: string | null;
   source: DoctorSource;
   target: string;
   dbOk: boolean;
@@ -485,14 +493,21 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     findings.storeMetaMatch &&
     aiDiagnostics.all_passing;
 
+  const install = getInstallInfo(packageRoot());
+  const serviceVersion =
+    health && typeof health.version === 'string' && health.version.trim()
+      ? health.version.trim()
+      : null;
+
   if (!options.quiet) {
     console.log('\n╔══════════════════════════════════════════════════════════════╗');
     console.log('║                      NEURALBRAIN DOCTOR                      ║');
     console.log('╚══════════════════════════════════════════════════════════════╝\n');
+    console.log(`  Version: ${formatVersionSummary(install)}`);
     console.log(
       source === 'service'
-        ? `  Source: running service at ${target}\n`
-        : `  Source: service not reachable at ${apiUrl}; inspected ${target} read-only\n`
+        ? `  Source:  running service at ${target}${serviceVersion ? ` (v${serviceVersion})` : ''}\n`
+        : `  Source:  service not reachable at ${apiUrl}; inspected ${target} read-only\n`
     );
 
     for (const check of checks) {
@@ -529,6 +544,9 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
 
   return {
     allPassing,
+    version: install.version,
+    install,
+    serviceVersion,
     source,
     target,
     dbOk: findings.dbOk,

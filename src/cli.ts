@@ -20,6 +20,7 @@ import { createLocalTlsFetch, ensureLocalTlsCerts, getDefaultCertsDir } from './
 import { resolveCanonicalProjectId, writeBrainRc } from './lib/projectSlug';
 import { parseDurationMs } from './lib/recurrence';
 import { normalizeProjectId } from './lib/scope';
+import { formatVersionSummary, getInstallInfo, readPackageVersion } from './lib/version';
 import {
   installAgentIntegration,
   parseCliArgs as parseInstallAgentArgs,
@@ -262,13 +263,14 @@ function runCompose(
 ): number {
   const composeFile = path.join(packageRoot, 'docker-compose.yml');
   const fileFlags = [composeFile, ...extraComposeFiles].flatMap((file) => ['-f', file]);
+  const version = process.env.NEURALBRAIN_VERSION || readPackageVersion(packageRoot) || '0.1.0';
   const res = spawnSync(
     'docker',
     ['compose', '-p', COMPOSE_PROJECT_NAME, ...fileFlags, '--env-file', envPath, ...args],
     {
       cwd: packageRoot,
       stdio: 'inherit',
-      env: { ...process.env, HOME: os.homedir() },
+      env: { ...process.env, HOME: os.homedir(), NEURALBRAIN_VERSION: version },
     }
   );
   return res.status ?? 1;
@@ -620,13 +622,12 @@ export function isInstalledCopy(packageRoot: string): boolean {
   return path.basename(path.dirname(real)) === 'node_modules';
 }
 
-function readPackageVersion(packageRoot: string): string | null {
-  try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8'));
-    return typeof pkg?.version === 'string' && pkg.version ? pkg.version : null;
-  } catch {
-    return null;
-  }
+export function getCliVersion(packageRoot: string = getPackageRoot()): string {
+  return readPackageVersion(packageRoot) ?? 'unknown';
+}
+
+export function formatCliVersion(packageRoot: string = getPackageRoot()): string {
+  return formatVersionSummary(getInstallInfo(packageRoot));
 }
 
 /**
@@ -1424,6 +1425,11 @@ Commands:
     --limit <n>     Max reminders to return
   rename-project  Rename a project_id across SQLite and Qdrant (<from> <to>)
   mcp             Start the stdio MCP server
+  version         Show CLI version (also -v, --version)
+
+Options:
+  -v, --version   Show CLI version
+  -h, --help      Show this help message
 `);
 }
 
@@ -1433,6 +1439,11 @@ async function main(): Promise<void> {
 
   if (sub === '-h' || sub === '--help' || sub === 'help') {
     printHelp();
+    return;
+  }
+
+  if (sub === '-v' || sub === '--version' || sub === 'version') {
+    console.log(formatCliVersion());
     return;
   }
 

@@ -28,10 +28,15 @@ RUN --mount=type=cache,target=/root/.npm \
 # Stage 2: Runner (lean bookworm-slim reduces image size from ~1.1GB to ~220MB)
 FROM node:24-bookworm-slim AS runner
 
+ARG NEURALBRAIN_VERSION=0.1.0
+LABEL org.opencontainers.image.title="neuralbrain" \
+      org.opencontainers.image.version="${NEURALBRAIN_VERSION}"
+
 WORKDIR /app
 
 # Ensure IPv4 DNS resolution order in runtime as well
 ENV NODE_OPTIONS="--dns-result-order=ipv4first"
+ENV NEURALBRAIN_VERSION=${NEURALBRAIN_VERSION}
 
 # Copy production node_modules from builder
 COPY --from=builder /app/node_modules ./node_modules

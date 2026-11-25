@@ -1,8 +1,11 @@
 services:
   brain:
+    image: neuralbrain:${NEURALBRAIN_VERSION:-0.1.0}
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        NEURALBRAIN_VERSION: ${NEURALBRAIN_VERSION:-0.1.0}
     container_name: neuralbrain
     ports:
       - "${HOST_BIND:-127.0.0.1}:${PORT:-3737}:3000"

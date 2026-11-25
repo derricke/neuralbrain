@@ -7,6 +7,7 @@ import { app } from './app';
 import { initDb, resetDb } from './lib/db';
 import { logger } from './lib/logger';
 import { ensureLocalTlsCerts } from './lib/tls';
+import { getAppVersion } from './lib/version';
 import { verifyOrCreateStoreMeta } from './learning/storeMeta';
 import { drainEmbedQueue, ensureInitialEmbeddingsSync } from './learning/embedWorker';
 import { probeReasoningTokens } from './consolidation/fixtures';
@@ -100,14 +101,14 @@ async function startServer() {
           const cert = fs.readFileSync(certPath);
           return https.createServer({ key, cert }, app).listen(PORT, HOST, () => {
             logger.info(
-              { port: PORT, host: HOST, protocol: 'https', certPath, generated },
+              { version: getAppVersion(), port: PORT, host: HOST, protocol: 'https', certPath, generated },
               'neuralbrain service listening'
             );
           });
         })()
       : app.listen(PORT, HOST, () => {
           logger.info(
-            { port: PORT, host: HOST, protocol: 'http' },
+            { version: getAppVersion(), port: PORT, host: HOST, protocol: 'http' },
             'neuralbrain service listening'
           );
         });

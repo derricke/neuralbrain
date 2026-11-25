@@ -75,8 +75,17 @@ describe('Web Operator Dashboard & UI Route Tests', () => {
       // Verify HTML content structure
       expect(res.text).toContain('<!DOCTYPE html>');
       expect(res.text).toContain('neuralbrain');
+      expect(res.text).toContain('id="versionBadge"');
       expect(res.text).toContain('/dashboard/styles.css');
       expect(res.text).toContain('/dashboard/app.js');
+
+      // HEALTH and QDRANT badges sit directly next to each other before STORE badge
+      const healthIdx = res.text.indexOf('id="healthBadge"');
+      const qdrantIdx = res.text.indexOf('id="qdrantBadge"');
+      const storeMetaIdx = res.text.indexOf('id="storeMetaBadge"');
+      expect(healthIdx).toBeGreaterThan(-1);
+      expect(qdrantIdx).toBeGreaterThan(healthIdx);
+      expect(storeMetaIdx).toBeGreaterThan(qdrantIdx);
       expect(res.text).toContain('Overview & Memory Layers');
       expect(res.text).toContain('subTabBtnShortSummaries');
       expect(res.text).toContain('Notes Explorer & Repair Queue');

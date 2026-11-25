@@ -57,6 +57,11 @@ describe('neuralbrain doctor', () => {
       // Never "N/M passing" and "all passing" at once.
       expect(report.allPassing).toBe(report.checks.every((c) => c.pass) && report.aiDiagnostics.all_passing);
       expect(report.allPassing).toBe(true);
+      expect(report.version).toBeTruthy();
+      expect(report.install.version).toBe(report.version);
+      expect(report.install.installKind).toBe('checkout');
+      expect(report.install.isGlobal).toBe(false);
+      expect(report.install.location).toBe(fs.realpathSync(path.resolve(__dirname, '../../..')));
     });
 
     it('runs the AI fixtures in a throwaway database, leaving the inspected store untouched', async () => {

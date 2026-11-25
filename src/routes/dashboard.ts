@@ -3,6 +3,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { getDb } from '../lib/db';
 import { logger } from '../lib/logger';
 import { getSpoolStats } from '../lib/spool';
+import { getAppVersion } from '../lib/version';
 import { verifyOrCreateStoreMeta } from '../learning/storeMeta';
 import { getPendingEmbedCount } from '../memory/embedQueueStore';
 import { drainEmbedQueue, getReembedStatus, probeQdrant } from '../learning/embedWorker';
@@ -213,6 +214,7 @@ dashboardRouter.get('/api/stats', async (_req: Request, res: Response, next: Nex
 
     const health = {
       status: dbStatus === 'ok' && verification.match ? 'ok' : 'degraded',
+      version: getAppVersion(),
       db: dbStatus,
       qdrant: qdrantStatus,
       embed_queue_pending: pendingEmbedCount,
